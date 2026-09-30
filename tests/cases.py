@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 
 from wi_driver import McpError, read_kv
 
@@ -166,3 +167,70 @@ CASES = [
     test_inspection_at_breakpoint,
     test_eventlog_and_command,
 ]
+
+
+def test_launch_arguments_roundtrip(wi):
+    wi.safe_stop()
+    wi.wipe_markers()
+    intended = ["", "two words", 'a"b', "trail\\", "comma,value", "{braces}", "Hu Tao \u2764", "run"]
+    response = wi.load(wi.fixture("launch_arguments"), arguments=subprocess.list2cmdline(intended))
+    assert "SUCCESS" in response, response[:300]
+    execution = wi.resume_until(marker=wi.marker("launch_arguments"))
+    assert os.path.exists(wi.marker("launch_arguments")), "Argument marker missing: %s" % execution["last"]
+    observed = read_kv(wi.marker("launch_arguments"))
+    actual = [bytes.fromhex(observed["argv%d" % index]).decode("utf-16-le")
+              for index in range(1, int(observed["argc"]))]
+    assert actual == intended, "actual=%r intended=%r" % (actual, intended)
+    return {"expectedArguments": intended, "actualArguments": actual, "marker": observed}
+
+
+def test_assembly_executes_patch(wi):
+    wi.safe_stop()
+    wi.wipe_markers()
+    response = wi.load(wi.fixture("patch_canary"))
+    assert "SUCCESS" in response, response[:300]
+    expression = "patch_canary.exe:patch_value"
+    wi.call("SetBreakpoint", {"target": expression})
+    address = wi.eval_int(expression)
+    assert address, "Patch fixture export unresolved"
+    execution = wi.resume_until(bp_addr=address, stop_at_bp=True)
+    assert execution["bp_hits"] == 1, "Patch fixture breakpoint was not hit"
+    wi.call("DeleteAllBreakpoints")
+    original = wi.read_bytes(address, 16)
+    response = wi.call("Assemble", {"address": "0x%X" % address, "instruction": "mov eax, 42"})
+    encoded = wi.read_bytes(address, 5)
+    assert encoded == bytes.fromhex("b82a000000"), "Assemble installed %s: %s" % (encoded.hex(), response)
+    wi.call("Assemble", {"address": "0x%X" % (address + 5), "instruction": "ret"})
+    assert wi.read_bytes(address, 6) == bytes.fromhex("b82a000000c3"), "Patched function bytes differ"
+    execution = wi.resume_until(marker=wi.marker("patch_canary"))
+    assert os.path.exists(wi.marker("patch_canary")), "Patched execution marker missing: %s" % execution["last"]
+    observed = read_kv(wi.marker("patch_canary"))
+    assert observed["value"] == "42", "Patched function returned %s" % observed["value"]
+    return {"originalBytes": original.hex(), "installedBytes": "b82a000000c3", "marker": observed}
+
+
+DEFECT_CASES = [test_launch_arguments_roundtrip, test_assembly_executes_patch]
+
+
+def test_legacy_idle_contract_capture(wi):
+    wi.safe_stop()
+    observations = []
+    for tool in wi.environment.legacy_catalog:
+        payload = {"jsonrpc": "2.0", "id": wi.rid, "method": "tools/call",
+                   "params": {"name": tool["name"], "arguments": {}}}
+        wi.rid += 1
+        response = wi.raw(payload)
+        assert response and response.get("id") == payload["id"], "Missing matching response: %s" % tool["name"]
+        assert ("result" in response) != ("error" in response), "Invalid response envelope: %s" % tool["name"]
+        observations.append({"name": tool["name"], "arguments": {}, "response": response})
+    assert wi.state().get("status") == "NO_TARGET", "Default calls started an unexpected target"
+    return {"scope": "idle defaults and omitted required arguments", "observations": observations}
+
+
+def test_runtime_surface_inventory(wi):
+    from inventory import capture_runtime_surface
+    return capture_runtime_surface(wi)
+
+
+CONTRACT_CASES = [test_legacy_idle_contract_capture]
+SURFACE_CASES = [test_runtime_surface_inventory]

@@ -9,6 +9,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -96,7 +97,7 @@ def tree_identity(directory):
 
 
 def write_json(path, value):
-    Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
 
 
 def process_identity(process):
@@ -170,8 +171,9 @@ def build_targets(environment):
         raise McpError("Visual Studio compiler is unavailable")
     logs = []
     for source in sorted(TARGET_SOURCES.glob("*.c")):
-        optimization = "/Od" if source.stem == "bpmain" else "/O1"
-        command = [compiler, "/nologo", optimization, "/W3", str(source), f"/Fe:{source.stem}.exe"]
+        optimization = "/Od" if source.stem in ("bpmain", "patch_canary") else "/O1"
+        command = [compiler, "/nologo", optimization, "/W3", str(source), f"/Fe:{source.stem}.exe",
+                   "/link", "/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
         result = subprocess.run(command, cwd=environment.targets, env=compiler_variables,
                                 capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
         logs.append({"source": file_identity(source), "command": command,
@@ -180,6 +182,40 @@ def build_targets(environment):
             write_json(environment.root / "fixture-build.json", logs)
             raise McpError(f"Fixture build failed: {source.name}: {result.stdout} {result.stderr}")
     write_json(environment.root / "fixture-build.json", logs)
+
+
+def build_debugger(output, architecture):
+    source = ROOT / "x64dbg"
+    build = Path(output) / f"build-{architecture}"
+    build.mkdir()
+    qt_build = "build64" if architecture == "x64" else "build32"
+    qt = source / qt_build / "_deps" / "qt5-src" / "lib" / "cmake" / "Qt5"
+    environment = compiler_environment(architecture)
+    configure = ["cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
+                 "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_UNITY_BUILD=ON", "-DCMAKE_UNITY_BUILD_BATCH_SIZE=6"]
+    if qt.is_dir():
+        configure.append(f"-DQt5_DIR={qt}")
+    commands = [configure, ["cmake", "--build", str(build), "--target", "exe", "headless", "x64dbg_tests", "--parallel", "6"]]
+    results = []
+    with (build / "build.log").open("w", encoding="utf-8") as log:
+        for command in commands:
+            print(f"Building native {architecture}: {command[1]}", flush=True)
+            process = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
+            log.flush()
+            results.append({"command": command, "exitCode": process.returncode})
+            write_json(build / "commands.json", results)
+            if process.returncode:
+                raise McpError(f"Native build failed: {(build / 'build.log').read_text(encoding='utf-8')[-8000:]}")
+    artifacts = source / "bin" / architecture
+    inputs = subprocess.check_output(["git", "ls-files", "x64dbg"], cwd=ROOT, text=True).splitlines()
+    manifest = {"architecture": architecture, "sourceHead": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+                "sourceInputs": [file_identity(ROOT / path) for path in inputs if Path(path).suffix in (".cpp", ".c", ".h", ".toml", ".cmake", ".txt", ".rc", ".xml")],
+                "buildInputs": file_identity(build / "CMakeCache.txt"), "commands": results,
+                "artifacts": [file_identity(path) for path in sorted(artifacts.rglob("*"))
+                              if path.is_file() and path.suffix.lower() in (".exe", ".dll", ".dp64", ".dp32")]}
+    write_json(build / "build-manifest.json", manifest)
+    print(f"[VERIFIED] Native {architecture} release build: {build}", flush=True)
+    return manifest
 
 
 class SuiteEnvironment:
@@ -235,13 +271,14 @@ class SuiteEnvironment:
         for marker in self.targets.glob("*_result.txt"):
             marker.unlink()
 
-    def retain(self, results):
+    def retain(self, results, phase="baseline"):
         after = tree_identity(self.deployment)
         unchanged = after == self.before
         write_json(self.root / "requests.json", self.requests)
         write_json(self.root / "legacy-catalog.json", self.legacy_catalog)
-        write_json(self.root / "evidence.json", {"schemaVersion": 1, "phase": "external-baseline",
+        write_json(self.root / "evidence.json", {"schemaVersion": 1, "phase": phase,
                    "source": self.source, "architecture": self.architecture, "processes": self.processes,
+                   "environment": {"windowsVersion": list(sys.getwindowsversion()), "pythonVersion": sys.version},
                    "sourceDeployment": self.before, "fixtures": tree_identity(self.targets),
                    "results": results, "personalDeploymentUnchanged": unchanged})
         if not unchanged:

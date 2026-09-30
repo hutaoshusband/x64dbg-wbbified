@@ -1,0 +1,1825 @@
+{
+  "schemaVersion": 1,
+  "baselineProvider": {
+    "name": "x64dbg-MCP Server",
+    "version": "1.3",
+    "architecture": "x64",
+    "sha256": "5cf0e96db28276717ee3f2d31239f24490373677f5de5284d945052de87eb37c"
+  },
+  "tools": [
+    {
+      "legacyName": "LoadBinary",
+      "canonicalRoute": "target_open",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "filePath": {
+            "type": "string",
+            "description": "Absolute file path of the executable to debug."
+          },
+          "arguments": {
+            "type": "string",
+            "description": "Optional command-line arguments.",
+            "default": ""
+          }
+        },
+        "required": [
+          "filePath"
+        ]
+      },
+      "description": "Loads an executable into the debugger for a new debugging session. Equivalent to File > Open in the GUI. If a session is already active it is terminated first. The debuggee pauses at the system breakpoint.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "`filePath` is used by existing suite; verify argv/raw command line, cwd and actual initial stop",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ExecuteDebuggerCommand",
+      "canonicalRoute": "commands_execute",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The x64dbg command to execute."
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "description": "Executes a native x64dbg command string (like 'erun', 'analr', 'graph'). This is for x64dbg-internal commands ONLY — do NOT pass MCP tool names here. MCP tools (WaitForEvent, GetDebugState, Disassemble, etc.) must be called directly as tools.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Native commands only; actual execution/completion and captured output",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ListCommandsByCategory",
+      "canonicalRoute": "capabilities_list",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "Optional category filter."
+          }
+        },
+        "required": []
+      },
+      "description": "Lists the available MCP tools, optionally filtered to a single category.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "This legacy name catalogs MCP tools; preserve its meaning rather than silently returning native commands",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SearchForStrings",
+      "canonicalRoute": "memory_search_text",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "searchText": {
+            "type": "string",
+            "description": "The literal text to search for."
+          },
+          "encoding": {
+            "type": "string",
+            "description": "Character encoding: UTF-8 or UTF-16.",
+            "default": "UTF-8"
+          }
+        },
+        "required": [
+          "searchText"
+        ]
+      },
+      "description": "Searches process memory for a specific text string and returns the addresses where it occurs.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Exact encoding, range, addresses and incomplete scan reporting",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetEventLog",
+      "canonicalRoute": "events_read",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Number of most recent events to return (default: all, max 64)."
+          }
+        },
+        "required": []
+      },
+      "description": "Returns the last N debugger events (exceptions, breakpoints, DLL loads, thread events, etc.). Keeps the last 64 events in a ring buffer. Use this to see what happened in x64dbg.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Legacy `count` parameter/text maintained; correlate actual engine events",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ClearEventLog",
+      "canonicalRoute": "events_clear",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Clears the event log ring buffer.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Clear visible ring history without deleting durable operation evidence",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "EvalExpression",
+      "canonicalRoute": "expression_evaluate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "type": "string",
+            "description": "x64dbg expression (e.g. cip, eax+4, kernel32:CreateFileA)."
+          }
+        },
+        "required": [
+          "expression"
+        ]
+      },
+      "description": "Evaluates an x64dbg expression (address, register, arithmetic, symbol) and returns the result in hex and decimal.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "`expression` and suite-parsed first line hex; arithmetic works while idle",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "AttachProcess",
+      "canonicalRoute": "target_attach",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pid": {
+            "type": "integer",
+            "description": "Process ID to attach to."
+          }
+        },
+        "required": [
+          "pid"
+        ]
+      },
+      "description": "Attaches the debugger to a running process by PID.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "PID identity/rights/architecture and actual attachment",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "WaitForEvent",
+      "canonicalRoute": "events_wait",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "timeoutMs": {
+            "type": "integer",
+            "description": "Maximum wait time in milliseconds (default 30000, max 120000).",
+            "default": 30000
+          }
+        },
+        "required": []
+      },
+      "description": "Blocks until a debugger event fires (breakpoint hit, paused, resumed, exception, session start/stop) or timeout. Returns all events that occurred. Use this to monitor debugger state changes in real-time over HTTP — call it after 'run' or while waiting for the user to interact with the debugger.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Cursors/filter/deadline prevent stale and missed events",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetCurrentAddress",
+      "canonicalRoute": "target_state",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Returns the current instruction pointer (EIP/RIP), the module it belongs to, and its label/comment. Takes no arguments.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Correct EIP/RIP, selected thread, module and annotations",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ReadMemory",
+      "canonicalRoute": "memory_read",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Hex address or expression to read from."
+          },
+          "size": {
+            "type": "integer",
+            "description": "Number of bytes to read (max 4096).",
+            "default": 64
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Reads raw bytes from the target process memory and returns a hex dump with ASCII. Example: ReadMemory address=0x7FF600001000, size=128",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "`address`/`size`, legacy hexdump layout; exact bytes and holes",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "WaitForPause",
+      "canonicalRoute": "execution_wait",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "timeoutMs": {
+            "type": "integer",
+            "description": "Maximum wait time in milliseconds.",
+            "default": 30000
+          }
+        },
+        "required": []
+      },
+      "description": "Blocks until the debuggee stops running (hits a breakpoint, exception, or exits). Returns the reason for the pause and the current address. Use after 'run' to wait for the target to break.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Distinguish existing pause and new stop; bounded waits",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "StepInto",
+      "canonicalRoute": "execution_step_into",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Executes a single instruction, stepping INTO any call encountered (F7). Takes no arguments.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Observed new context and call entry",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "StepOver",
+      "canonicalRoute": "execution_step_over",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Executes a single instruction, stepping OVER any call/subroutine entirely (F8). Takes no arguments.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Calls return to caller or earlier stop reported",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "StepOut",
+      "canonicalRoute": "execution_step_out",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Runs until the current function returns to its caller (Ctrl+F9). Takes no arguments.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual caller continuation or explicit exception/exit",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "PauseDebug",
+      "canonicalRoute": "execution_pause",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Pauses (suspends) the running debuggee, equivalent to Debug > Pause (F12). Takes no arguments.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual paused event/epoch; handle target exiting first",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "StopDebug",
+      "canonicalRoute": "target_stop",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Terminates the current debugging session and closes the debuggee process. Takes no arguments.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Target termination observed; idle error text compatible with suite",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "RestartDebug",
+      "canonicalRoute": "target_restart",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Restarts the current debugging session from the beginning. Takes no arguments.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Correct next target generation and preserved launch inputs",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SetBreakpoint",
+      "canonicalRoute": "breakpoints_create",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Hex address or API symbol to break on."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "description": "Sets a software execution breakpoint (INT3) at an address or API symbol.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Legacy `target` expression resolution and real INT3 hit",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "DeleteBreakpoint",
+      "canonicalRoute": "breakpoints_delete",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Hex address or API symbol of the breakpoint to remove."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "description": "Removes a breakpoint at an address or API symbol.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Trap restoration and catalog state",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetAllRegisters",
+      "canonicalRoute": "registers_read",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Returns the current values of all general-purpose registers. Takes no arguments.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Preserve general-register text; add complete supported groups natively",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetCallStack",
+      "canonicalRoute": "stack_read",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Returns the current thread's call stack. Takes no arguments.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Correct selected-thread frames; retain legacy frame text",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "WriteMemToAddress",
+      "canonicalRoute": "memory_write",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Hex address to write to."
+          },
+          "byteString": {
+            "type": "string",
+            "description": "Hex bytes to write, e.g. '0F FF 90'."
+          }
+        },
+        "required": [
+          "address",
+          "byteString"
+        ]
+      },
+      "description": "Patches memory by writing raw hex bytes to an address. WARNING: this modifies the live process. Example: WriteMemToAddress address=0x12345678, byteString=0F FF 90",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "`address`/`byteString`; actual write/readback with precise errors",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "CommentOrLabelAtAddress",
+      "canonicalRoute": "annotations_set",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Hex address."
+          },
+          "value": {
+            "type": "string",
+            "description": "The comment or label text."
+          },
+          "mode": {
+            "type": "string",
+            "description": "'Comment' or 'Label'.",
+            "default": "Comment"
+          }
+        },
+        "required": [
+          "address",
+          "value"
+        ]
+      },
+      "description": "Adds a comment or a label at a specific address in the disassembly.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Native comment/label distinctions and database persistence",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "Disassemble",
+      "canonicalRoute": "disassembly_read",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Address or expression (default: current IP).",
+            "default": "cip"
+          },
+          "count": {
+            "type": "integer",
+            "description": "Number of instructions (default 10, max 100).",
+            "default": 10
+          }
+        },
+        "required": []
+      },
+      "description": "Disassembles instructions at an address. Returns instruction mnemonics with addresses. Default: 10 instructions from current IP.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "`address`/`count`; preserve suite's address/bar text convention",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ListModules",
+      "canonicalRoute": "modules_list",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Lists all loaded modules (DLLs/EXE) with base addresses and sizes.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Accurate bases, paths, sizes and identities",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ListBreakpoints",
+      "canonicalRoute": "breakpoints_list",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Lists all active breakpoints (software, hardware, and memory).",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Every native kind and state, not just software breakpoints",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetMemoryMap",
+      "canonicalRoute": "memory_map",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Returns the memory map showing all memory regions with base address, size, protection, and module info.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Accurate regions/protection, legacy display fields",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SetRegister",
+      "canonicalRoute": "registers_write",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "register": {
+            "type": "string",
+            "description": "Register name (e.g. eax, ecx, eip)."
+          },
+          "value": {
+            "type": "string",
+            "description": "Value to set (hex or decimal)."
+          }
+        },
+        "required": [
+          "register",
+          "value"
+        ]
+      },
+      "description": "Sets the value of a CPU register.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "`register`/`value`; actual context mutation and readback",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetThreads",
+      "canonicalRoute": "threads_list",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Lists all threads in the debugged process with IDs, instruction pointers, and names.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Real IDs/names/current context; preserve expected Main Thread labeling",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SwitchThread",
+      "canonicalRoute": "threads_select",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "threadId": {
+            "type": "integer",
+            "description": "Thread ID to switch to."
+          }
+        },
+        "required": [
+          "threadId"
+        ]
+      },
+      "description": "Switches the debugger's active thread context to a different thread.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Correct actual selected thread and epoch",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "Assemble",
+      "canonicalRoute": "assembly_apply",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Address to assemble at."
+          },
+          "instruction": {
+            "type": "string",
+            "description": "Assembly instruction (e.g. nop, mov eax 1, jmp 0x401000)."
+          }
+        },
+        "required": [
+          "address",
+          "instruction"
+        ]
+      },
+      "description": "Assembles an instruction at a specific address, replacing existing bytes.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actually assemble requested source, track patch, verify bytes and execute",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetImports",
+      "canonicalRoute": "modules_imports",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Module name (e.g. kernel32, ntdll)."
+          }
+        },
+        "required": [
+          "module"
+        ]
+      },
+      "description": "Shows the import table of a loaded module.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Real imports including ordinals/delay imports when supported",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetExports",
+      "canonicalRoute": "modules_exports",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Module name (e.g. kernel32, ntdll)."
+          }
+        },
+        "required": [
+          "module"
+        ]
+      },
+      "description": "Shows the export table of a loaded module.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Real names, forwarders and addresses; legacy `module` accepted",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SetHardwareBreakpoint",
+      "canonicalRoute": "breakpoints_create",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Address for the hardware breakpoint."
+          },
+          "type": {
+            "type": "string",
+            "description": "Type: r (read), w (write), x (execute, default).",
+            "default": "x"
+          },
+          "size": {
+            "type": "integer",
+            "description": "Size: 1, 2, 4, or 8 (default 1).",
+            "default": 1
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Sets a hardware breakpoint using debug registers (DR0-DR3). Supports read, write, and execute types.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Size/alignment/access/DR limits and actual target hit",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SetMemoryBreakpoint",
+      "canonicalRoute": "breakpoints_create",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Address for the memory breakpoint."
+          },
+          "type": {
+            "type": "string",
+            "description": "Type: r (read/access), w (write), x (execute). Default: access (any)."
+          },
+          "singleshoot": {
+            "type": "boolean",
+            "description": "If true, breakpoint is removed after first hit (default false).",
+            "default": false
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Sets a memory breakpoint at an address. Triggers when memory is accessed (read/write/execute). Uses guard pages — slower than hardware breakpoints but no DR register limit.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Guard/range access behavior and overlapping ranges",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetPatches",
+      "canonicalRoute": "patch_sets_list",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Lists all memory patches applied to the debugged process.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Original/new bytes and actual tracked patch state",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "FindPattern",
+      "canonicalRoute": "memory_search_pattern",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Hex bytes with ?? wildcards, e.g. 'E8 ?? ?? ?? ?? 85 C0'."
+          },
+          "module": {
+            "type": "string",
+            "description": "Module to scan (default: main exe)."
+          },
+          "maxResults": {
+            "type": "integer",
+            "description": "Max results (default 10).",
+            "default": 10
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      },
+      "description": "Scans module memory for a byte pattern with ?? wildcards. Returns matching addresses. Example: FindPattern pattern='E8 ?? ?? ?? ?? 85 C0 74'",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Wildcards, exact ranges and matches",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetStrings",
+      "canonicalRoute": "memory_strings",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Module to scan (default: main exe)."
+          },
+          "minLength": {
+            "type": "integer",
+            "description": "Min string length (default 4).",
+            "default": 4
+          }
+        },
+        "required": []
+      },
+      "description": "Scans a module's memory for ASCII strings and returns them with their addresses.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Preserve ASCII behavior; native API includes supported encodings",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetReferences",
+      "canonicalRoute": "analysis_references",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Target address to find references to."
+          },
+          "module": {
+            "type": "string",
+            "description": "Module to search in (default: main exe)."
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Finds code references (CALL/JMP) to a target address within a module.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Code/data direction and actual references; report scan coverage",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetFunctions",
+      "canonicalRoute": "analysis_functions",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Module name (e.g. kernel32, ntdll)."
+          }
+        },
+        "required": [
+          "module"
+        ]
+      },
+      "description": "Lists analyzed functions in a module with start addresses, sizes, and labels. Requires prior analysis (Ctrl+A in x64dbg).",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Real analysis boundaries; analysis-not-run is explicit",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "RunToAddress",
+      "canonicalRoute": "execution_run_to",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Address to run to."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "description": "Timeout ms (default 30000).",
+            "default": 30000
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Sets a temporary breakpoint at the target address, resumes execution, and waits for the debuggee to hit it.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Own temporary breakpoint lifetime; competing stops distinct",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "TraceInto",
+      "canonicalRoute": "trace_start",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Instructions to trace (default 10, max 100).",
+            "default": 10
+          }
+        },
+        "required": []
+      },
+      "description": "Single-steps N instructions recording the address and disassembly of each. Max 100.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Into semantics and recorded instruction sequence; native API supports scalable limits",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SetConditionalBreakpoint",
+      "canonicalRoute": "breakpoints_create",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Breakpoint address."
+          },
+          "condition": {
+            "type": "string",
+            "description": "Break condition expression, e.g. 'eax==0'."
+          },
+          "log": {
+            "type": "string",
+            "description": "Log format string (optional)."
+          }
+        },
+        "required": [
+          "address",
+          "condition"
+        ]
+      },
+      "description": "Sets a breakpoint with a condition expression and optional log text.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual condition predicate and optional logging",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "FollowPointer",
+      "canonicalRoute": "pointers_follow",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Starting address or expression."
+          },
+          "depth": {
+            "type": "integer",
+            "description": "Dereference depth (default 1, max 16).",
+            "default": 1
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Dereferences a pointer chain N levels deep, showing each level's address and value with module info.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Correct depth and target pointer width with failed-level reporting",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "WatchExpressions",
+      "canonicalRoute": "expressions_evaluate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "expressions": {
+            "type": "string",
+            "description": "Comma-separated x64dbg expressions to evaluate."
+          }
+        },
+        "required": [
+          "expressions"
+        ]
+      },
+      "description": "Evaluates multiple x64dbg expressions at once and returns all results. Pass comma-separated expressions.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Preserve legacy comma-separated input; canonical array avoids parser ambiguity",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetSEHChain",
+      "canonicalRoute": "seh_chain",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Walks the Structured Exception Handler chain (x32 only) and shows each handler's address and module.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "x32 handler chain; x64 gets explicit architecture limitation",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetPEB",
+      "canonicalRoute": "process_peb",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Reads key fields from the Process Environment Block: image base, being debugged, heaps, NtGlobalFlag, image path, command line.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual image base/debug flags/command line and field validity",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetArguments",
+      "canonicalRoute": "arguments_read",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Number of args to read (default 4, max 16).",
+            "default": 4
+          }
+        },
+        "required": []
+      },
+      "description": "Reads function arguments from the stack (x32: [ESP+4]...) or registers (x64: RCX,RDX,R8,R9...) at the current position.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Correct conventions and raw locations; no guessed signatures",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "DumpMemory",
+      "canonicalRoute": "memory_dump",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Start address."
+          },
+          "size": {
+            "type": "integer",
+            "description": "Bytes to dump."
+          },
+          "filePath": {
+            "type": "string",
+            "description": "Output file path on disk."
+          }
+        },
+        "required": [
+          "address",
+          "size",
+          "filePath"
+        ]
+      },
+      "description": "Saves a memory region to a file on disk.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Exact saved bytes, hash, read holes and owned destination",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "AllocateMemory",
+      "canonicalRoute": "memory_allocate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "size": {
+            "type": "integer",
+            "description": "Number of bytes to allocate."
+          },
+          "protection": {
+            "type": "string",
+            "description": "Memory protection: rwx, rw, rx, r (default rw).",
+            "default": "rw"
+          }
+        },
+        "required": [
+          "size"
+        ]
+      },
+      "description": "Allocates a block of memory in the target process.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Real remote address/size/protection and allocation owner",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "FreeMemory",
+      "canonicalRoute": "memory_free",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Base address of the allocated block to free."
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Frees a previously allocated memory block in the target process.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual released region, stale/allocation checks",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "EnableBreakpoint",
+      "canonicalRoute": "breakpoints_enable",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Target address or expression."
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Enables a breakpoint at a given address.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual enabled configuration and trigger",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "DisableBreakpoint",
+      "canonicalRoute": "breakpoints_enable",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Target address or expression."
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Disables a breakpoint at a given address without deleting it.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Disabled state without deletion; no unexpected hit",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ToggleBreakpoint",
+      "canonicalRoute": "breakpoints_toggle",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Target address or expression."
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Toggles a breakpoint between enabled and disabled.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Predictable state change, legacy retry ambiguity documented",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "DeleteAllBreakpoints",
+      "canonicalRoute": "breakpoints_clear",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Removes all breakpoints (normal, hardware, and memory).",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "All kinds removed, native bytes/debug registers/guards restored",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ResetHitCount",
+      "canonicalRoute": "breakpoints_reset_hits",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Target address or expression."
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Resets the hit counter of a breakpoint at the given address to zero.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Real counter reset and subsequent hit count",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "DisassembleFunction",
+      "canonicalRoute": "disassembly_function",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Target address or expression."
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Disassembles an entire function by finding its start/end boundaries from the analysis database.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Boundary source and all decoded instructions paginated",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SearchSymbols",
+      "canonicalRoute": "symbols_search",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Symbol name pattern to search for (substring match)."
+          },
+          "module": {
+            "type": "string",
+            "description": "Module to search in (default: all modules)."
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      },
+      "description": "Searches for symbols (labels) matching a pattern in a module.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual pattern matching across supported providers",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ListSymbols",
+      "canonicalRoute": "symbols_list",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Module name to list symbols from."
+          }
+        },
+        "required": [
+          "module"
+        ]
+      },
+      "description": "Lists exported symbols of a module.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Preserve legacy exports view and expose full providers in native API",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SuspendThread",
+      "canonicalRoute": "threads_suspend",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "threadId": {
+            "type": "integer",
+            "description": "Thread ID to operate on."
+          }
+        },
+        "required": [
+          "threadId"
+        ]
+      },
+      "description": "Suspends a thread by its thread ID.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual suspend count ownership and observed target effect",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ResumeThread",
+      "canonicalRoute": "threads_resume",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "threadId": {
+            "type": "integer",
+            "description": "Thread ID to operate on."
+          }
+        },
+        "required": [
+          "threadId"
+        ]
+      },
+      "description": "Resumes a suspended thread by its thread ID.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Correct count semantics; don't over-resume another suspension",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SetBookmark",
+      "canonicalRoute": "annotations_set",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Target address or expression."
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Sets a bookmark at the specified address.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual debugger bookmark and database persistence",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "DeleteBookmark",
+      "canonicalRoute": "annotations_delete",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Target address or expression."
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Deletes a bookmark at the specified address.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual removed bookmark only",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "ListBookmarks",
+      "canonicalRoute": "annotations_list",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Lists all bookmarks with addresses and labels.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Exact current bookmark set",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "DumpModule",
+      "canonicalRoute": "modules_dump",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Module name to dump."
+          },
+          "filePath": {
+            "type": "string",
+            "description": "Output file path."
+          }
+        },
+        "required": [
+          "module",
+          "filePath"
+        ]
+      },
+      "description": "Dumps an entire loaded module to a file on disk.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Declare mapped/raw/rebuilt layout and validate resulting artifact",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "AnalyzeModule",
+      "canonicalRoute": "modules_analyze_pe",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Module name (e.g. kernel32, ntdll)."
+          }
+        },
+        "required": [
+          "module"
+        ]
+      },
+      "description": "Shows PE structure analysis: sections, entry point, image size, characteristics.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "PE metadata behavior; this is distinct from code analysis",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "DetectOEP",
+      "canonicalRoute": "modules_oep_candidates",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Module name (e.g. kernel32, ntdll)."
+          }
+        },
+        "required": [
+          "module"
+        ]
+      },
+      "description": "Attempts to detect the Original Entry Point for packed executables by analyzing section characteristics.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Return heuristic candidates with uncertainty; no unsupported success claim",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetDumpableRegions",
+      "canonicalRoute": "memory_dumpable_regions",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Lists memory regions that can be dumped (committed, readable) for a module or the entire process.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Readable ranges and actual constraints",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "RestorePatches",
+      "canonicalRoute": "patch_restore_all",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Restores all patched bytes back to their original values.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Compare-checked original bytes and native state restored",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SetExceptionBreakpoint",
+      "canonicalRoute": "breakpoints_create",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "exceptionCode": {
+            "type": "string",
+            "description": "Exception code in hex (e.g. C000001D, 0EEDFADE, E06D7363)."
+          },
+          "chance": {
+            "type": "integer",
+            "description": "1 = first-chance, 2 = second-chance, 3 = both (default 1).",
+            "default": 1
+          },
+          "action": {
+            "type": "string",
+            "description": "break = break into debugger, ignore = pass to application (default break).",
+            "default": "break"
+          }
+        },
+        "required": [
+          "exceptionCode"
+        ]
+      },
+      "description": "Controls how an exception code is handled: break into debugger or pass to application. Use this to ignore Delphi (0EEDFADE), C++ (E06D7363), or other framework exceptions during startup, or to break on specific exceptions like ILLEGAL_INSTRUCTION (C000001D).",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Exception code/chance and observed exception stop",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "DeleteExceptionBreakpoint",
+      "canonicalRoute": "breakpoints_delete",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "exceptionCode": {
+            "type": "string",
+            "description": "Exception code in hex to delete."
+          }
+        },
+        "required": [
+          "exceptionCode"
+        ]
+      },
+      "description": "Removes an exception breakpoint, restoring default handling for that exception code.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Exact exception policy restored",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "AnalyzeCode",
+      "canonicalRoute": "analysis_start",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Address or module to analyze. If omitted, analyzes the current module."
+          },
+          "type": {
+            "type": "string",
+            "description": "Analysis type: 'function' (analr - analyze single function), 'module' (anal - analyze module), 'controlflow' (cfanal - control flow analysis). Default: module.",
+            "default": "module"
+          }
+        },
+        "required": []
+      },
+      "description": "Runs x64dbg code analysis on a module or address range. This populates the function list, enables GetFunctions/GetReferences/DisassembleFunction. Must be run before those tools return useful results.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual native completion and produced boundaries/graph",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "TraceOver",
+      "canonicalRoute": "trace_start",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Instructions to trace (default 10, max 100).",
+            "default": 10
+          }
+        },
+        "required": []
+      },
+      "description": "Steps N instructions stepping OVER calls (like TraceInto but without diving into subroutines). Records address and disassembly of each step.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Over-call instruction sequence and real stop conditions",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SetBreakpointCommand",
+      "canonicalRoute": "breakpoints_update",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Breakpoint address."
+          },
+          "command": {
+            "type": "string",
+            "description": "x64dbg command to run on hit (e.g. 'log {x:eax}', 'msg {utf8@[esp+4]}')."
+          }
+        },
+        "required": [
+          "address",
+          "command"
+        ]
+      },
+      "description": "Sets an x64dbg command to execute when a breakpoint at the given address is hit. Use for logging breakpoints (e.g., 'log {x:eax}' to log register values on hit).",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual command/condition semantics on hit",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SetBreakpointFastResume",
+      "canonicalRoute": "breakpoints_update",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Breakpoint address."
+          },
+          "enable": {
+            "type": "boolean",
+            "description": "true to enable fast resume, false to disable.",
+            "default": true
+          }
+        },
+        "required": [
+          "address"
+        ]
+      },
+      "description": "Makes a breakpoint auto-resume after hit without pausing. Combined with SetBreakpointCommand, creates logging breakpoints that record state at thousands of call sites without stopping.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Actual resumed target and hit/log behavior",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "SaveDatabase",
+      "canonicalRoute": "database_save",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Saves the x64dbg database (labels, comments, breakpoints, analysis) for the current module. Persists your work across sessions.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Written database and fresh-instance reload prove persistence",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "Echo",
+      "canonicalRoute": "Small pure protocol utility",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Message to echo."
+          }
+        },
+        "required": [
+          "message"
+        ]
+      },
+      "description": "Echoes the input back to the client.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Preserve `message` and returned string; never use as debugger acceptance evidence",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "GetDebugState",
+      "canonicalRoute": "target_state` plus idle instance state",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "description": "Returns the current debugger state: whether a binary is loaded, whether it is running or paused, the PID, current instruction pointer, and current module. Always available. Takes no arguments.",
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Preserve `isDebugging`, `isRunning`, `status`, `currentAddress` used by suite",
+      "nativeStatus": "planned"
+    },
+    {
+      "legacyName": "run",
+      "canonicalRoute": "execution_resume",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "timeoutMs": {
+            "type": "integer",
+            "description": "Maximum time to wait for target to pause after resuming (default 300000ms = 5 minutes, max 600000ms = 10 minutes). The tool blocks until a breakpoint/exception fires or timeout.",
+            "default": 300000
+          }
+        },
+        "required": []
+      },
+      "description": "Resumes execution and waits for the target to pause (breakpoint, exception, or exit). Blocks until a pause event occurs or timeout. Use timeoutMs to control how long to wait (default 120s). Always returns the reason for the pause and current state.",
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false
+      },
+      "completionPredicate": "Resume actual selected compatibility target; no implicit wrong-instance operation",
+      "nativeStatus": "planned"
+    }
+  ]
+}

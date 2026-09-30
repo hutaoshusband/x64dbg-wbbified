@@ -12,8 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-FINAL_RE = re.compile(r"^\[x64dbg-test\] FINAL status=(?P<status>pass|fail) asserts=(?P<asserts>\d+)(?: reason=(?P<reason>\S+))?$")
-TEST_LOG_RE = re.compile(r"^\[x64dbg-test\]")
+FINAL_RE = re.compile(r"^\[(?:x64dbg|wi)-test\] FINAL status=(?P<status>pass|fail) asserts=(?P<asserts>\d+)(?: reason=(?P<reason>\S+))?$")
+TEST_LOG_RE = re.compile(r"^\[(?:x64dbg|wi)-test\]")
 ARTIFACT_GITIGNORE = ".gitignore"
 ARTIFACT_GITIGNORE_MARKER = "# x64dbg-test\n*"
 ABSOLUTE_CF_MARKER = "absolute_cf"
