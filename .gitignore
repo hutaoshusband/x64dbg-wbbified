@@ -1,32 +1,64 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
 *.o
 *.obj
-
-# Precompiled Headers
+*.slo
+*.lo
 *.gch
 *.pch
-
-# Compiled Dynamic libraries
 *.so
 *.dylib
-*.dll
-
-# Fortran module files
+*.a
 *.mod
 *.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
+*.exp
+*.ilk
+*.pdb
+*.dll
+*.exe
 *.lib
 
-# Executables
-*.exe
-*.out
-*.app
+!x64dbg/cmake/cmkr.exe
+!x64dbg/.github/format/**
+!x64dbg/src/dbg/**/*.lib
+!x64dbg/src/gui/Src/ThirdPartyLibs/ldconvert/*.lib
+!x64dbg/deps/**
+
+!WinTools/**
+!tests/**
+
+x64dbg/bin/*/
+x64dbg/bin/*.exe
+x64dbg/bin/*.dll
+x64dbg/bin/*.ini
+x64dbg/bin/*.chm
+x64dbg/bin/*.zip
+x64dbg/build*/
+x64dbg/release/
+x64dbg/.vs/
+x64dbg/src/**/Win32/
+x64dbg/src/**/x64/
+
+tests/targets/*.exe
+tests/targets/*.obj
+tests/targets/*.lib
+tests/targets/*.exp
+tests/targets/*_result.txt
+tests/tmp/
+
+WinTools/**/wininspect.ini
+WinTools/**/db/
+WinTools/**/.deps_copied
+WinTools/**/.deps_hash
+WinTools/**/memdumps/
+WinTools/**/plugins/GhostDbg*
+WinTools/**/plugins/Scylla*
+WinTools/**/plugins/scylla*
+WinTools/**/plugins/HookLibrary*
+WinTools/**/plugins/x64DbgMCPServer/
+WinTools/**/plugins/minidump/
+WinTools/**/Scylla.dll
+WinTools/**/*.log
+
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
