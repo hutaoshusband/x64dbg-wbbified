@@ -15,6 +15,7 @@ Run `python tests/run_tests.py` from the repository root. This is the shared ent
 | `inventory` | Source registration/form candidates reconciled with the captured legacy catalog and optional runtime surface |
 | `build` | Fresh Release source builds of the GUI debugger, headless debugger and existing native fixtures |
 | `native` | Existing headless regression bundles, preserving their assertion failures and process exit results |
+| `mcp-contracts` | Fresh source-built x64/x32 common-contract fixture; independent Draft 2020-12 validation, exact numeric/context roundtrips, bounded parsing and dependency probes |
 
 `--arch x64`, `--arch x32` and `--arch all` select architectures. `--case` can be repeated; baseline case selections accept globs, while native selections use existing native bundle IDs. `--engine` selects TitanEngine, GleeBug, StaticEngine or all available backends for the native phase. `--list` lists cases without launching or writing artifacts. `--timeout` bounds requests and execution waits between 1 and 60 seconds. Defaults are x64, baseline, and 45 seconds.
 
@@ -26,7 +27,14 @@ python tests/run_tests.py --phase contracts
 python tests/run_tests.py --phase surface
 python tests/run_tests.py --phase surface --surface-provider native --arch all
 python tests/run_tests.py --phase defects
+python tests/run_tests.py --phase mcp-contracts --arch all
 ```
+
+The `mcp-contracts` phase uses the test-only dependency in `tests/requirements.txt`. Install it in the Python environment used for the suite. Its native fixture is declared in the real cmkr input and kept out of default executable builds. New CMake directories fetch HTTP, JSON, SQLite and JavaScript sources by fixed URL and SHA-256; dependency metadata and licenses are retained in the build receipt. `X64DBG_BUILD_MCP=OFF` disables these new development targets for existing debugger-only builds.
+
+The common contract registry currently describes twelve shared data contracts and advertises zero operational tools. It validates precise decimal/hex strings, explicit target/paused/mutation identities, exclusive address/file forms, bounded pages/deadlines and expected byte ranges. Pointer-width range checks run after address resolution. Thread-sensitive operations still require their own thread precondition, and identity/grant/lease checks belong to the real owner executor; a syntactically valid context alone authorizes no effect.
+
+The compiled schemas use explicit formats for unsigned 64-bit strings and Windows paths. The independent checker supplies these format validators and checks native acceptance against the same normative limits, including uint64 overflow. Real SQLite insert/query/uniqueness and bounded JavaScript evaluation verify source-library linkage; HTTP parser framing/limit checks verify parser behavior without opening a listener. These checks do not verify persistent storage, script sandboxing, a broker endpoint or debugger operations. Those roadmap gates remain open.
 
 For source inventory, supply the exact captured catalog. Include a captured runtime snapshot to add shipped runtime operations and, when present beside it, `plugin-resources.json`. Registry refresh is explicit:
 

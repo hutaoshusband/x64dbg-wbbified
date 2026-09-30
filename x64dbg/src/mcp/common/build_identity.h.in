@@ -1,0 +1,6 @@
+#pragma once
+
+namespace wininspect::mcp
+{
+inline constexpr char BuildId[] = "@MCP_BUILD_ID@";
+}

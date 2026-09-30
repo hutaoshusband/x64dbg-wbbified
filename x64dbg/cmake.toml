@@ -5,6 +5,7 @@ cmkr-include = "cmake/cmkr.cmake"
 [options]
 X64DBG_BUILD_IN_TREE = true
 X64DBG_RELEASE = false
+X64DBG_BUILD_MCP = true
 
 [variables]
 CMAKE_MODULE_PATH = "${CMAKE_SOURCE_DIR}/cmake"
@@ -23,6 +24,7 @@ include-after = [
 [conditions]
 x86 = "CMAKE_SIZEOF_VOID_P EQUAL 4"
 x64 = "CMAKE_SIZEOF_VOID_P EQUAL 8"
+mcp = "X64DBG_BUILD_MCP"
 
 [find-package]
 Qt5 = { components = ["Widgets", "WinExtras"] }
@@ -285,3 +287,24 @@ msvc.link-options = [
 ]
 dependencies = ["exe"]
 compile-features = ["cxx_std_17"]
+
+[target.mcp_common]
+type = "static"
+condition = "mcp"
+sources = ["src/mcp/common/*.cpp", "src/mcp/common/*.h"]
+include-before = ["src/mcp/dependencies.cmake"]
+include-directories = ["src/mcp/common"]
+link-libraries = ["mcp_json"]
+compile-features = ["cxx_std_17"]
+
+[target.mcp_contract_fixture]
+type = "executable"
+condition = "mcp"
+sources = ["src/mcp/testing/contracts.cpp"]
+link-libraries = ["::mcp_common", "mcp_http", "mcp_sqlite", "mcp_quickjs"]
+compile-features = ["cxx_std_17"]
+msvc.link-options = ["/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
+
+[target.mcp_contract_fixture.properties]
+OUTPUT_NAME = "wininspect-mcp-contract-fixture"
+EXCLUDE_FROM_ALL = true

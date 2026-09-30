@@ -1,0 +1,8 @@
+SQLite 3.53.4
+
+SQLite is in the public domain. Its authors have dedicated the deliverable
+SQLite code and documentation to the public domain. The amalgamation source
+notices are preserved in the fetched source.
+
+Source: https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip
+Copyright statement: https://www.sqlite.org/copyright.html

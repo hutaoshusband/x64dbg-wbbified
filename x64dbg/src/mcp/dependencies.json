@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "reviewedAt": "2026-10-01",
+  "architectures": [
+    "x64",
+    "x32"
+  ],
+  "runtimeProof": "Exact source-built fixture on the current Windows host; older OS and minimum compiler remain unverified until exercised",
+  "licenseCompatibilitySource": "https://www.gnu.org/licenses/license-list.html.html",
+  "ownedCodeLicense": "Root LICENSE scopes MIT to owned contributions; original debugger license remains unchanged",
+  "dependencies": [
+    {
+      "role": "http",
+      "name": "Boost.Beast/Asio",
+      "version": "1.92.0",
+      "sourceUrl": "https://archives.boost.io/release/1.92.0/source/boost_1_92_0.tar.gz",
+      "archiveSha256": "c4a3b310ddd2472416e091067166b0713be97c63f38c212c484ada022fd296ce",
+      "license": "BSL-1.0",
+      "upstreamReference": "https://www.boost.org/releases/1.92.0/",
+      "notice": "boost.txt",
+      "languageRequirement": "C++11; project uses C++17",
+      "windowsRequirement": "_WIN32_WINNT=0x0601",
+      "compilerVerification": "MSVC toolchain recorded by the exact build receipt; no lower compiler claim",
+      "noticeSha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+      "configuration": [
+        "Header sources compiled into native code",
+        "No implicit prebuilt Boost libraries",
+        "No TLS or public listener in this foundation checkpoint"
+      ]
+    },
+    {
+      "role": "json",
+      "name": "nlohmann/json",
+      "version": "3.12.0",
+      "sourceUrl": "https://codeload.github.com/nlohmann/json/tar.gz/refs/tags/v3.12.0",
+      "archiveSha256": "4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187",
+      "license": "MIT",
+      "upstreamReference": "https://github.com/nlohmann/json/releases/tag/v3.12.0",
+      "notice": "json.txt",
+      "languageRequirement": "C++11; project uses C++17",
+      "windowsRequirement": "No OS APIs in parser",
+      "compilerVerification": "MSVC toolchain recorded by the exact build receipt; no lower compiler claim",
+      "noticeSha256": "46a65cffd1ea955132d95a8dd921640714a8d6b537d2e4e482d31145ae95b603"
+    },
+    {
+      "role": "store",
+      "name": "SQLite",
+      "version": "3.53.4",
+      "sourceUrl": "https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip",
+      "archiveSha256": "1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d",
+      "license": "Public-Domain",
+      "upstreamReference": "https://www.sqlite.org/download.html",
+      "notice": "sqlite.txt",
+      "languageRequirement": "ISO C source amalgamation",
+      "windowsRequirement": "Windows VFS; minimum OS requires runtime verification",
+      "compilerVerification": "MSVC toolchain recorded by the exact build receipt; no lower compiler claim",
+      "archiveSha3_256": "628a44cfe82c66aed1ccbbe85a562d2e33ebe64b3288981ed76285612227934e",
+      "configuration": [
+        "SQLITE_THREADSAFE=1",
+        "SQLITE_DQS=0",
+        "SQLITE_DEFAULT_FOREIGN_KEYS=1",
+        "SQLITE_OMIT_LOAD_EXTENSION"
+      ]
+    },
+    {
+      "role": "javascript",
+      "name": "QuickJS-NG",
+      "version": "0.17.0",
+      "sourceUrl": "https://codeload.github.com/quickjs-ng/quickjs/tar.gz/refs/tags/v0.17.0",
+      "archiveSha256": "559bc4c420475e55c7ab4510adbc562f55d7524d75e8e89d79ce4bb02f5687d9",
+      "license": "MIT",
+      "upstreamReference": "https://github.com/quickjs-ng/quickjs/releases/tag/v0.17.0",
+      "notice": "quickjs.txt",
+      "languageRequirement": "C11; MSVC C11 atomics enabled",
+      "windowsRequirement": "_WIN32_WINNT=0x0601 in upstream build",
+      "compilerVerification": "MSVC toolchain recorded by the exact build receipt; no lower compiler claim",
+      "noticeSha256": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171",
+      "configuration": [
+        "Core VM only",
+        "No quickjs-libc, std/os modules or standalone qjs executable",
+        "Separate constrained native script process required in WP-19"
+      ]
+    }
+  ]
+}

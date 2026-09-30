@@ -34,6 +34,7 @@ endif()
 # Options
 option(X64DBG_BUILD_IN_TREE "" ON)
 option(X64DBG_RELEASE "" OFF)
+option(X64DBG_BUILD_MCP "" ON)
 
 # Variables
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
@@ -1179,4 +1180,81 @@ add_dependencies(headless
 get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
 if(NOT CMKR_VS_STARTUP_PROJECT)
 	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT headless)
+endif()
+
+# Target: mcp_common
+if(X64DBG_BUILD_MCP) # mcp
+	set(CMKR_TARGET mcp_common)
+	include("src/mcp/dependencies.cmake")
+
+	set(mcp_common_SOURCES
+		cmake.toml
+		"src/mcp/common/contracts.cpp"
+		"src/mcp/common/contracts.h"
+	)
+
+	add_library(mcp_common STATIC)
+
+	target_sources(mcp_common PRIVATE ${mcp_common_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${mcp_common_SOURCES})
+
+	target_compile_features(mcp_common PUBLIC
+		cxx_std_17
+	)
+
+	target_include_directories(mcp_common PUBLIC
+		"src/mcp/common"
+	)
+
+	target_link_libraries(mcp_common PUBLIC
+		mcp_json
+	)
+
+endif()
+# Target: mcp_contract_fixture
+if(X64DBG_BUILD_MCP) # mcp
+	set(mcp_contract_fixture_SOURCES
+		cmake.toml
+		"src/mcp/testing/contracts.cpp"
+	)
+
+	add_executable(mcp_contract_fixture)
+
+	target_sources(mcp_contract_fixture PRIVATE ${mcp_contract_fixture_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${mcp_contract_fixture_SOURCES})
+
+	target_compile_features(mcp_contract_fixture PRIVATE
+		cxx_std_17
+	)
+
+	if(NOT TARGET mcp_common)
+		message(FATAL_ERROR "Target \"mcp_common\" referenced by \"mcp_contract_fixture\" does not exist!")
+	endif()
+
+	target_link_libraries(mcp_contract_fixture PRIVATE
+		mcp_common
+		mcp_http
+		mcp_sqlite
+		mcp_quickjs
+	)
+
+	if(MSVC) # msvc
+		target_link_options(mcp_contract_fixture PRIVATE
+			"/MANIFEST:EMBED"
+			"/MANIFESTUAC:level='asInvoker' uiAccess='false'"
+		)
+	endif()
+
+	set_target_properties(mcp_contract_fixture PROPERTIES
+		OUTPUT_NAME
+			wininspect-mcp-contract-fixture
+		EXCLUDE_FROM_ALL
+			ON
+	)
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT mcp_contract_fixture)
+	endif()
+
 endif()

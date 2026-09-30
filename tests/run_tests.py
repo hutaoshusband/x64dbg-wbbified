@@ -127,7 +127,7 @@ def run_hide_case(environment, hidden, results, timeout):
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Isolated WinInspect verification suite")
-    parser.add_argument("--phase", choices=("baseline", "functional", "defects", "contracts", "surface", "fixtures", "inventory", "build", "native"), default="baseline")
+    parser.add_argument("--phase", choices=("baseline", "functional", "defects", "contracts", "surface", "fixtures", "inventory", "build", "native", "mcp-contracts"), default="baseline")
     parser.add_argument("--arch", choices=("x64", "x32", "all"), default="x64")
     parser.add_argument("--case", action="append", default=[], help="Select a case name or glob; repeatable")
     parser.add_argument("--deploy", type=Path, help="Read-only source deployment for one architecture")
@@ -193,6 +193,9 @@ def main():
         names = ["test_fixture_oracles" if arguments.phase == "fixtures" else "test_source_inventory"]
     if arguments.phase in ("native", "build"):
         names = [arguments.phase]
+    if arguments.phase == "mcp-contracts":
+        from native_contracts import CASE_NAMES
+        names = list(CASE_NAMES)
     if arguments.phase == "baseline":
         names.extend(("test_peb_autohide_on", "test_peb_autohide_control"))
     selected_names = [name for name in names if not arguments.case or
@@ -207,7 +210,7 @@ def main():
     if private_root.is_relative_to(ROOT):
         raise McpError("Evidence must stay outside the project workspace")
     private_root.mkdir(parents=True, exist_ok=True)
-    run_root = Path(tempfile.mkdtemp(prefix="wp00-", dir=private_root))
+    run_root = Path(tempfile.mkdtemp(prefix="wp01-" if arguments.phase == "mcp-contracts" else "wp00-", dir=private_root))
     print(f"Private evidence: {run_root}", flush=True)
     if arguments.phase == "native":
         return run_native_suite(arguments, run_root)
@@ -216,6 +219,24 @@ def main():
         for architecture in architectures:
             build_debugger(run_root, architecture)
         return 0
+    if arguments.phase == "mcp-contracts":
+        from native_contracts import build_contract_fixture, run_contract_checks
+        architectures = ("x64", "x32") if arguments.arch == "all" else (arguments.arch,)
+        results = []
+        catalogs = []
+        for architecture in architectures:
+            try:
+                binary = build_contract_fixture(run_root, architecture)
+                checks, catalog = run_contract_checks(binary, run_root / architecture, architecture, arguments.case, arguments.timeout)
+                results.extend(checks)
+                catalogs.append(catalog)
+            except Exception as error:
+                results.append({"architecture": architecture, "name": "environment", "status": "failed", "error": str(error)})
+                print(f"[FAILED] {architecture}: {error}", flush=True)
+        if len(catalogs) == 2 and catalogs[0]["contracts"] != catalogs[1]["contracts"]:
+            results.append({"name": "cross_architecture_contracts", "status": "failed", "error": "Compiled schemas differ"})
+        write_json(run_root / "summary.json", {"phase": arguments.phase, "results": results})
+        return int(any(result["status"] != "verified" for result in results))
     if arguments.phase == "inventory":
         from inventory import run_inventory
         outcome = run_inventory(run_root, arguments.catalog, arguments.refresh_registries, arguments.runtime_surface)
