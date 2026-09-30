@@ -33,7 +33,11 @@ For source inventory, supply the exact captured catalog. Include a captured runt
 python tests/run_tests.py --phase inventory --catalog C:/private-run/x64/legacy-catalog.json --runtime-surface C:/private-run/x64/runtime-surface-paused.json --refresh-registries
 ```
 
-The legacy manifest records the observed external plugin contracts and canonical migration destinations. The parity manifest records source and runtime discovery candidates. Its rows remain planned until actual agent routes satisfy the independent native parity predicates. Candidate totals do not establish complete semantic parity. Dynamic context menus, lazy dialogs, provider effects and state classifications still need reconciliation.
+The legacy manifest records the observed external plugin contracts and canonical migration destinations. The parity manifest records source and runtime discovery candidates. Source declarations and definitions are excluded explicitly; factories and GUI signal/menu bindings remain separate, auditable records. Command aliases share their registration identity, settings share their section/key identity, and generated settings retain their native key patterns, default values and index expressions. Native callbacks, conditional registration guards, architecture branches and programmatic dialog inputs retain their source locations.
+
+Runtime reconciliation requires the snapshot's adjacent owned-process evidence receipt. The retained process identity, capture state, module hashes and architecture identify the observed build. Registered command names and script providers reconcile against source rows. Shipped plugin resource rows use the captured PE architecture, while unresolved runtime surfaces and plugin configuration rows apply only to the observed architecture. A recorded x64 capture does not establish x32 availability.
+
+All operation rows remain planned until actual agent routes satisfy the independent native parity predicates. Candidate totals do not establish complete semantic parity. Dynamic context menus, lazy dialogs, opaque provider effects and state classifications still need reconciliation; runtime GUI identities need semantic source/provider bindings.
 
 ## Isolation and retained evidence
 

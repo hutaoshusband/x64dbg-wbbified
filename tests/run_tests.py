@@ -194,7 +194,7 @@ def main():
         from inventory import run_inventory
         outcome = run_inventory(run_root, arguments.catalog, arguments.refresh_registries, arguments.runtime_surface)
         write_json(run_root / "summary.json", outcome)
-        print(f"Reconciled {outcome['legacy']['count']} legacy tools; source candidates: {outcome['categories']}", flush=True)
+        print(f"Reconciled {outcome['legacy']['count']} legacy tools; parity candidates: {outcome['categories']}", flush=True)
         print("Runtime provider reconciliation remains pending", flush=True)
         return 0
     architectures = ("x64", "x32") if arguments.arch == "all" else (arguments.arch,)
