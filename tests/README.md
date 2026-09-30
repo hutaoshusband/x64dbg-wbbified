@@ -50,3 +50,5 @@ Evidence includes requests without authentication headers, catalog contracts, ta
 ## Native log compatibility
 
 The inherited regression runner recognizes both upstream `[x64dbg-test]` and fork `[wi-test]` final markers. A reported failure remains a failure; successful parser recognition cannot override a failed assertion, missing final marker, timeout or unsuccessful process exit. Existing native drivers and checker modules remain authoritative for their individual bundles.
+
+Native test scripts are staged with `configure_file(COPYONLY)`. CMake tracks their contents and refreshes the runtime copies when a script changes, including builds that require no C++ recompilation. Tests therefore execute the current source script instead of a copy left over from the last link step.

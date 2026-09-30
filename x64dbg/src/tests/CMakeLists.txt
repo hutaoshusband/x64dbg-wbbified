@@ -99,7 +99,6 @@ function(x64dbg_add_test)
     x64dbg_set_output_dir(${test_target} "${X64DBG_TEST_OUTPUT_DIR}")
 
     set(test_dependencies ${test_target})
-    set(test_copy_target ${test_target})
 
     if(TEST_PLUGIN_SOURCE)
         set(test_plugin_source_path "${test_source_dir}/${TEST_PLUGIN_SOURCE}")
@@ -137,27 +136,13 @@ function(x64dbg_add_test)
         x64dbg_set_output_dir(${test_plugin} "${test_runtime_dir}")
 
         list(APPEND test_dependencies ${test_plugin})
-        set(test_copy_target ${test_plugin})
     endif()
 
     file(GLOB test_scripts CONFIGURE_DEPENDS "${test_source_dir}/test*.txt")
-    if(test_scripts)
-        set(test_copy_commands
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${test_runtime_dir}"
-        )
-        foreach(test_script ${test_scripts})
-            get_filename_component(test_script_name "${test_script}" NAME)
-            list(APPEND test_copy_commands
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${test_script}"
-                    "${test_runtime_dir}/${test_script_name}"
-            )
-        endforeach()
-
-        add_custom_command(TARGET ${test_copy_target} POST_BUILD
-            ${test_copy_commands}
-        )
-    endif()
+    foreach(test_script ${test_scripts})
+        get_filename_component(test_script_name "${test_script}" NAME)
+        configure_file("${test_script}" "${test_runtime_dir}/${test_script_name}" COPYONLY)
+    endforeach()
 
     add_dependencies(x64dbg_tests ${test_dependencies})
 endfunction()
