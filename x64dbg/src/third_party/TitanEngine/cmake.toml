@@ -1,0 +1,32 @@
+[project]
+name = "TitanEngine"
+msvc-runtime = "static"
+
+[options]
+TITANENGINE_RESOURCES = true
+
+[target.distorm]
+type = "static"
+sources = ["distorm/src/*.c"]
+headers = ["distorm/src/*.h", "distorm/include/*.h"]
+include-directories = ["distorm/include"]
+
+[target.scylla_wrapper]
+type = "static"
+sources = ["scylla_wrapper/*.cpp"]
+headers = ["scylla_wrapper/*.h", "scylla_wrapper/include/*.h"]
+link-libraries = ["::distorm"]
+include-directories = ["scylla_wrapper/include"]
+compile-features = ["cxx_std_11"]
+
+[target.TitanEngine]
+type = "shared"
+sources = ["TitanEngine/*.cpp"]
+headers = ["TitanEngine/*.h"]
+private-link-libraries = ["::scylla_wrapper", "Psapi.lib"]
+x64.private-link-libraries = ["TitanEngine/ntdll_x64.lib"]
+x32.private-link-libraries = ["TitanEngine/ntdll_x86.lib"]
+TITANENGINE_RESOURCES.sources = ["TitanEngine/TitanEngine.rc"]
+msvc.link-options = [
+    "/PDBALTPATH:$<TARGET_PDB_FILE_NAME:TitanEngine>",
+]

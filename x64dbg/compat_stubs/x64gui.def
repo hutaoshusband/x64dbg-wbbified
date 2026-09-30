@@ -1,0 +1,5 @@
+LIBRARY x64gui
+EXPORTS
+  _gui_guiinit=wingui._gui_guiinit
+  _gui_sendmessage=wingui._gui_sendmessage
+  _gui_translate_text=wingui._gui_translate_text

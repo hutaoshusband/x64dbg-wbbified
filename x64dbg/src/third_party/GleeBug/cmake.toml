@@ -1,0 +1,36 @@
+[project]
+name = "GleeBug"
+
+[options]
+GLEEBUG_RESOURCES = true
+
+[target.GleeBug]
+type = "static"
+sources = ["GleeBug/Zydis/*.c", "GleeBug/*.cpp"]
+headers = ["GleeBug/Zydis/*.h", "GleeBug/*.h"]
+include-directories = ["."]
+compile-features = ["cxx_std_23"]
+compile-definitions = ["NOMINMAX"]
+x64.link-libraries = ["GleeBug/ntdll_x64.lib"]
+x32.link-libraries = ["GleeBug/ntdll_x86.lib"]
+
+[target.MyDebugger]
+condition = "root"
+type = "executable"
+sources = ["MyDebugger/*.cpp"]
+headers = ["MyDebugger/*.h"]
+link-libraries = ["::GleeBug"]
+
+[target.GleeBugStaticEngine]
+type = "shared"
+sources = ["StaticEngine/*.cpp"]
+headers = ["StaticEngine/*.h"]
+private-link-libraries = ["::GleeBug"]
+
+[target.GleeBugTitanEngine]
+type = "shared"
+sources = ["TitanEngineEmulator/*.cpp"]
+GLEEBUG_RESOURCES.sources = ["TitanEngineEmulator/TitanEngine.rc"]
+headers = ["TitanEngineEmulator/*.h"]
+private-link-libraries = ["::GleeBug"]
+include-after = ["output-folders.cmake"]

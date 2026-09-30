@@ -1,0 +1,126 @@
+# Reference: https://build-cpp.github.io/cmkr/cmake-toml
+[cmake]
+version = "3.19"
+cmkr-include = false
+
+[project]
+name = "ElfBug_tests"
+
+[fetch-content.Catch2]
+git = "https://github.com/catchorg/Catch2"
+tag = "v3.14.0"
+shallow = true
+
+[target.ElfBug_tests]
+type = "executable"
+sources = ["tests.cpp", "api_c_compat.c"]
+headers = [
+    "TestHarness.h",
+    "SymbolHelper.h",
+]
+link-libraries = ["ElfBug", "Catch2::Catch2WithMain"]
+compile-features = ["cxx_std_20", "c_std_11"]
+compile-definitions = ['ELFBUG_TESTS_TARGETS_DIR="${CMAKE_BINARY_DIR}/tests/targets"']
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests"
+properties.C_STANDARD = 11
+properties.C_STANDARD_REQUIRED = true
+cmake-after = """
+list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
+include(Catch)
+catch_discover_tests(ElfBug_tests)
+add_dependencies(ElfBug_tests
+    elfbug_fixture_end_immediately
+    elfbug_fixture_exit_code_42
+    elfbug_fixture_hello_elfbug
+    elfbug_fixture_run_endlessly
+    elfbug_fixture_segfault
+    elfbug_fixture_multi_threaded
+    elfbug_fixture_step_over_targets
+    elfbug_fixture_exec_target
+    elfbug_fixture_threads_spin
+    elfbug_fixture_exit_race
+    elfbug_fixture_signal_race
+    elfbug_fixture_clone_trap
+)
+"""
+
+[template.elfbug_fixture]
+type = "executable"
+compile-options = ["-g", "-O0", "-pie"]
+link-options = ["-pie"]
+
+[target.elfbug_fixture_end_immediately]
+type = "elfbug_fixture"
+sources = ["targets/end_immediately.cpp"]
+properties.OUTPUT_NAME = "end_immediately"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_run_endlessly]
+type = "elfbug_fixture"
+sources = ["targets/run_endlessly.cpp"]
+properties.OUTPUT_NAME = "run_endlessly"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_hello_elfbug]
+type = "elfbug_fixture"
+sources = ["targets/hello_elfbug.cpp"]
+properties.OUTPUT_NAME = "hello_elfbug"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_segfault]
+type = "elfbug_fixture"
+sources = ["targets/segfault.cpp"]
+properties.OUTPUT_NAME = "segfault"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_exit_code_42]
+type = "elfbug_fixture"
+sources = ["targets/exit_code_42.cpp"]
+properties.OUTPUT_NAME = "exit_code_42"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_multi_threaded]
+type = "elfbug_fixture"
+sources = ["targets/multi_threaded.cpp"]
+link-libraries = ["pthread"]
+properties.OUTPUT_NAME = "multi_threaded"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_step_over_targets]
+type = "elfbug_fixture"
+sources = ["targets/step_over_targets.cpp"]
+properties.OUTPUT_NAME = "step_over_targets"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_exec_target]
+type = "elfbug_fixture"
+sources = ["targets/exec_target.cpp"]
+properties.OUTPUT_NAME = "exec_target"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_threads_spin]
+type = "elfbug_fixture"
+sources = ["targets/threads_spin.cpp"]
+link-libraries = ["pthread"]
+properties.OUTPUT_NAME = "threads_spin"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_exit_race]
+type = "elfbug_fixture"
+sources = ["targets/exit_race.cpp"]
+link-libraries = ["pthread"]
+properties.OUTPUT_NAME = "exit_race"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_signal_race]
+type = "elfbug_fixture"
+sources = ["targets/signal_race.cpp"]
+link-libraries = ["pthread"]
+properties.OUTPUT_NAME = "signal_race"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"
+
+[target.elfbug_fixture_clone_trap]
+type = "elfbug_fixture"
+sources = ["targets/clone_trap.cpp"]
+properties.OUTPUT_NAME = "clone_trap"
+properties.RUNTIME_OUTPUT_DIRECTORY = "${CMAKE_BINARY_DIR}/tests/targets"

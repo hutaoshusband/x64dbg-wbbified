@@ -1,0 +1,7 @@
+_build*/
+*.chm
+python-2.7.18.amd64.portable/
+hha.dll
+hhc.exe
+itcc.dll
+*.7z

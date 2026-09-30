@@ -1,0 +1,8 @@
+*.sdf
+*.opensdf
+*.suo
+Release/
+Debug/
+My Amplifier XE Results */
+actual.out
+expected.out

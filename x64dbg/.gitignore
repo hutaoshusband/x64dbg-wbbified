@@ -1,0 +1,44 @@
+# Output folders
+/bin/*/
+/bin/*.exe
+/bin/*.dll
+/bin/*.ini
+/bin/*.chm
+/bin/*.zip
+/bin/release-notes.md
+!/bin/themes/
+/src/**/x64/
+/src/**/Win32/
+/src/gui_build/
+/release/
+
+# Folders
+.vs/
+.vscode/
+.idea/
+build*/
+cmake-build*/
+dist/
+
+# Extensions/files
+*.sdf
+*.suo
+*.VC.db
+*.vcxproj.user
+*.aps
+*.pro.user*
+*.orig
+*.pdb
+*.ilk
+.DS_Store
+Makefile
+Makefile.*
+
+CMakeLists.txt.user
+/.cache
+CMakeUserPresets.json
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/

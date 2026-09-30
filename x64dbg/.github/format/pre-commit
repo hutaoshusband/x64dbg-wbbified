@@ -1,0 +1,48 @@
+#!/bin/sh
+#
+# Simple script to auto-format every source file before committing.
+#
+
+# Check if the formatter is present
+if [ ! -f .github/format/AStyleHelper.exe ]; then
+    echo "AStyleHelper not found!"
+    exit 0
+fi
+
+# Get stamp file epoch (default to 0)
+STAMP_EPOCH=$(date -u -r .git/AStyleHelper.stamp +%s 2>/dev/null)
+STAMP_EPOCH=${STAMP_EPOCH:-0}
+
+# If the HEAD is newer than the stamp (we switched branches), set stamp to 0
+if [ $(date -u -r .git/HEAD +%s 2>/dev/null) -gt $STAMP_EPOCH ]; then
+    echo "AStyleHelper: branch switched, performing full formatting"
+    STAMP_EPOCH=0
+fi
+
+# Format the code
+".github/format/AStyleHelper.exe" Silent $STAMP_EPOCH
+FORMAT_STATUS=$?
+
+# Touch the stamp file to indicate when the last formatting was done
+touch .git/AStyleHelper.stamp
+
+# Exit when nothing needs to be done
+if [ $FORMAT_STATUS -eq 0 ]; then
+    echo "AStyleHelper: no formatting needed"
+    exit 0
+fi
+
+# Stage the formatted files (when staged in this commit)
+GIT_FILES=$(git diff-index --name-only --cached HEAD)
+if [[ -n "$GIT_FILES" ]]; then
+    for GIT_FILE in $GIT_FILES; do
+        git add --all -- "$GIT_FILE"
+    done
+fi
+
+# Cancel commit if the changes were undone by the formatting
+GIT_FILES=$(git diff-index --name-only --cached HEAD)
+if [ -z "$GIT_FILES" ]; then
+    ".github/format/AStyleHelper.exe" "After formatting, no files were staged..."
+    exit 1
+fi
