@@ -7,7 +7,7 @@ is a fork of x64dbg: https://github.com/x64dbg/x64dbg
 Essentially x64dbg WBB-ified provides these two updates:
 
 - Additional Anti-Detection against Anti-Debug measures.
-- Native in-built and oneclick MCP Server for AI-Agents
+- Native in-built and oneclick MCP Server for AI-Agents. Objectively **the most** agentic MCP containing tools for each action a user would be able to interact in the GUI.
 
 ## Contributing
 
