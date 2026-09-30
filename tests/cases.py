@@ -1,7 +1,7 @@
 import os
 import re
 
-from wi_driver import BPMAIN_EXE, BPMAIN_MARKER, EXITMARK_EXE, EXITMARK_MARKER, McpError, read_kv, wipe_markers
+from wi_driver import McpError, read_kv
 
 REQUIRED_TOOLS = {"LoadBinary", "run", "GetDebugState", "StopDebug", "SetBreakpoint",
                   "DeleteAllBreakpoints", "ListBreakpoints", "GetAllRegisters", "SetRegister",
@@ -35,20 +35,21 @@ def test_eval_expression(wi):
 
 def test_exitmark_run_to_completion(wi):
     wi.safe_stop()
-    wipe_markers()
-    r = wi.load(EXITMARK_EXE)
+    wi.wipe_markers()
+    r = wi.load(wi.fixture("exitmark"))
     assert "SUCCESS" in r, r[:200]
     info = wi.resume_until()
     assert info["terminated"], "debuggee did not terminate, last state: %s" % info["last"]
-    assert os.path.exists(EXITMARK_MARKER), "marker file missing"
-    kv = read_kv(EXITMARK_MARKER)
+    assert os.path.exists(wi.marker("exitmark")), "marker file missing"
+    kv = read_kv(wi.marker("exitmark"))
     assert kv.get("marker") == "done", str(kv)
+    return {"marker": kv, "execution": info}
 
 
 def load_paused_at_bp(wi, bp_expr):
     wi.safe_stop()
-    wipe_markers()
-    r = wi.load(BPMAIN_EXE)
+    wi.wipe_markers()
+    r = wi.load(wi.fixture("bpmain"))
     assert "SUCCESS" in r, r[:200]
     r = wi.call("SetBreakpoint", {"target": bp_expr})
     assert "Breakpoint" in r, r[:200]
@@ -63,13 +64,14 @@ def test_breakpoint_hits(wi):
     addr = load_paused_at_bp(wi, "bpmain.exe:brk_target")
     lst = wi.call("ListBreakpoints")
     assert "0x%X" % addr in lst, lst[:300]
-    info = wi.resume_until(marker=BPMAIN_MARKER, bp_addr=addr)
-    assert os.path.exists(BPMAIN_MARKER), "marker file missing"
-    kv = read_kv(BPMAIN_MARKER)
+    info = wi.resume_until(marker=wi.marker("bpmain"), bp_addr=addr)
+    assert os.path.exists(wi.marker("bpmain")), "marker file missing"
+    kv = read_kv(wi.marker("bpmain"))
     assert kv.get("marker") == "done", str(kv)
     assert kv.get("hits") == "2", str(kv)
     assert info["bp_hits"] >= 1, "expected second bp hit, got %d, last state: %s" % (info["bp_hits"], info["last"])
     wi.safe_stop()
+    return {"marker": kv, "breakpointAddress": "0x%X" % addr, "execution": info}
 
 
 def test_inspection_at_breakpoint(wi):
@@ -133,17 +135,19 @@ def test_inspection_at_breakpoint(wi):
     lst = wi.call("ListBreakpoints")
     assert "0x%X" % addr not in lst, lst[:300]
 
-    info = wi.resume_until(marker=BPMAIN_MARKER)
-    assert os.path.exists(BPMAIN_MARKER), "marker file missing, last state: %s" % info["last"]
-    kv = read_kv(BPMAIN_MARKER)
+    info = wi.resume_until(marker=wi.marker("bpmain"))
+    assert os.path.exists(wi.marker("bpmain")), "marker file missing, last state: %s" % info["last"]
+    kv = read_kv(wi.marker("bpmain"))
     assert kv.get("hits") == "2", str(kv)
     wi.safe_stop()
+    return {"marker": kv, "registers": regs, "moduleHeader": mz.hex(), "writtenBytes": rb.hex(),
+            "execution": info}
 
 
 def test_eventlog_and_command(wi):
     wi.safe_stop()
-    wipe_markers()
-    r = wi.load(EXITMARK_EXE)
+    wi.wipe_markers()
+    r = wi.load(wi.fixture("exitmark"))
     assert "SUCCESS" in r, r[:200]
     log = wi.call("GetEventLog", {"count": 8})
     assert "Events" in log, log[:200]

@@ -1,252 +1,478 @@
+import ctypes
+from ctypes import wintypes
+import hashlib
 import json
 import os
+from pathlib import Path
 import re
+import secrets
 import shutil
 import socket
 import subprocess
 import time
 import urllib.request
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WI64 = os.path.join(ROOT, "WinTools", "x64")
-EXE = os.path.join(WI64, "wininspect.exe")
-PLUGINS = os.path.join(WI64, "plugins")
-INI = os.path.join(WI64, "wininspect.ini")
-TARGETS = os.path.join(ROOT, "tests", "targets")
-TMP = os.path.join(ROOT, "tests", "tmp")
-BUILD_BAT = os.path.join(TARGETS, "build.bat")
 
-EXITMARK_EXE = os.path.join(TARGETS, "exitmark.exe")
-BPMAIN_EXE = os.path.join(TARGETS, "bpmain.exe")
-PROBE_EXE = os.path.join(TARGETS, "probe.exe")
-EXITMARK_MARKER = os.path.join(TARGETS, "exitmark_result.txt")
-BPMAIN_MARKER = os.path.join(TARGETS, "bpmain_result.txt")
-PROBE_MARKER = os.path.join(TARGETS, "probe_result.txt")
-
+ROOT = Path(__file__).resolve().parent.parent
+TARGET_SOURCES = ROOT / "tests" / "targets"
 HOST = "127.0.0.1"
-PORT = 9094
-URL = "http://%s:%d/" % (HOST, PORT)
-
-SCYLLA_FILES = ["ScyllaHideX64DBGPlugin.dp64", "HookLibraryx64.dll", "scylla_hide.ini", "scylla_hide.log"]
-SCYLLA_STASH = os.path.join(TMP, "scylla_stash")
-
-MARKERS = [EXITMARK_MARKER, BPMAIN_MARKER, PROBE_MARKER]
+KERNEL = ctypes.WinDLL("kernel32", use_last_error=True)
+PSAPI = ctypes.WinDLL("psapi", use_last_error=True)
+USER = ctypes.WinDLL("user32", use_last_error=True)
+JOB_OBJECT_KILL_ON_CLOSE = 0x2000
+JOB_OBJECT_EXTENDED_LIMITS = 9
+TCP_OWNER_PID_LISTENERS = 3
+WINDOW_CLOSE = 0x10
+KERNEL.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+KERNEL.CreateJobObjectW.restype = wintypes.HANDLE
+KERNEL.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+KERNEL.SetInformationJobObject.restype = wintypes.BOOL
+KERNEL.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+KERNEL.AssignProcessToJobObject.restype = wintypes.BOOL
+KERNEL.CloseHandle.argtypes = [wintypes.HANDLE]
+KERNEL.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+PSAPI.EnumProcessModulesEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+PSAPI.GetModuleFileNameExW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+USER.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+USER.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 
 
 class McpError(Exception):
     pass
 
 
-def token():
-    with open(os.path.join(WI64, "mcp_config.json")) as f:
-        return json.load(f)["AuthToken"]
+class JobLimits(ctypes.Structure):
+    _fields_ = [("processTime", ctypes.c_int64), ("jobTime", ctypes.c_int64),
+                ("flags", wintypes.DWORD), ("minimumWorkingSet", ctypes.c_size_t),
+                ("maximumWorkingSet", ctypes.c_size_t), ("activeProcessLimit", wintypes.DWORD),
+                ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+                ("scheduling", wintypes.DWORD)]
 
 
-def wait_port(up=True, timeout=60.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            socket.create_connection((HOST, PORT), 1).close()
-            reachable = True
-        except OSError:
-            reachable = False
-        if reachable == up:
-            return True
-        time.sleep(0.3)
-    return False
+class IoCounters(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in
+                ("readOperations", "writeOperations", "otherOperations", "readBytes", "writeBytes", "otherBytes")]
 
 
-def set_ini_flag(value):
-    lines = []
-    if os.path.exists(INI):
-        with open(INI, encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
-    out = []
-    section = None
-    found = False
-    for ln in lines:
-        s = ln.strip()
-        if s.startswith("[") and s.endswith("]"):
-            if section == "Engine" and not found:
-                out.append("HideDebugger=%d" % value)
-                found = True
-            section = s[1:-1]
-        elif section == "Engine" and s.lower().startswith("hidedebugger="):
-            out.append("HideDebugger=%d" % value)
-            found = True
-            continue
-        out.append(ln)
-    if section == "Engine" and not found:
-        out.append("HideDebugger=%d" % value)
-        found = True
-    if not found:
-        out += ["[Engine]", "HideDebugger=%d" % value]
-    with open(INI, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
+class ExtendedJobLimits(ctypes.Structure):
+    _fields_ = [("basic", JobLimits), ("io", IoCounters), ("processMemory", ctypes.c_size_t),
+                ("jobMemory", ctypes.c_size_t), ("peakProcessMemory", ctypes.c_size_t),
+                ("peakJobMemory", ctypes.c_size_t)]
 
 
-def stash_scylla():
-    os.makedirs(SCYLLA_STASH, exist_ok=True)
-    for name in SCYLLA_FILES:
-        src = os.path.join(PLUGINS, name)
-        if os.path.exists(src):
-            shutil.move(src, os.path.join(SCYLLA_STASH, name))
+class OwnedJob:
+    def __init__(self):
+        self.handle = KERNEL.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = ExtendedJobLimits()
+        limits.basic.flags = JOB_OBJECT_KILL_ON_CLOSE
+        if not KERNEL.SetInformationJobObject(self.handle, JOB_OBJECT_EXTENDED_LIMITS, ctypes.byref(limits), ctypes.sizeof(limits)):
+            error = ctypes.get_last_error()
+            self.close()
+            raise ctypes.WinError(error)
+
+    def assign(self, process):
+        if not KERNEL.AssignProcessToJobObject(self.handle, wintypes.HANDLE(int(process._handle))):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self):
+        if self.handle:
+            KERNEL.CloseHandle(self.handle)
+            self.handle = None
 
 
-def restore_scylla():
-    if not os.path.isdir(SCYLLA_STASH):
-        return
-    for name in os.listdir(SCYLLA_STASH):
-        shutil.move(os.path.join(SCYLLA_STASH, name), os.path.join(PLUGINS, name))
+def file_identity(path):
+    path = Path(path).resolve()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return {"path": str(path), "size": path.stat().st_size, "sha256": digest.hexdigest()}
+
+
+def tree_identity(directory):
+    return [file_identity(path) for path in sorted(Path(directory).rglob("*")) if path.is_file()]
+
+
+def write_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def process_identity(process):
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not KERNEL.GetProcessTimes(wintypes.HANDLE(int(process._handle)), *(ctypes.byref(value) for value in times)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+    return {"pid": process.pid, "creationTime": str(created)}
+
+
+def loaded_modules(process):
+    modules = (wintypes.HMODULE * 2048)()
+    needed = wintypes.DWORD()
+    handle = wintypes.HANDLE(int(process._handle))
+    if not PSAPI.EnumProcessModulesEx(handle, modules, ctypes.sizeof(modules), ctypes.byref(needed), 3):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if needed.value > ctypes.sizeof(modules):
+        raise McpError("Loaded module inventory exceeded its bound")
+    result = []
+    for module in modules[:needed.value // ctypes.sizeof(wintypes.HMODULE)]:
+        buffer = ctypes.create_unicode_buffer(32768)
+        if not PSAPI.GetModuleFileNameExW(handle, module, buffer, len(buffer)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        result.append(file_identity(buffer.value))
+    return result
+
+
+def listener_pid(port):
+    library = ctypes.WinDLL("iphlpapi", use_last_error=True)
+    size = wintypes.DWORD()
+    library.GetExtendedTcpTable(None, ctypes.byref(size), False, socket.AF_INET, TCP_OWNER_PID_LISTENERS, 0)
+    if size.value > 8 * 1024 * 1024:
+        raise McpError("TCP inventory exceeded its bound")
+    buffer = ctypes.create_string_buffer(size.value)
+    result = library.GetExtendedTcpTable(buffer, ctypes.byref(size), False, socket.AF_INET, TCP_OWNER_PID_LISTENERS, 0)
+    if result:
+        raise ctypes.WinError(result)
+    rows = ctypes.cast(buffer, ctypes.POINTER(wintypes.DWORD))
+    for index in range(rows[0]):
+        offset = 1 + index * 6
+        if socket.ntohs(rows[offset + 2] & 0xFFFF) == port:
+            return rows[offset + 5]
+    return None
+
+
+def compiler_environment(architecture):
+    program_files = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    locator = program_files / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not locator.is_file():
+        raise McpError("Visual Studio discovery tool is unavailable")
+    result = subprocess.run([str(locator), "-latest", "-products", "*", "-requires",
+                             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+                            capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    development_command = Path(result.stdout.strip()) / "Common7" / "Tools" / "VsDevCmd.bat"
+    if not development_command.is_file() or any(value in str(development_command) for value in '&|<>^%!\r\n'):
+        raise McpError("Visual Studio development environment path is invalid")
+    target = "x86" if architecture == "x32" else "x64"
+    command = f'call "{development_command}" -arch={target} -host_arch=x64 >nul && set'
+    result = subprocess.run(f'cmd.exe /d /s /c "{command}"', capture_output=True, text=True,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode:
+        raise McpError(f"Visual Studio environment failed: {result.stdout} {result.stderr}")
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line and not line.startswith("="))
+
+
+def build_targets(environment):
+    compiler_variables = compiler_environment(environment.architecture)
+    search_path = next(value for key, value in compiler_variables.items() if key.lower() == "path")
+    compiler = shutil.which("cl.exe", path=search_path)
+    if not compiler:
+        raise McpError("Visual Studio compiler is unavailable")
+    logs = []
+    for source in sorted(TARGET_SOURCES.glob("*.c")):
+        optimization = "/Od" if source.stem == "bpmain" else "/O1"
+        command = [compiler, "/nologo", optimization, "/W3", str(source), f"/Fe:{source.stem}.exe"]
+        result = subprocess.run(command, cwd=environment.targets, env=compiler_variables,
+                                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        logs.append({"source": file_identity(source), "command": command,
+                     "exitCode": result.returncode, "stdout": result.stdout, "stderr": result.stderr})
+        if result.returncode:
+            write_json(environment.root / "fixture-build.json", logs)
+            raise McpError(f"Fixture build failed: {source.name}: {result.stdout} {result.stderr}")
+    write_json(environment.root / "fixture-build.json", logs)
+
+
+class SuiteEnvironment:
+    def __init__(self, root, architecture, deployment):
+        self.root = Path(root).resolve()
+        self.architecture = architecture
+        self.deployment = Path(deployment).resolve()
+        self.targets = self.root / "targets"
+        self.targets.mkdir(parents=True)
+        self.stages = {}
+        self.processes = []
+        self.requests = []
+        self.legacy_catalog = None
+        self.before = tree_identity(self.deployment)
+        self.source = {"head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+                       "status": subprocess.check_output(["git", "status", "--porcelain=v1"], cwd=ROOT, text=True),
+                       "patchSha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=ROOT)).hexdigest(),
+                       "testInputs": [file_identity(path) for path in sorted((ROOT / "tests").glob("*.py"))]}
+
+    def stage(self, plugin_profile):
+        if plugin_profile in self.stages:
+            return self.stages[plugin_profile]
+        stage = self.root / f"deploy-{plugin_profile}"
+        stage.mkdir()
+        for source in self.deployment.iterdir():
+            if source.is_file() and source.suffix.lower() in (".dll", ".exe"):
+                shutil.copy2(source, stage / source.name)
+        for directory in ("platforms", "iconengines", "imageformats", "styles"):
+            source = self.deployment / directory
+            if source.is_dir():
+                shutil.copytree(source, stage / directory)
+        plugins = stage / "plugins"
+        plugins.mkdir()
+        suffix = ".dp64" if self.architecture == "x64" else ".dp32"
+        baseline_plugin = self.deployment / "plugins" / f"x64dbg-MCP-Server{suffix}"
+        if not baseline_plugin.is_file():
+            raise McpError(f"Legacy MCP baseline plugin is unavailable for {self.architecture}")
+        shutil.copy2(baseline_plugin, plugins / baseline_plugin.name)
+        if plugin_profile == "shipped":
+            for source in (self.deployment / "plugins").iterdir():
+                if source.is_file() and source.suffix.lower() in (suffix, ".dll", ".ini"):
+                    shutil.copy2(source, plugins / source.name)
+        self.stages[plugin_profile] = stage
+        return stage
+
+    def fixture(self, name):
+        return str(self.targets / f"{name}.exe")
+
+    def marker(self, name):
+        return str(self.targets / f"{name}_result.txt")
+
+    def wipe_markers(self):
+        for marker in self.targets.glob("*_result.txt"):
+            marker.unlink()
+
+    def retain(self, results):
+        after = tree_identity(self.deployment)
+        unchanged = after == self.before
+        write_json(self.root / "requests.json", self.requests)
+        write_json(self.root / "legacy-catalog.json", self.legacy_catalog)
+        write_json(self.root / "evidence.json", {"schemaVersion": 1, "phase": "external-baseline",
+                   "source": self.source, "architecture": self.architecture, "processes": self.processes,
+                   "sourceDeployment": self.before, "fixtures": tree_identity(self.targets),
+                   "results": results, "personalDeploymentUnchanged": unchanged})
+        if not unchanged:
+            raise McpError("The personal deployment changed during verification")
 
 
 def read_kv(path):
-    with open(path) as f:
-        return dict(line.split("=", 1) for line in f.read().strip().splitlines())
-
-
-def wipe_markers():
-    for m in MARKERS:
-        if os.path.exists(m):
-            os.remove(m)
+    with open(path, encoding="utf-8") as stream:
+        return dict(line.split("=", 1) for line in stream.read().strip().splitlines())
 
 
 class WinInspect:
-    def __init__(self):
+    def __init__(self, environment, plugin_profile="shipped", hide_debugger=True, timeout=45):
+        self.environment = environment
+        self.plugin_profile = plugin_profile
+        self.hide_debugger = hide_debugger
+        self.timeout = timeout
         self.proc = None
+        self.job = None
         self.sid = None
-        self.rid = 0
-        self.auth = token()
+        self.rid = 1
+        self.auth = secrets.token_hex(32)
+        self.port = None
+        self.record = None
+
+    def fixture(self, name):
+        return self.environment.fixture(name)
+
+    def marker(self, name):
+        return self.environment.marker(name)
+
+    def wipe_markers(self):
+        self.environment.wipe_markers()
 
     def start(self):
-        self.proc = subprocess.Popen([EXE])
-        if not wait_port(up=True, timeout=60):
-            raise McpError("MCP port %d never came up" % PORT)
-        time.sleep(1.5)
-        r = self.raw({"jsonrpc": "2.0", "id": 0, "method": "initialize",
-                      "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                                 "clientInfo": {"name": "wininspect-suite", "version": "1.0"}}})
-        server = r.get("result", {}).get("serverInfo", {})
-        if not server:
-            raise McpError("initialize failed: %s" % json.dumps(r)[:300])
-        self.raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        return server
+        stage = self.environment.stage(self.plugin_profile)
+        profile = self.environment.root / f"profile-{len(self.environment.processes)}"
+        profile.mkdir()
+        (profile / "wininspect.ini").write_text(
+            f"[Engine]\nHideDebugger={int(self.hide_debugger)}\nNoConsoleWindow=1\n[Misc]\nLoadLastSession=0\n", encoding="utf-8")
+        with socket.socket() as probe:
+            probe.bind((HOST, 0))
+            self.port = probe.getsockname()[1]
+        configuration = {"IpAddress": HOST, "Port": self.port, "AutoStart": True, "AuthToken": self.auth}
+        write_json(stage / "mcp_config.json", configuration)
+        self.job = OwnedJob()
+        process_environment = os.environ.copy()
+        for variable in ("QTDIR", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QML_IMPORT_PATH", "QML2_IMPORT_PATH"):
+            process_environment.pop(variable, None)
+        self.proc = subprocess.Popen([str(stage / "wininspect.exe"), "-userdir", str(profile)],
+                                     cwd=self.environment.targets, env=process_environment)
+        try:
+            self.job.assign(self.proc)
+            self.record = {**process_identity(self.proc), "deployment": str(stage), "profile": str(profile),
+                           "port": self.port, "plugins": self.plugin_profile, "hideDebugger": self.hide_debugger}
+            self.environment.processes.append(self.record)
+            deadline = time.monotonic() + self.timeout
+            while time.monotonic() < deadline:
+                if self.proc.poll() is not None:
+                    raise McpError(f"Debugger exited during startup with code {self.proc.returncode}")
+                try:
+                    with socket.create_connection((HOST, self.port), 0.3):
+                        break
+                except OSError:
+                    time.sleep(0.15)
+            else:
+                raise McpError("Owned MCP endpoint did not become ready")
+            if listener_pid(self.port) != self.proc.pid:
+                raise McpError("MCP listener does not belong to the owned debugger process")
+            response = self.raw({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                                 "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                            "clientInfo": {"name": "wininspect-suite", "version": "2.0"}}})
+            server = response.get("result", {}).get("serverInfo", {})
+            if not server:
+                raise McpError("Legacy initialization failed")
+            self.raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            self.record["server"] = server
+            self.record["loadedModules"] = loaded_modules(self.proc)
+            return server
+        except BaseException:
+            self.stop()
+            raise
 
     def stop(self):
-        if self.proc:
-            self.proc.kill()
-            self.proc.wait()
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+                def close_owned_window(window, context):
+                    process_id = wintypes.DWORD()
+                    USER.GetWindowThreadProcessId(window, ctypes.byref(process_id))
+                    if process_id.value == self.proc.pid:
+                        USER.PostMessageW(window, WINDOW_CLOSE, 0, 0)
+                    return True
+
+                callback = callback_type(close_owned_window)
+                USER.EnumWindows(callback, 0)
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=5)
+            if self.record is not None:
+                self.record["exitCode"] = self.proc.returncode
             self.proc = None
-        wait_port(up=False, timeout=15)
+        if self.job is not None:
+            self.job.close()
+            self.job = None
         self.sid = None
 
     def raw(self, payload):
-        headers = {"Content-Type": "application/json",
-                   "Accept": "application/json, text/event-stream",
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
                    "Authorization": "Bearer " + self.auth}
         if self.sid:
             headers["Mcp-Session-Id"] = self.sid
-        req = urllib.request.Request(URL, data=json.dumps(payload).encode(), headers=headers)
-        with urllib.request.urlopen(req, timeout=90) as r:
-            sid = r.headers.get("Mcp-Session-Id")
-            if sid:
-                self.sid = sid
-            body = r.read().decode()
-        if r.headers.get("Content-Type", "").startswith("text/event-stream"):
-            for line in body.splitlines():
-                if line.startswith("data:"):
-                    return json.loads(line[5:].strip())
-            return None
-        return json.loads(body) if body.strip() else None
+        request = urllib.request.Request(f"http://{HOST}:{self.port}/", data=json.dumps(payload).encode(), headers=headers)
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            session_id = response.headers.get("Mcp-Session-Id")
+            if session_id:
+                self.sid = session_id
+            body = response.read().decode()
+            content_type = response.headers.get("Content-Type", "")
+        if content_type.startswith("text/event-stream"):
+            frames = [line[5:].strip() for line in body.splitlines() if line.startswith("data:")]
+            result = json.loads("\n".join(frames)) if frames else None
+        else:
+            result = json.loads(body) if body.strip() else None
+        captured = json.loads(json.dumps({"request": payload, "response": result}).replace(self.auth, "[redacted]"))
+        self.environment.requests.append(captured)
+        return result
 
     def call(self, name, args=None):
         payload = {"jsonrpc": "2.0", "id": self.rid, "method": "tools/call",
                    "params": {"name": name, "arguments": args if args is not None else {}}}
         self.rid += 1
-        r = self.raw(payload)
-        if r is None:
-            raise McpError("tool %s returned no response" % name)
-        if r.get("error"):
-            raise McpError("tool %s rpc error: %s" % (name, json.dumps(r["error"])[:300]))
-        result = r.get("result", {})
-        text = "\n".join(c.get("text", "") for c in result.get("content", []))
+        response = self.raw(payload)
+        if response is None:
+            raise McpError(f"Tool {name} returned no response")
+        if response.get("error"):
+            raise McpError(f"Tool {name} RPC error: {json.dumps(response['error'])[:300]}")
+        result = response.get("result", {})
+        text = "\n".join(content.get("text", "") for content in result.get("content", []))
         if result.get("isError"):
-            raise McpError("tool %s failed: %s" % (name, text[:300]))
+            raise McpError(f"Tool {name} failed: {text[:300]}")
         return text
 
     def list_tools(self):
-        r = self.raw({"jsonrpc": "2.0", "id": self.rid, "method": "tools/list"})
-        self.rid += 1
-        return [t["name"] for t in r["result"]["tools"]]
+        tools = []
+        cursor = None
+        seen_cursors = set()
+        while True:
+            payload = {"jsonrpc": "2.0", "id": self.rid, "method": "tools/list"}
+            if cursor:
+                payload["params"] = {"cursor": cursor}
+            self.rid += 1
+            response = self.raw(payload)
+            if not response or "result" not in response:
+                raise McpError("Legacy tools/list failed")
+            tools.extend(response["result"]["tools"])
+            cursor = response["result"].get("nextCursor")
+            if not cursor:
+                break
+            if cursor in seen_cursors:
+                raise McpError("Legacy catalog pagination repeated a cursor")
+            seen_cursors.add(cursor)
+        names = [tool["name"] for tool in tools]
+        if len(names) != len(set(names)):
+            raise McpError("Legacy catalog contains duplicate names")
+        self.environment.legacy_catalog = tools
+        return names
 
     def state(self):
-        d = {}
-        for ln in self.call("GetDebugState").splitlines():
-            if ":" in ln:
-                k, v = ln.split(":", 1)
-                d[k.strip()] = v.strip()
-        return d
+        return {key.strip(): value.strip() for line in self.call("GetDebugState").splitlines() if ":" in line
+                for key, value in [line.split(":", 1)]}
 
     def eval_int(self, expression):
         first = self.call("EvalExpression", {"expression": expression}).splitlines()[0]
         return int(first.split()[0], 16)
 
     def registers(self):
-        d = {}
-        for ln in self.call("GetAllRegisters").splitlines():
-            if ":" in ln:
-                k, v = ln.split(":", 1)
+        registers = {}
+        for line in self.call("GetAllRegisters").splitlines():
+            if ":" in line:
+                key, value = line.split(":", 1)
                 try:
-                    d[k.strip()] = int(v.strip(), 16)
+                    registers[key.strip()] = int(value.strip(), 16)
                 except ValueError:
                     pass
-        return d
+        return registers
 
     def read_bytes(self, address, size):
-        addr = address if isinstance(address, str) else "0x%X" % address
-        text = self.call("ReadMemory", {"address": addr, "size": size})
-        out = []
-        for ln in text.splitlines():
-            if ": " not in ln:
+        address_text = address if isinstance(address, str) else f"0x{address:X}"
+        text = self.call("ReadMemory", {"address": address_text, "size": size})
+        result = []
+        for line in text.splitlines():
+            if ": " not in line:
                 continue
-            after = ln.split(": ", 1)[1].strip()
-            seg = re.split(r"\s{2,}", after)
-            if seg and re.fullmatch(r"(?:[0-9A-Fa-f]{2} )*[0-9A-Fa-f]{2}", seg[0]):
-                out += [int(b, 16) for b in seg[0].split()]
-        return bytes(out[:size])
+            segment = re.split(r"\s{2,}", line.split(": ", 1)[1].strip())[0]
+            if re.fullmatch(r"(?:[0-9A-Fa-f]{2} )*[0-9A-Fa-f]{2}", segment):
+                result.extend(int(value, 16) for value in segment.split())
+        return bytes(result[:size])
 
     def safe_stop(self):
         try:
             self.call("StopDebug")
-        except McpError as e:
-            if "active debug session" not in str(e):
+        except McpError as error:
+            if "active debug session" not in str(error):
                 raise
 
-    def load(self, path):
-        return self.call("LoadBinary", {"filePath": path})
+    def load(self, path, **arguments):
+        return self.call("LoadBinary", {"filePath": str(path), **arguments})
 
     def resume_until(self, marker=None, bp_addr=None, stop_at_bp=False, iterations=150, poll=0.4):
         info = {"bp_hits": 0, "terminated": False, "last": {}}
-        for _ in range(iterations):
-            st = self.state()
-            info["last"] = st
-            if st.get("isDebugging") == "false" or st.get("status") == "NO_TARGET":
+        deadline = time.monotonic() + min(iterations * poll, self.timeout)
+        while time.monotonic() < deadline:
+            state = self.state()
+            info["last"] = state
+            if state.get("isDebugging") == "false" or state.get("status") == "NO_TARGET":
                 info["terminated"] = True
                 break
-            if bp_addr and st.get("currentAddress"):
-                try:
-                    if int(st["currentAddress"], 16) == bp_addr:
-                        info["bp_hits"] += 1
-                        if stop_at_bp:
-                            break
-                except ValueError:
-                    pass
-            if marker and os.path.exists(marker):
-                time.sleep(0.5)
+            if marker and Path(marker).exists():
                 break
-            if st.get("isRunning") == "true":
+            if state.get("isRunning") == "true":
                 time.sleep(poll)
                 continue
+            address = state.get("currentAddress")
+            if bp_addr and address and int(address, 16) == bp_addr:
+                info["bp_hits"] += 1
+                if stop_at_bp:
+                    break
             self.call("run", {})
             time.sleep(poll)
         return info

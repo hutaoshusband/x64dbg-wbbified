@@ -1,107 +1,152 @@
+import argparse
+from datetime import datetime, timezone
+import fnmatch
 import os
-import subprocess
+from pathlib import Path
 import sys
+import tempfile
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cases
-from wi_driver import (BUILD_BAT, PROBE_EXE, PROBE_MARKER, TARGETS, WinInspect,
-                       restore_scylla, set_ini_flag, stash_scylla, wipe_markers, read_kv)
-
-TARGET_EXES = ["exitmark.exe", "bpmain.exe", "probe.exe"]
+from wi_driver import McpError, ROOT, SuiteEnvironment, WinInspect, build_targets, read_kv, write_json
 
 
-def ensure_targets():
-    if all(os.path.exists(os.path.join(TARGETS, n)) for n in TARGET_EXES):
-        return
-    r = subprocess.run(["cmd", "/c", BUILD_BAT], cwd=TARGETS, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(r.stdout)
-        print(r.stderr)
-        raise SystemExit("target build failed")
-
-
-def kill_stale():
-    subprocess.run(["taskkill", "/F", "/IM", "wininspect.exe"], capture_output=True)
-    time.sleep(1)
-
-
-def run_functional(results):
-    wi = WinInspect()
+def run_case(function, debugger, results):
+    started = time.monotonic()
+    result = {"name": function.__name__, "status": "verified"}
     try:
-        server = wi.start()
-        print("wininspect up, MCP server: %s %s" % (server.get("name"), server.get("version")))
-        for fn in cases.CASES:
-            t0 = time.time()
-            try:
-                fn(wi)
-                results.append((fn.__name__, None))
-                print("[PASS] %s (%.1fs)" % (fn.__name__, time.time() - t0))
-            except Exception as e:
-                results.append((fn.__name__, str(e)))
-                print("[FAIL] %s (%.1fs): %s" % (fn.__name__, time.time() - t0, e))
-            wi.safe_stop()
+        oracle = function(debugger)
+        if oracle is not None:
+            result["oracle"] = oracle
+    except Exception as error:
+        result.update(status="failed", error=str(error))
     finally:
-        wi.stop()
+        try:
+            debugger.safe_stop()
+        except Exception as error:
+            result.update(status="failed", cleanupError=str(error))
+    result["seconds"] = round(time.monotonic() - started, 3)
+    results.append(result)
+    print(f"[{result['status'].upper()}] {result['name']} ({result['seconds']:.1f}s)", flush=True)
+    if result.get("error"):
+        print(result["error"], flush=True)
 
 
-def run_hide_case(label, ini_value, expect_hidden, results):
-    wi = WinInspect()
-    t0 = time.time()
+def run_functional(environment, selected, results, timeout):
+    debugger = WinInspect(environment, timeout=timeout)
     try:
-        wi.start()
-        if os.path.exists(PROBE_MARKER):
-            os.remove(PROBE_MARKER)
-        r = wi.load(PROBE_EXE)
-        assert "SUCCESS" in r, r[:200]
-        info = wi.resume_until(marker=PROBE_MARKER)
-        assert os.path.exists(PROBE_MARKER), "probe marker missing, last state: %s" % info["last"]
-        kv = read_kv(PROBE_MARKER)
-        bd = int(kv["BeingDebugged"])
-        ngf = int(kv["NtGlobalFlag"], 16)
-        if expect_hidden:
-            assert bd == 0, "BeingDebugged=%d, expected 0 (%s)" % (bd, kv)
-            assert ngf & 0x70 == 0, "NtGlobalFlag=0x%x, debug bits set (%s)" % (ngf, kv)
-        else:
-            assert bd == 1, "BeingDebugged=%d, expected 1 (%s)" % (bd, kv)
-        results.append((label, None))
-        print("[PASS] %s (%.1fs): %s" % (label, time.time() - t0,
-                                         " ".join("%s=%s" % kv2 for kv2 in sorted(kv.items()))))
-    except Exception as e:
-        results.append((label, str(e)))
-        print("[FAIL] %s (%.1fs): %s" % (label, time.time() - t0, e))
+        server = debugger.start()
+        print(f"Owned debugger ready: {server.get('name')} {server.get('version')}", flush=True)
+        debugger.list_tools()
+        for function in selected:
+            run_case(function, debugger, results)
     finally:
-        wi.stop()
+        debugger.stop()
+
+
+def run_hide_case(environment, hidden, results, timeout):
+    debugger = WinInspect(environment, plugin_profile="legacy-only", hide_debugger=hidden, timeout=timeout)
+    result = {"name": "test_peb_autohide_on" if hidden else "test_peb_autohide_control", "status": "verified"}
+    started = time.monotonic()
+    try:
+        debugger.start()
+        debugger.wipe_markers()
+        response = debugger.load(debugger.fixture("probe"))
+        assert "SUCCESS" in response, response[:200]
+        marker = debugger.marker("probe")
+        state = debugger.resume_until(marker=marker)
+        assert Path(marker).exists(), f"Probe marker missing: {state['last']}"
+        observed = read_kv(marker)
+        result["oracle"] = observed
+        being_debugged = int(observed["BeingDebugged"])
+        global_flags = int(observed["NtGlobalFlag"], 16)
+        assert being_debugged == int(not hidden), str(observed)
+        if hidden:
+            assert global_flags & 0x70 == 0, str(observed)
+    except Exception as error:
+        result.update(status="failed", error=str(error))
+    finally:
+        debugger.stop()
+    result["seconds"] = round(time.monotonic() - started, 3)
+    results.append(result)
+    print(f"[{result['status'].upper()}] {result['name']} ({result['seconds']:.1f}s)", flush=True)
+    if result.get("error"):
+        print(result["error"], flush=True)
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Isolated WinInspect verification suite")
+    parser.add_argument("--phase", choices=("baseline", "functional"), default="baseline")
+    parser.add_argument("--arch", choices=("x64", "x32", "all"), default="x64")
+    parser.add_argument("--case", action="append", default=[], help="Select a case name or glob; repeatable")
+    parser.add_argument("--deploy", type=Path, help="Read-only source deployment for one architecture")
+    parser.add_argument("--output", type=Path, help="Private evidence root outside the repository")
+    parser.add_argument("--timeout", type=float, default=45, help="Bound each request and run wait in seconds")
+    parser.add_argument("--list", action="store_true", help="List cases without launching or writing files")
+    arguments = parser.parse_args()
+    if not 1 <= arguments.timeout <= 60:
+        parser.error("--timeout must be between 1 and 60 seconds")
+    if arguments.deploy and arguments.arch == "all":
+        parser.error("--deploy requires one architecture")
+    return arguments
 
 
 def main():
-    ensure_targets()
-    kill_stale()
-    os.makedirs(os.path.join(os.path.dirname(TARGETS), "tmp"), exist_ok=True)
-    wipe_markers()
-    set_ini_flag(1)
-
+    arguments = parse_arguments()
+    names = [function.__name__ for function in cases.CASES]
+    if arguments.phase == "baseline":
+        names.extend(("test_peb_autohide_on", "test_peb_autohide_control"))
+    selected_names = [name for name in names if not arguments.case or
+                      any(fnmatch.fnmatchcase(name, pattern) for pattern in arguments.case)]
+    if not selected_names:
+        raise McpError("No cases match the selection")
+    if arguments.list:
+        print("\n".join(selected_names))
+        return 0
+    private_root = arguments.output or Path(os.environ["LOCALAPPDATA"]) / "x64dbg-wbbified" / "Verification"
+    private_root = private_root.resolve()
+    if private_root.is_relative_to(ROOT):
+        raise McpError("Evidence must stay outside the project workspace")
+    private_root.mkdir(parents=True, exist_ok=True)
+    run_root = Path(tempfile.mkdtemp(prefix="wp00-", dir=private_root))
+    print(f"Private evidence: {run_root}", flush=True)
+    architectures = ("x64", "x32") if arguments.arch == "all" else (arguments.arch,)
     results = []
-    run_functional(results)
-
-    stash_scylla()
-    try:
-        set_ini_flag(1)
-        run_hide_case("test_peb_autohide_on", 1, True, results)
-        set_ini_flag(0)
-        run_hide_case("test_peb_autohide_control", 0, False, results)
-    finally:
-        set_ini_flag(1)
-        restore_scylla()
-
-    failed = [(n, e) for n, e in results if e]
-    print("")
-    print("summary: %d/%d passed" % (len(results) - len(failed), len(results)))
-    for n, e in failed:
-        print("  FAILED %s: %s" % (n, e))
-    sys.exit(1 if failed else 0)
+    for architecture in architectures:
+        environment = SuiteEnvironment(run_root / architecture, architecture,
+                                       arguments.deploy or ROOT / "WinTools" / architecture)
+        architecture_results = []
+        try:
+            build_targets(environment)
+            functional = [function for function in cases.CASES if function.__name__ in selected_names]
+            if functional:
+                run_functional(environment, functional, architecture_results, arguments.timeout)
+            for hidden, name in ((True, "test_peb_autohide_on"), (False, "test_peb_autohide_control")):
+                if name in selected_names:
+                    run_hide_case(environment, hidden, architecture_results, arguments.timeout)
+        except Exception as error:
+            architecture_results.append({"name": "environment", "status": "failed", "error": str(error)})
+            print(f"[FAILED] {architecture}: {error}", flush=True)
+        finally:
+            environment.retain(architecture_results)
+        executed = {result["name"] for result in architecture_results}
+        for name in selected_names:
+            if name not in executed:
+                architecture_results.append({"name": name, "status": "verification_pending",
+                                             "reason": "The environment failed before this case executed"})
+        results.extend({**result, "architecture": architecture} for result in architecture_results)
+    failed = [result for result in results if result["status"] != "verified"]
+    write_json(run_root / "summary.json", {"schemaVersion": 1, "observedAtUtc": datetime.now(timezone.utc).isoformat(),
+               "phase": arguments.phase, "requestedCases": selected_names, "results": results})
+    print(f"Result: {len(results) - len(failed)}/{len(results)} verified; evidence: {run_root}", flush=True)
+    return int(bool(failed))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except McpError as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)
