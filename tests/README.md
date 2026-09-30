@@ -24,6 +24,7 @@ python tests/run_tests.py --phase build --arch all
 python tests/run_tests.py --phase native --arch all --case commandparser --case script_run_exit
 python tests/run_tests.py --phase contracts
 python tests/run_tests.py --phase surface
+python tests/run_tests.py --phase surface --surface-provider native --arch all
 python tests/run_tests.py --phase defects
 ```
 
@@ -37,6 +38,8 @@ The legacy manifest records the observed external plugin contracts and canonical
 
 Runtime reconciliation requires the snapshot's adjacent owned-process evidence receipt. The retained process identity, capture state, module hashes and architecture identify the observed build. Registered command names and script providers reconcile against source rows. Shipped plugin resource rows use the captured PE architecture, while unresolved runtime surfaces and plugin configuration rows apply only to the observed architecture. A recorded x64 capture does not establish x32 availability.
 
+Repeat `--runtime-surface` to merge independently captured builds, states or architectures. Matching provisional discovery identities retain each snapshot's inputs/state as separate observations; their observed architecture scopes combine. This preserves the legacy shipped-plugin capture alongside source-built x64/x32 captures. Semantic GUI/provider binding remains required before these provisional identities can become executable agent operations.
+
 All operation rows remain planned until actual agent routes satisfy the independent native parity predicates. Candidate totals do not establish complete semantic parity. Dynamic context menus, lazy dialogs, opaque provider effects and state classifications still need reconciliation; runtime GUI identities need semantic source/provider bindings.
 
 ## Isolation and retained evidence
@@ -46,6 +49,8 @@ Each run creates a private directory beneath `%LOCALAPPDATA%/x64dbg-wbbified/Ver
 External phases copy the selected `WinTools/<arch>` deployment, use a new user directory and random authentication token, verify the HTTP listener PID, and retain process creation identity and loaded module hashes. Job ownership and process-specific shutdown bound cleanup to the owned debugger and its targets. Deployment hashes before and after the run verify that personal files were unchanged.
 
 The x64 external plugin is the available behavioral baseline. The shipped x32 plugin directory has no corresponding MCP plugin; external x32 verification fails explicitly until that artifact is available. Normal fixtures and source-built native regressions support both architectures independently.
+
+`--phase surface --surface-provider native` observes the source-built GUI in `x64dbg/bin/<arch>` directly through its native startup command. Its private deployment excludes the external MCP provider, and the fixture records the idle engine state, registered commands, GUI models, loaded native module hashes and PE architecture. Both x64 and x32 are supported. This mode verifies native GUI inventory capture; it does not provide or verify an MCP product endpoint. The default legacy surface mode retains the authenticated idle/paused capture.
 
 Build phases use new out-of-tree CMake directories. Existing local Qt SDKs may supply the configured Qt package, while build output remains in the debugger's ignored `bin/<arch>` directory. No obsolete cached source directory is reused. Build receipts retain actual commands, source inputs and artifact hashes.
 

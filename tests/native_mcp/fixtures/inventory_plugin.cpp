@@ -75,9 +75,13 @@ namespace
                 commands.append(model->data(model->index(row, 0), Qt::DisplayRole).toString());
             QMetaObject::invokeMethod(editor, "autoCompleteUpdate", Qt::DirectConnection, Q_ARG(QString, editor->text()));
         }
-        QJsonObject inventory{{"schemaVersion", 1}, {"processId", QString::number(GetCurrentProcessId())},
+        const auto debugging = DbgIsDebugging();
+        const auto runLockUnlocked = DbgIsRunning();
+        QJsonObject inventory{{"schemaVersion", 2}, {"processId", QString::number(GetCurrentProcessId())},
                               {"guiThreadId", QString::number(GetCurrentThreadId())},
                               {"menus", menus}, {"widgets", widgets}, {"commands", commands},
+                              {"debugState", QJsonObject{{"debugging", debugging}, {"running", debugging && runLockUnlocked}}},
+                              {"runLockUnlocked", runLockUnlocked},
                               {"scriptProviders", scriptProviders}};
         QSaveFile file(*output);
         if(file.open(QIODevice::WriteOnly))

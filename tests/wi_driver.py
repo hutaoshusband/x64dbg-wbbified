@@ -251,11 +251,14 @@ class SuiteEnvironment:
         plugins.mkdir()
         suffix = ".dp64" if self.architecture == "x64" else ".dp32"
         baseline_plugin = self.deployment / "plugins" / f"x64dbg-MCP-Server{suffix}"
-        if not baseline_plugin.is_file():
+        if plugin_profile != "native" and not baseline_plugin.is_file():
             raise McpError(f"Legacy MCP baseline plugin is unavailable for {self.architecture}")
-        shutil.copy2(baseline_plugin, plugins / baseline_plugin.name)
-        if plugin_profile == "shipped":
+        if plugin_profile != "native":
+            shutil.copy2(baseline_plugin, plugins / baseline_plugin.name)
+        if plugin_profile in ("shipped", "native") and (self.deployment / "plugins").is_dir():
             for source in (self.deployment / "plugins").iterdir():
+                if plugin_profile == "native" and source.name.lower() == baseline_plugin.name.lower():
+                    continue
                 if source.is_file() and source.suffix.lower() in (suffix, ".dll", ".ini"):
                     shutil.copy2(source, plugins / source.name)
         self.stages[plugin_profile] = stage
@@ -313,28 +316,37 @@ class WinInspect:
     def wipe_markers(self):
         self.environment.wipe_markers()
 
-    def start(self):
+    def start(self, initial_command=None):
+        if self.plugin_profile == "native" and not initial_command:
+            raise McpError("Native inventory startup requires its explicit observation command")
         stage = self.environment.stage(self.plugin_profile)
         profile = self.environment.root / f"profile-{len(self.environment.processes)}"
         profile.mkdir()
         (profile / "wininspect.ini").write_text(
             f"[Engine]\nHideDebugger={int(self.hide_debugger)}\nNoConsoleWindow=1\n[Misc]\nLoadLastSession=0\n", encoding="utf-8")
-        with socket.socket() as probe:
-            probe.bind((HOST, 0))
-            self.port = probe.getsockname()[1]
-        configuration = {"IpAddress": HOST, "Port": self.port, "AutoStart": True, "AuthToken": self.auth}
-        write_json(stage / "mcp_config.json", configuration)
+        if self.plugin_profile != "native":
+            with socket.socket() as probe:
+                probe.bind((HOST, 0))
+                self.port = probe.getsockname()[1]
+            configuration = {"IpAddress": HOST, "Port": self.port, "AutoStart": True, "AuthToken": self.auth}
+            write_json(stage / "mcp_config.json", configuration)
         self.job = OwnedJob()
         process_environment = os.environ.copy()
         for variable in ("QTDIR", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QML_IMPORT_PATH", "QML2_IMPORT_PATH"):
             process_environment.pop(variable, None)
-        self.proc = subprocess.Popen([str(stage / "wininspect.exe"), "-userdir", str(profile)],
+        command = [str(stage / "wininspect.exe"), "-userdir", str(profile)]
+        if initial_command:
+            command.extend(("-c", initial_command))
+        self.proc = subprocess.Popen(command,
                                      cwd=self.environment.targets, env=process_environment)
         try:
             self.job.assign(self.proc)
             self.record = {**process_identity(self.proc), "deployment": str(stage), "profile": str(profile),
                            "port": self.port, "plugins": self.plugin_profile, "hideDebugger": self.hide_debugger}
             self.environment.processes.append(self.record)
+            if self.plugin_profile == "native":
+                self.record["startupCommand"] = initial_command
+                return {"mode": "native-command-startup"}
             deadline = time.monotonic() + self.timeout
             while time.monotonic() < deadline:
                 if self.proc.poll() is not None:

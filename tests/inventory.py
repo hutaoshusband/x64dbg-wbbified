@@ -730,7 +730,7 @@ def reconcile_legacy_catalog(catalog_path):
             "catalog": file_identity(catalog_path)}
 
 
-def build_inventory_fixture(environment):
+def build_inventory_fixture(environment, plugin_profile="shipped"):
     compiler_variables = compiler_environment(environment.architecture)
     search_path = next(value for key, value in compiler_variables.items() if key.lower() == "path")
     compiler = shutil.which("cl.exe", path=search_path)
@@ -753,8 +753,44 @@ def build_inventory_fixture(environment):
     write_json(environment.root / "inventory-fixture-build.json", build)
     if process.returncode:
         raise McpError(f"Inventory fixture build failed: {process.stdout} {process.stderr}")
-    stage = environment.stage("shipped")
+    stage = environment.stage(plugin_profile)
     shutil.copy2(binary, stage / "plugins" / binary.name)
+
+
+def capture_native_runtime_surface(debugger):
+    path = debugger.environment.root / "runtime-surface-native-idle.json"
+    argument = path.as_posix()
+    if any(value in argument for value in '\"\r\n,'):
+        raise McpError("Inventory output path cannot be represented as a debugger argument")
+    debugger.start(f'baselineinventory "{argument}"')
+    deadline = time.monotonic() + debugger.timeout
+    while not path.is_file() and time.monotonic() < deadline:
+        if debugger.proc.poll() is not None:
+            raise McpError(f"Native debugger exited before capture: {debugger.proc.returncode}")
+        time.sleep(0.05)
+    if not path.is_file():
+        raise McpError("Native GUI inventory did not complete")
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    assert int(snapshot["processId"]) == debugger.proc.pid, "Inventory belongs to another process"
+    assert snapshot["menus"] and snapshot["commands"] and snapshot["scriptProviders"], "Incomplete native runtime surface"
+    assert "baselineinventory" in snapshot["commands"], "Inventory fixture was not registered"
+    assert snapshot["debugState"] == {"debugging": False, "running": False}, "Native capture is not idle"
+    modules = loaded_modules(debugger.proc)
+    assert not any(Path(module["path"]).name.lower().startswith("x64dbg-mcp-server") for module in modules), "External MCP provider loaded"
+    stage = debugger.environment.stage("native")
+    assert pe_architecture(stage / "wininspect.exe") == debugger.environment.architecture, "Native debugger architecture differs"
+    for name in ("wininspect.exe", "wininspect.dll", "winbridge.dll", "wingui.dll"):
+        expected = file_identity(stage / name)
+        actual = [module for module in modules if Path(module["path"]).resolve() == (stage / name).resolve()]
+        assert len(actual) == 1 and actual[0]["sha256"] == expected["sha256"], f"Loaded native module differs: {name}"
+    debugger.record["loadedModules"] = modules
+    debugger.record["loadedModulesAfterInventory"] = modules
+    resource_path = debugger.environment.root / "plugin-resources.json"
+    write_json(resource_path, collect_plugin_resources(debugger.environment.stage("native") / "plugins"))
+    return {"scope": "source-built native idle GUI surface without external MCP",
+            "snapshots": [{"state": "native-idle", "artifact": file_identity(path), "menuCount": len(snapshot["menus"]),
+                           "commandCount": len(snapshot["commands"]), "scriptProviders": snapshot["scriptProviders"]}],
+            "pluginResources": file_identity(resource_path)}
 
 
 def capture_runtime_surface(debugger):
@@ -826,18 +862,28 @@ def merge_runtime_surface(inventory, surface_path):
         raise ValueError("Runtime surface is incomplete")
     capture = runtime_capture(surface_path, surface)
     snapshot_identity = capture["snapshot"]
-    source = {"runtimeCaptureRef": "runtimeCapture"}
+    capture_key = snapshot_identity["sha256"]
+    captures = inventory.setdefault("runtimeCaptures", {})
+    if capture_key in captures:
+        raise ValueError("Runtime capture was supplied twice")
+    captures[capture_key] = capture
+    capture_ref = f"runtimeCaptures.{capture_key}"
+    source = {"runtimeCaptureRef": capture_ref}
     commands = {command.lower() for command in surface["commands"]}
-    command_rows = [row for row in inventory["operations"] if row["category"] == "command"]
+    command_rows = [row for row in inventory["operations"] if row["category"] == "command" and not row["id"].startswith("runtime.")]
     existing_aliases = {alias.lower() for row in command_rows for alias in row["aliases"]}
     for row in command_rows:
         observed = sorted(alias for alias in row["aliases"] if alias.lower() in commands)
-        row["variants"]["runtimeCommandNames"] = observed
-    inventory["commandReconciliation"] = {
+        row["variants"]["runtimeCommandNames"] = sorted(set(row["variants"].get("runtimeCommandNames", [])) | set(observed))
+        row["variants"].setdefault("runtimeCommandObservations", []).append({"captureRef": capture_ref, "names": observed})
+    reconciliation = {
+        "captureRef": capture_ref,
         "observedNameCount": len(commands), "sourceAliasCount": len(existing_aliases),
         "sourceNamesNotObserved": sorted(existing_aliases - commands),
         "runtimeNamesWithoutSource": sorted(commands - existing_aliases - {"baselineinventory"}),
         "fixtureNamesExcluded": ["baselineinventory"] if "baselineinventory" in commands else []}
+    inventory.setdefault("commandReconciliations", []).append(reconciliation)
+    inventory.setdefault("commandReconciliation", reconciliation)
     additions = []
     for command in sorted(set(surface["commands"]), key=str.lower):
         if command.lower() in existing_aliases or command == "baselineinventory":
@@ -857,7 +903,9 @@ def merge_runtime_surface(inventory, surface_path):
     for provider in sorted(set(surface["scriptProviders"])):
         matches = [row for row in inventory["operations"] if row["id"] == f"script_provider.{provider}"]
         if matches:
-            matches[0]["variants"]["runtimeObserved"] = {"captureRef": "runtimeCapture", "name": provider}
+            observed = {"captureRef": capture_ref, "name": provider}
+            matches[0]["variants"].setdefault("runtimeObserved", observed)
+            matches[0]["variants"].setdefault("runtimeObservations", []).append(observed)
         else:
             additions.append(make_row(f"runtime.script_provider.{provider}", "script_provider", source, {"name": provider}))
     for widget in sorted(surface["widgets"], key=lambda value: (value["path"], value["class"], value["objectName"])):
@@ -872,7 +920,7 @@ def merge_runtime_surface(inventory, surface_path):
         row["provider"] = "shipped-runtime-unresolved"
         row["architectures"] = [capture["architecture"]]
         row["architectureApplicability"] = "observed_only"
-        row["providerBuildRef"] = "runtimeCapture.loadedModules"
+        row["providerBuildRef"] = capture_ref + ".loadedModules"
     resource_path = Path(surface_path).parent / "plugin-resources.json"
     if resource_path.is_file():
         resources = json.loads(resource_path.read_text(encoding="utf-8"))
@@ -911,23 +959,40 @@ def merge_runtime_surface(inventory, surface_path):
                     row = make_row(f"provider.{configuration['provider']}.setting.{section}.{key}", "setting",
                                    {"configurationName": Path(configuration["source"]["path"]).name,
                                     "configurationSha256": configuration["source"]["sha256"],
-                                    "runtimeCaptureRef": "runtimeCapture"}, {"section": section, "key": key})
+                                    "runtimeCaptureRef": capture_ref}, {"section": section, "key": key})
                     row["provider"] = configuration["provider"]
                     row["architectures"] = [capture["architecture"]]
                     row["architectureApplicability"] = "observed_only"
                     row["stateRequirement"] = "provider_profile_available"
                     row["acceptanceIds"] = ["A-51", "A-52"]
                     additions.append(row)
-    inventory["operations"].extend(additions)
+    indexed = {row["id"]: row for row in inventory["operations"]}
+    for row in additions:
+        observation = {"captureRef": capture_ref, "architecture": capture["architecture"],
+                       "state": capture["state"], "variants": row["variants"]}
+        if row["id"] in indexed:
+            existing = indexed[row["id"]]
+            if existing["category"] != row["category"] or existing["provider"] != row["provider"]:
+                raise ValueError("Runtime identity has incompatible category or provider")
+            existing["runtimeObservations"].append(observation)
+            existing["architectures"] = sorted(set(existing["architectures"]) | set(row["architectures"]))
+        else:
+            row["runtimeObservations"] = [observation]
+            indexed[row["id"]] = row
+            inventory["operations"].append(row)
     identifiers = [row["id"] for row in inventory["operations"]]
     if len(identifiers) != len(set(identifiers)):
         raise ValueError("Runtime reconciliation produced duplicate operation identities")
     inventory["categories"] = dict(Counter(row["category"] for row in inventory["operations"]))
-    inventory["runtimeSnapshot"] = snapshot_identity
-    inventory["runtimeCapture"] = capture
+    inventory.setdefault("runtimeSnapshot", snapshot_identity)
+    inventory.setdefault("runtimeCapture", capture)
     inventory["coverageGaps"] = ["Context-created menus, lazy dialogs and opaque provider registration effects remain to be reconciled",
                                  "Runtime GUI identities need source bindings or native provider action identities",
-                                 "Parameterized settings and state guards need semantic review; x32 runtime surfaces remain unobserved"]
+                                 "Parameterized settings and state guards need semantic review"]
+    observed_architectures = sorted({value["architecture"] for value in captures.values()})
+    inventory["observedArchitectures"] = observed_architectures
+    if len(observed_architectures) < 2:
+        inventory["coverageGaps"].append(f"This registry contains only the {capture['architecture']} runtime capture; other captures need merging")
 
 
 def write_parity_registry(path, inventory):
@@ -942,9 +1007,11 @@ def write_parity_registry(path, inventory):
     Path(path).write_text("{\n" + ",\n".join(fields) + "\n}\n", encoding="utf-8", newline="\n")
 
 
-def run_inventory(output, catalog_path, refresh, surface_path=None):
+def run_inventory(output, catalog_path, refresh, surface_paths=None):
     inventory = collect_source_inventory()
-    if surface_path:
+    if isinstance(surface_paths, (str, Path)):
+        surface_paths = [surface_paths]
+    for surface_path in surface_paths or []:
         merge_runtime_surface(inventory, surface_path)
     write_json(Path(output) / "source-inventory.json", inventory)
     reconciliation = reconcile_legacy_catalog(catalog_path)

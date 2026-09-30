@@ -77,6 +77,24 @@ def run_functional(environment, selected, results, timeout):
         debugger.stop()
 
 
+def run_native_surface(environment, results, timeout):
+    from inventory import capture_native_runtime_surface
+    debugger = WinInspect(environment, plugin_profile="native", timeout=timeout)
+    result = {"name": "test_native_runtime_surface_inventory", "status": "verified"}
+    try:
+        result["oracle"] = capture_native_runtime_surface(debugger)
+    except Exception as error:
+        result.update(status="failed", error=str(error))
+    finally:
+        debugger.stop()
+    if debugger.record is not None and debugger.record.get("exitCode") != 0:
+        result.update(status="failed", cleanupError=f"Native debugger exited with {debugger.record.get('exitCode')}")
+    results.append(result)
+    print(f"[{result['status'].upper()}] {result['name']}", flush=True)
+    if result.get("error"):
+        print(result["error"], flush=True)
+
+
 def run_hide_case(environment, hidden, results, timeout):
     debugger = WinInspect(environment, plugin_profile="legacy-only", hide_debugger=hidden, timeout=timeout)
     result = {"name": "test_peb_autohide_on" if hidden else "test_peb_autohide_control", "status": "verified"}
@@ -117,7 +135,10 @@ def parse_arguments():
     parser.add_argument("--timeout", type=float, default=45, help="Bound each request and run wait in seconds")
     parser.add_argument("--list", action="store_true", help="List cases without launching or writing files")
     parser.add_argument("--catalog", type=Path, help="Captured legacy catalog for inventory reconciliation")
-    parser.add_argument("--runtime-surface", type=Path, help="Captured GUI and plugin surface for parity reconciliation")
+    parser.add_argument("--runtime-surface", type=Path, action="append", default=[],
+                        help="Captured GUI and plugin surface for parity reconciliation; repeatable")
+    parser.add_argument("--surface-provider", choices=("legacy", "native"), default="legacy",
+                        help="Observe shipped legacy or source-built native GUI surface")
     parser.add_argument("--refresh-registries", action="store_true", help="Update the source parity candidate registry")
     parser.add_argument("--engine", choices=("TitanEngine", "GleeBug", "StaticEngine", "all"), default="TitanEngine")
     arguments = parser.parse_args()
@@ -129,6 +150,8 @@ def parse_arguments():
         parser.error("--phase inventory requires --catalog")
     if arguments.refresh_registries and arguments.phase != "inventory":
         parser.error("--refresh-registries requires --phase inventory")
+    if arguments.surface_provider == "native" and arguments.phase != "surface":
+        parser.error("--surface-provider native requires --phase surface")
     return arguments
 
 
@@ -163,6 +186,9 @@ def main():
     functions = {"defects": cases.DEFECT_CASES, "contracts": cases.CONTRACT_CASES,
                  "surface": cases.SURFACE_CASES}.get(arguments.phase, cases.CASES)
     names = [function.__name__ for function in functions]
+    native_surface = arguments.phase == "surface" and arguments.surface_provider == "native"
+    if native_surface:
+        names = ["test_native_runtime_surface_inventory"]
     if arguments.phase in ("fixtures", "inventory"):
         names = ["test_fixture_oracles" if arguments.phase == "fixtures" else "test_source_inventory"]
     if arguments.phase in ("native", "build"):
@@ -200,14 +226,17 @@ def main():
     architectures = ("x64", "x32") if arguments.arch == "all" else (arguments.arch,)
     results = []
     for architecture in architectures:
-        environment = SuiteEnvironment(run_root / architecture, architecture,
-                                       arguments.deploy or ROOT / "WinTools" / architecture)
+        deployment = ROOT / "x64dbg" / "bin" / architecture if native_surface else ROOT / "WinTools" / architecture
+        environment = SuiteEnvironment(run_root / architecture, architecture, arguments.deploy or deployment)
         architecture_results = []
         try:
-            build_targets(environment)
+            if not native_surface:
+                build_targets(environment)
             if arguments.phase == "surface":
                 from inventory import build_inventory_fixture
-                build_inventory_fixture(environment)
+                build_inventory_fixture(environment, "native" if native_surface else "shipped")
+            if native_surface:
+                run_native_surface(environment, architecture_results, arguments.timeout)
             if arguments.phase == "fixtures":
                 run_fixture_oracles(environment, architecture_results)
             functional = [function for function in functions if function.__name__ in selected_names]
