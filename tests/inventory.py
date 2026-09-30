@@ -601,6 +601,72 @@ def classify_operation(call, category, relative, sections):
             "call": call, "source": {"path": relative, "line": call["line"]}}
 
 
+def collect_native_script_operations():
+    indexed = {}
+    for path in sorted((ROOT / "x64dbg" / "src" / "dbg").glob("_scriptapi_*.cpp")):
+        source = path.read_text(encoding="utf-8-sig")
+        tokens = tokenize_cpp(source)
+        scopes = architecture_scopes(source)
+        for region in function_regions(tokens):
+            if not region["name"].startswith("Script::"):
+                continue
+            first = region["signature"]
+            while first > 0 and tokens[first - 1][1] not in (";", "{", "}"):
+                first -= 1
+            markers = [index for index in range(first, region["signature"]) if tokens[index][1] == "SCRIPT_EXPORT"]
+            if len(markers) != 1:
+                raise ValueError(f"Native Script API definition has no export marker: {region['name']}")
+            marker = markers[0]
+            arguments, ending = call_arguments(tokens, region["signature"] + 1)
+            line = source.count("\n", 0, tokens[marker][2]) + 1
+            identity = f"script_api.{region['name']}"
+            location = {"path": path.relative_to(ROOT).as_posix(), "line": line}
+            if identity not in indexed:
+                row = make_row(identity, "script_function", location, {"sites": []})
+                row["provider"] = "debugger-native-script-api"
+                row["stateRequirement"] = "native_script_api_guards"
+                row["architectures"] = []
+                indexed[identity] = row
+            row = indexed[identity]
+            row["architectures"] = sorted(set(row["architectures"]) | set(scopes[line]["architectures"]))
+            row["variants"]["sites"].append({"source": location, "nativeHandler": region["name"],
+                                             "signature": source[tokens[marker][2]:ending].strip(),
+                                             "parameterExpressions": [render_cpp(value) for value in arguments], **scopes[line]})
+    path = ROOT / "x64dbg" / "src" / "dbg" / "simplescript.cpp"
+    source = path.read_text(encoding="utf-8-sig")
+    tokens = tokenize_cpp(source)
+    regions = {region["name"]: region for region in function_regions(tokens)}
+    region = regions["scriptGetBranchType"]
+    body = source[region["start"]:region["end"]]
+    for match in re.finditer(r"\bif\s*\(([\s\S]*?)\)\s*return\s+(script\w+)\s*;", body):
+        aliases = re.findall(r'StartsWith\(newtext,\s*"([^"\n]+)"\)', match[1])
+        if not aliases:
+            continue
+        kind = match[2]
+        line = source.count("\n", 0, region["start"] + match.start()) + 1
+        row = make_row(f"native_script.branch.{kind}", "script_instruction",
+                       {"path": path.relative_to(ROOT).as_posix(), "line": line},
+                       {"nativeHandler": "scriptGetBranchType", "branchKind": kind,
+                        "conditionHandler": "scriptBranchTaken", "input": "native script label"},
+                       [alias.strip() for alias in aliases])
+        row["provider"] = "debugger-native-script-runtime"
+        row["stateRequirement"] = "native_script_loaded_and_branch_label_valid"
+        row["acceptanceIds"] = ["A-46", "A-52"]
+        indexed[row["id"]] = row
+    internal = {}
+    for match in re.finditer(r'scriptIsInternalCommand\(cmd,\s*"([^"\n]+)"\)', source):
+        line = source.count("\n", 0, match.start()) + 1
+        internal.setdefault(match[1], []).append({"path": path.relative_to(ROOT).as_posix(), "line": line})
+    for name, locations in internal.items():
+        row = make_row(f"native_script.instruction.{name}", "script_instruction", locations[0],
+                       {"nativeHandler": "scriptInternalCmdExec", "sites": locations}, [name])
+        row["provider"] = "debugger-native-script-runtime"
+        row["stateRequirement"] = "native_script_runtime_command_guards"
+        row["acceptanceIds"] = ["A-46", "A-52"]
+        indexed[row["id"]] = row
+    return list(indexed.values())
+
+
 def collect_source_inventory():
     rows = []
     inputs = []
@@ -608,6 +674,7 @@ def collect_source_inventory():
     excluded = []
     bindings = []
     factories = []
+    automatic_slots = []
     source_root = ROOT / "x64dbg" / "src"
     for directory in (source_root / "dbg", source_root / "gui", source_root / "bridge"):
         for path in sorted(directory.rglob("*")):
@@ -619,6 +686,8 @@ def collect_source_inventory():
             if path.suffix == ".ui":
                 tree = Xml.parse(path)
                 form = tree.findtext("class")
+                connections = [{key: connection.findtext(key) for key in ("sender", "signal", "receiver", "slot")}
+                               for connection in tree.findall("./connections/connection")]
                 for widget in tree.iter():
                     if widget.tag not in ("widget", "action"):
                         continue
@@ -629,8 +698,20 @@ def collect_source_inventory():
                                 "properties": {value.get("name"): "".join(value.itertext()).strip()
                                                for value in widget.findall("property")},
                                 "items": ["".join(item.itertext()).strip() for item in widget.findall("item")]}
+                    relevant_connections = [connection for connection in connections
+                                            if name in (connection["sender"], connection["receiver"])]
+                    if relevant_connections:
+                        variants["designerConnections"] = relevant_connections
                     rows.append(make_row(identifier, category, {"path": relative, "objectName": name}, variants))
                 continue
+            if path.suffix == ".cpp" and "/gui/" in relative:
+                source = path.read_text(encoding="utf-8-sig")
+                for region in function_regions(tokenize_cpp(source)):
+                    match = re.fullmatch(r"(.+)::on_(.+)_([^_]+)", region["name"])
+                    if match:
+                        automatic_slots.append({"class": match[1], "objectName": match[2], "signal": match[3],
+                                                "nativeHandler": region["name"],
+                                                "source": {"path": relative, "line": source.count("\n", 0, region["start"]) + 1}})
             calls = list(source_calls(path))
             sections = configuration_sections(calls) if relative.endswith("Configuration.cpp") else {}
             for call in calls:
@@ -697,6 +778,10 @@ def collect_source_inventory():
                           any(pattern.search(value) for value in binding["call"]["argumentExpressions"])]
             if references:
                 row["variants"]["bindingRefs"] = references
+            slots = [slot for slot in automatic_slots if slot["class"] == row["variants"]["form"] and slot["objectName"] == name]
+            if slots:
+                row["variants"]["automaticSlots"] = slots
+    rows.extend(collect_native_script_operations())
     identifiers = [row["id"] for row in rows]
     if len(identifiers) != len(set(identifiers)):
         raise ValueError("Duplicate inventory identity")
@@ -856,6 +941,87 @@ def pe_architecture(path):
     return "x64" if machine == 0x8664 else "x32"
 
 
+def read_pe_exports(path):
+    architecture = pe_architecture(path)
+    content = Path(path).read_bytes()
+    pe_offset = struct.unpack_from("<I", content, 60)[0]
+    if pe_offset + 24 > len(content):
+        raise ValueError("Truncated PE COFF header")
+    section_count = struct.unpack_from("<H", content, pe_offset + 6)[0]
+    optional_size = struct.unpack_from("<H", content, pe_offset + 20)[0]
+    optional = pe_offset + 24
+    directory_offset = 112 if architecture == "x64" else 96
+    if optional + optional_size > len(content) or optional_size < directory_offset + 8 or section_count > 96:
+        raise ValueError("Invalid PE optional header")
+    magic = struct.unpack_from("<H", content, optional)[0]
+    if magic != (0x20B if architecture == "x64" else 0x10B):
+        raise ValueError("PE machine and optional header disagree")
+    section_start = optional + optional_size
+    if section_start + section_count * 40 > len(content):
+        raise ValueError("Truncated PE section table")
+    sections = [struct.unpack_from("<IIII", content, section_start + index * 40 + 8)
+                for index in range(section_count)]
+
+    def mapped_offset(rva, length):
+        for virtual_size, virtual_address, raw_size, raw_offset in sections:
+            delta = rva - virtual_address
+            if 0 <= delta and delta + length <= raw_size and raw_offset + delta + length <= len(content):
+                return raw_offset + delta
+        raise ValueError("PE export range has no complete file mapping")
+
+    export_rva, export_size = struct.unpack_from("<II", content, optional + directory_offset)
+    if not export_rva:
+        return []
+    if export_size < 40:
+        raise ValueError("Truncated PE export directory")
+    directory = mapped_offset(export_rva, 40)
+    count = struct.unpack_from("<I", content, directory + 24)[0]
+    names_rva = struct.unpack_from("<I", content, directory + 32)[0]
+    if count > 65536:
+        raise ValueError("PE export name count exceeds inventory limit")
+    if not count:
+        return []
+    names_offset = mapped_offset(names_rva, count * 4)
+    names = []
+    for index in range(count):
+        name_rva = struct.unpack_from("<I", content, names_offset + index * 4)[0]
+        name_offset = mapped_offset(name_rva, 1)
+        end = content.find(b"\0", name_offset, min(len(content), name_offset + 4096))
+        if end < 0:
+            raise ValueError("PE export name is not terminated within the inventory limit")
+        mapped_offset(name_rva, end - name_offset + 1)
+        names.append(content[name_offset:end].decode("ascii"))
+    return names
+
+
+def reconcile_native_script_exports(inventory, surface_path, capture_ref):
+    evidence = json.loads((Path(surface_path).parent / "evidence.json").read_text(encoding="utf-8"))
+    modules = [module for process in evidence["processes"] for module in process["loadedModulesAfterInventory"]
+               if Path(module["path"]).name.lower() == "wininspect.dll"]
+    if len(modules) != 1:
+        raise ValueError("Native Script API capture has no unique engine DLL")
+    module = modules[0]
+    if file_identity(module["path"])["sha256"] != module["sha256"]:
+        raise ValueError("Captured Script API engine DLL changed")
+    architecture = pe_architecture(module["path"])
+    symbols = {}
+    for name in read_pe_exports(module["path"]):
+        if name.startswith("?") and "@@" in name:
+            parts = name[1:].split("@@", 1)[0].split("@")
+            if parts[-1] == "Script":
+                qualified = "::".join([*reversed(parts[1:]), parts[0]])
+                symbols.setdefault(qualified, []).append(name)
+    rows = {row["id"][len("script_api."):]: row for row in inventory["operations"] if row["category"] == "script_function"}
+    expected = {name for name, row in rows.items() if architecture in row["architectures"]}
+    for name in sorted(expected & set(symbols)):
+        rows[name]["variants"].setdefault("nativeExportObservations", []).append(
+            {"captureRef": capture_ref, "architecture": architecture, "binarySha256": module["sha256"], "symbols": symbols[name]})
+    inventory.setdefault("nativeScriptExportCaptures", []).append(
+        {"captureRef": capture_ref, "architecture": architecture, "binarySha256": module["sha256"],
+         "qualifiedFunctionCount": len(symbols), "symbolCount": sum(len(value) for value in symbols.values()),
+         "sourceFunctionsNotExported": sorted(expected - set(symbols)), "exportedFunctionsWithoutSource": sorted(set(symbols) - expected)})
+
+
 def merge_runtime_surface(inventory, surface_path):
     surface = json.loads(Path(surface_path).read_text(encoding="utf-8"))
     if not surface.get("menus") or not surface.get("commands") or not surface.get("scriptProviders"):
@@ -868,6 +1034,7 @@ def merge_runtime_surface(inventory, surface_path):
         raise ValueError("Runtime capture was supplied twice")
     captures[capture_key] = capture
     capture_ref = f"runtimeCaptures.{capture_key}"
+    reconcile_native_script_exports(inventory, surface_path, capture_ref)
     source = {"runtimeCaptureRef": capture_ref}
     commands = {command.lower() for command in surface["commands"]}
     command_rows = [row for row in inventory["operations"] if row["category"] == "command" and not row["id"].startswith("runtime.")]
