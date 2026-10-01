@@ -2,9 +2,12 @@
 #include <cstdint>
 #include <cstring>
 #include <intrin.h>
+#include <cstdio>
 
 extern "C" __declspec(dllexport) void* gBreakpointAddress = nullptr;
 extern "C" __declspec(dllexport) volatile LONG gEscapedBreakpoints = 0;
+extern "C" __declspec(dllexport) volatile LONG gCompletedWorkers = 0;
+extern "C" __declspec(dllexport) volatile LONG gFailedWorkers = 0;
 
 static volatile LONG gReady = 0;
 static volatile LONG gGo = 0;
@@ -107,10 +110,12 @@ static DWORD WINAPI Worker(void*)
 #ifdef _WIN64
     LARGE_INTEGER delay;
     delay.QuadPart = -250LL * 10000LL;
-    gTestInstruction(FALSE, &delay);
+    if(gTestInstruction(FALSE, &delay) != 0)
+        InterlockedIncrement(&gFailedWorkers);
 #else
     gTestInstruction();
 #endif
+    InterlockedIncrement(&gCompletedWorkers);
     return 0;
 }
 
@@ -144,10 +149,17 @@ int main()
         Sleep(0);
     InterlockedExchange(&gGo, 1);
 
-    WaitForMultipleObjects(ThreadCount, threads, TRUE, INFINITE);
+    const auto waitResult = WaitForMultipleObjects(ThreadCount, threads, TRUE, INFINITE);
     for(auto thread : threads)
         CloseHandle(thread);
 
     Finish();
+    wchar_t normalMode[2] = {};
+    if(GetEnvironmentVariableW(L"WININSPECT_TEST_NORMAL", normalMode, 2) == 1 && normalMode[0] == L'1')
+        printf("readyWorkers=%ld\ncompletedWorkers=%ld\nfailedWorkers=%ld\nescapedBreakpoints=%ld\nphase=%ld\nwaitSucceeded=%u\n",
+               gReady, gCompletedWorkers, gFailedWorkers, gEscapedBreakpoints, gPhase,
+               static_cast<unsigned int>(waitResult == WAIT_OBJECT_0));
+    if(waitResult != WAIT_OBJECT_0 || gReady != ThreadCount || gCompletedWorkers != ThreadCount || gFailedWorkers != 0 || gPhase != 2)
+        return 103;
     return gEscapedBreakpoints == 0 ? 0 : 102;
 }

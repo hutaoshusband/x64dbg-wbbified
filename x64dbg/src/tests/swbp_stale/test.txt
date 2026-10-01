@@ -1,10 +1,14 @@
+settingset Engine, HideDebugger, 0
+settingset Events, TlsCallbacks, 0
 settingset Events, SystemBreakpoint, 1
 settingset Events, EntryBreakpoint, 0
 init tests/swbp_stale.exe
+stalesystem
 bp swbp_stale:Ready
 run
 testassert cip == swbp_stale:Ready, "target initialized the dynamic test instruction"
 bpd swbp_stale:Ready
+staleaddress [swbp_stale:gBreakpointAddress]
 bp [swbp_stale:gBreakpointAddress]
 bp swbp_stale:Finish
 run
@@ -12,7 +16,12 @@ testassert cip == [swbp_stale:gBreakpointAddress], "dynamic short INT3 breakpoin
 bpd [swbp_stale:gBreakpointAddress]
 run
 testassert cip == swbp_stale:Finish, "all stale short INT3 events stayed inside the breakpoint engine"
+stalesystem
+staleevents
 testassert dword:[swbp_stale:gEscapedBreakpoints] == 0, "no managed breakpoint exception reached the debuggee VEH"
+testassert dword:[swbp_stale:gCompletedWorkers] == .64, "every worker executed the restored instruction"
+testassert dword:[swbp_stale:gFailedWorkers] == 0, "every restored instruction returned successfully"
 bpd swbp_stale:Finish
 run
+staleexit 0
 testfinalize
