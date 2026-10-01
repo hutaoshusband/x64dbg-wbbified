@@ -38,6 +38,15 @@ Json instance_or_target_forms(Json properties, Json required)
     return {{"oneOf", Json::array({context_schema("InstanceRef", properties, required), context_schema("TargetRef", std::move(properties), std::move(required))})}};
 }
 
+Json file_forms(Json base)
+{
+    const auto file = contract_schema("FileRef");
+    Json choices = Json::array();
+    for(const auto& form : file.at("oneOf"))
+        choices.push_back(extend_object_schema(base, form.at("properties"), form.at("required")));
+    return {{"oneOf", std::move(choices)}};
+}
+
 Json paged_data_schema(Json item)
 {
     return closed_object_schema({{"items", bounded_array_schema(std::move(item), MaximumPageLimit)},

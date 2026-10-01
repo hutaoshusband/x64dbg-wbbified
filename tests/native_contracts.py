@@ -19,6 +19,7 @@ CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_
               "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser",
               "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
+              "test_breakpoint_trace_contracts", "test_assembly_file_contracts",
               "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
 
 EXECUTION_TOOLS = ("execution_resume", "execution_pause", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to",
@@ -28,6 +29,11 @@ INSPECTION_TOOLS = ("registers_read", "registers_write", "expression_evaluate", 
                     "stack_read", "arguments_read", "pointers_follow", "process_peb", "thread_teb", "seh_chain", "unwind_info", "structures_list", "structures_decode")
 MEMORY_TOOLS = ("memory_map", "memory_read", "memory_read_string", "memory_write", "memory_allocate", "memory_free", "memory_protection_set",
                 "memory_search_pattern", "memory_search_text", "memory_strings", "memory_dump", "memory_dumpable_regions", "modules_dump", "handles_list", "heaps_list")
+BREAKPOINT_TRACE_TOOLS = ("breakpoints_list", "breakpoints_create", "breakpoints_update", "breakpoints_delete", "breakpoints_enable", "breakpoints_toggle",
+                         "breakpoints_reset_hits", "breakpoints_clear", "trace_start", "trace_stop", "trace_state", "trace_open", "trace_read", "trace_search", "trace_export")
+ASSEMBLY_FILE_TOOLS = ("disassembly_read", "disassembly_function", "assembly_encode", "assembly_apply", "patch_sets_create", "patch_sets_list", "patch_sets_read",
+                       "patch_apply_runtime", "patch_restore_runtime", "patch_restore_all", "patch_export_file", "file_inspect", "file_patch_plan", "file_patch_apply",
+                       "file_patch_undo", "file_compare", "file_export")
 
 
 def build_contract_fixture(output, architecture):
@@ -282,7 +288,7 @@ def registry_validators(registry, formats):
     validators = {}
     expected = {"server_info", "server_health", "capabilities_list", "capabilities_describe", "capabilities_search", "client_context_get", "client_context_set", "control_acquire", "control_renew", "control_release"}
     expected.update({"debugger_instances", "debugger_start", "debugger_focus", "debugger_close", "debugger_settings_get", "debugger_settings_set", "processes_list", "target_open", "target_attach", "target_state", "target_snapshot", "target_stop", "target_detach", "target_restart", "target_command_line_get", "target_command_line_set"})
-    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS)
+    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS + BREAKPOINT_TRACE_TOOLS + ASSEMBLY_FILE_TOOLS)
     assert registry["operationalTools"] == [] and {tool["name"] for tool in registry["tools"]} == expected
     assert [tool["name"] for tool in registry["tools"]] == sorted(expected)
     for tool in registry["tools"]:
@@ -474,13 +480,15 @@ def tool_context_examples():
     return SimpleNamespace(target=target, paused=paused, mutation=mutation, page=page, register=register, frame=frame, structure=structure)
 
 
-def check_tool_family(probe, registry, validators, names, inputs, outputs, extra_inputs=(), extra_outputs=(), expected_effects=None):
+def check_tool_family(probe, registry, validators, names, inputs, outputs, extra_inputs=(), extra_outputs=(), expected_effects=None,
+                      required_fields=None, executors=None, conditions=None):
     assert set(names) == set(inputs) == set(outputs)
     definitions = {tool["name"]: tool for tool in registry["tools"]}
     input_cases = []
     for name, value in inputs.items():
+        missing = "instanceId" if required_fields is None else required_fields[name]
         input_cases.extend(((True, name, value), (False, name, {**value, "unknown": "reject"}),
-                            (False, name, {key: item for key, item in value.items() if key != "instanceId"})))
+                            (False, name, {key: item for key, item in value.items() if key != missing})))
     input_cases.extend(extra_inputs)
     for expected, name, value in input_cases:
         assert validators[(name, "input")].is_valid(value) == expected, f"Independent input {name}: expected {expected}"
@@ -498,7 +506,8 @@ def check_tool_family(probe, registry, validators, names, inputs, outputs, extra
         assert response["valid"] == expected, f"Native output {name}: {response}"
     for name, value in inputs.items():
         definition = definitions[name]
-        assert definition["availability"] == "planned" and definition["executor"] == "engine" and not definition["effectConditions"]
+        assert definition["availability"] == "planned" and definition["executor"] == ("engine" if executors is None else executors[name])
+        assert definition["effectConditions"] == ([] if conditions is None else conditions.get(name, []))
         rejected = probe.call("call", value, name)
         assert not rejected["valid"] and rejected["error"]["code"] == "unsupported_capability", rejected
         effects = probe.call("effects", value, name)
@@ -692,6 +701,188 @@ def check_memory_contracts(probe, registry, validators):
                      (False, "memory_protection_set", {"pages": [{**outputs["memory_protection_set"]["pages"][0], "newProtection": "0x100000000"}], "complete": True}),
                      (False, "memory_dump", {**artifact, "sha256": "0" * 63})]
     return check_tool_family(probe, registry, validators, MEMORY_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects)
+
+
+def instruction_example():
+    return {"addressHex": "0x140001000", "bytesHex": "b82a000000", "length": 5, "text": "mov eax, 42", "mnemonic": "mov",
+            "operands": [{"index": 0, "kind": "register", "text": "eax", "widthBits": 32, "valueHex": None, "access": "write"},
+                         {"index": 1, "kind": "immediate", "text": "42", "widthBits": 32, "valueHex": "0x2a", "access": "read"}],
+            "branch": "none", "branchTargetHex": None, "labels": ["fixture!value"], "valid": True, "error": None}
+
+
+def check_breakpoint_trace_contracts(probe, registry, validators):
+    context = tool_context_examples()
+    options = {"name": "controlled", "enabled": True, "singleShot": False, "silent": False, "fastResume": False, "breakCondition": "rax == 42",
+               "logText": "hit {rax}", "logCondition": "1", "commandText": "", "commandCondition": "", "logFile": None, "encoding": "int3"}
+    breakpoint = {"breakpointId": "bp-1", "revision": "rev-1", "target": context.target, "addressHex": "0x140001000", "hits": "42", "active": True,
+                  "nativeTypeHex": "0x1", "hardwareSlot": None, "creatorClientId": "client-1", "state": "installed", "kind": "software",
+                  "location": {"addressHex": "0x140001000"}, "options": options}
+    disposition = {"items": [{"breakpointId": "bp-1", "status": "changed", "observed": breakpoint, "error": None}], "complete": True}
+    limits = {"maxInstructions": "9007199254740993", "maxWallTimeMs": 60000, "maxArtifactBytes": "1048576"}
+    indexing = {"state": "complete", "entries": "9007199254740993", "error": None}
+    artifact = {"artifactId": "trace-artifact-1", "namespaceId": "private-1", "revision": "rev-1", "sha256": "0" * 64, "size": "8192",
+                "mediaType": "application/octet-stream", "source": "trace:trace-1"}
+    trace = {"traceId": "trace-1", "target": context.target, "jobId": "job-1", "mode": "into", "state": "completed", "executedInstructions": "42",
+             "producedEntries": "42", "limits": limits, "recording": False, "artifact": artifact, "indexing": indexing, "stopReason": "condition"}
+    entry = {"index": "9007199254740993", "threadId": 123, "instruction": instruction_example(), "registers": [{"name": "eax", "valueHex": "0x2a"}],
+             "memory": [{"addressHex": "0x1000", "beforeBytesHex": "07", "afterBytesHex": "2a"}], "complete": True}
+    rows = {"items": [entry], "page": context.page, "traceArtifactId": "trace-artifact-1", "traceSha256": "0" * 64, "coverage": indexing}
+    target_mutation = {**context.target, "leaseId": "lease-1"}
+    inputs = {"breakpoints_list": {**context.target, "kind": "software"},
+              "breakpoints_create": {**context.mutation, "kind": "software", "location": {"moduleId": "module-1", "rvaHex": "0x1000"}, "options": {"encoding": "int3"}},
+              "breakpoints_update": {**target_mutation, "breakpointId": "bp-1", "changes": {"breakCondition": "rax == 42"}, "expectedRevision": "rev-1"},
+              "breakpoints_delete": {**target_mutation, "breakpointIds": ["bp-1"]}, "breakpoints_enable": {**target_mutation, "breakpointIds": ["bp-1"], "enabled": True},
+              "breakpoints_toggle": {**target_mutation, "breakpointId": "bp-1", "expectedEnabled": False},
+              "breakpoints_reset_hits": {**target_mutation, "breakpointIds": ["bp-1"]}, "breakpoints_clear": {**target_mutation, "kind": "memory"},
+              "trace_start": {**context.mutation, "mode": "into", "stopCondition": "eax == 42", "limits": limits, "record": {"enabled": True, "fields": ["instructions", "registers", "memory"]}, "namespaceId": "private-1"},
+              "trace_stop": {**context.target, "traceId": "trace-1"}, "trace_state": {**context.target, "traceId": "trace-1"},
+              "trace_open": {"instanceId": "instance-1", "artifactId": "trace-artifact-1"}, "trace_read": {"traceArtifactId": "trace-artifact-1", "fields": ["instructions"]},
+              "trace_search": {"traceArtifactId": "trace-artifact-1", "query": {"field": "instruction", "expression": "mov eax,42"}},
+              "trace_export": {"traceArtifactId": "trace-artifact-1", "range": {"first": "9007199254740993", "count": "42"}, "format": "jsonl", "namespaceId": "private-1"}}
+    outputs = {"breakpoints_list": {"items": [breakpoint], "page": context.page}, "breakpoints_create": breakpoint, "breakpoints_update": breakpoint,
+               "breakpoints_delete": disposition, "breakpoints_enable": disposition, "breakpoints_toggle": breakpoint, "breakpoints_reset_hits": disposition, "breakpoints_clear": disposition,
+               "trace_start": trace, "trace_stop": trace, "trace_state": trace, "trace_open": {"traceArtifactId": "trace-artifact-1", "sha256": "0" * 64,
+                   "architecture": "x64", "formatVersion": "1", "entries": "9007199254740993", "indexing": indexing}, "trace_read": rows, "trace_search": rows,
+               "trace_export": {**artifact, "traceArtifactId": "trace-artifact-1", "sourceSha256": "1" * 64, "entries": "42", "complete": True}}
+    extra_inputs = [(True, "breakpoints_create", {**context.mutation, "kind": "hardware", "location": {"addressHex": "0x1000"}, "options": {"access": "read_write", "size": 8}}),
+                    (True, "breakpoints_create", {**context.mutation, "kind": "hardware", "location": {"expression": "rip"}, "options": {"access": "execute", "size": 1}}),
+                    (True, "breakpoints_create", {**context.mutation, "kind": "memory", "location": {"address": {"addressHex": "0x1000"}, "size": 4096}, "options": {"access": "write", "overlapPolicy": "preserve"}}),
+                    (True, "breakpoints_create", {**context.mutation, "kind": "module", "location": {"moduleName": "controlled.dll"}, "options": {"event": "either"}}),
+                    (True, "breakpoints_create", {**context.mutation, "kind": "exception", "location": {"codeHex": "0xc0000005"}, "options": {"chance": "first"}}),
+                    (False, "breakpoints_create", {**context.mutation, "kind": "hardware", "location": {"addressHex": "0x1000"}, "options": {"access": "execute", "size": 8}}),
+                    (False, "breakpoints_create", {**context.mutation, "kind": "hardware", "location": {"addressHex": "0x1000"}, "options": {"access": "read_write", "size": 3}}),
+                    (False, "breakpoints_create", {**context.mutation, "kind": "memory", "location": {"addressHex": "0x1000"}}),
+                    (False, "breakpoints_create", {**context.mutation, "kind": "exception", "location": {"codeHex": "0x100000000"}}),
+                    (False, "breakpoints_create", {**context.mutation, "kind": "exception", "location": {"codeHex": "0xc0000005"}, "options": {"encoding": "int3"}}),
+                    (False, "breakpoints_update", {**inputs["breakpoints_update"], "changes": {}}),
+                    (False, "breakpoints_delete", {**target_mutation, "breakpointIds": ["bp-1", "bp-1"]}),
+                    (False, "breakpoints_enable", {**target_mutation, "breakpointIds": [], "enabled": True}),
+                    (False, "breakpoints_toggle", {**inputs["breakpoints_toggle"], "expectedEnabled": "false"}),
+                    (True, "trace_start", {**inputs["trace_start"], "limits": {"maxWallTimeMs": 1}, "mode": "over"}),
+                    (True, "trace_start", {**inputs["trace_start"], "limits": {"maxInstructions": "18446744073709551615"}, "record": {"enabled": False}}),
+                    (False, "trace_start", {**inputs["trace_start"], "limits": {}}),
+                    (False, "trace_start", {**inputs["trace_start"], "limits": {"maxArtifactBytes": "1048576"}}),
+                    (False, "trace_start", {**inputs["trace_start"], "limits": {"maxInstructions": "0"}}),
+                    (False, "trace_start", {**inputs["trace_start"], "limits": {"maxInstructions": 9007199254740993}}),
+                    (False, "trace_start", {**inputs["trace_start"], "limits": {"maxWallTimeMs": 60001}}),
+                    (False, "trace_start", {**inputs["trace_start"], "mode": "native"}),
+                    (False, "trace_open", {"instanceId": "instance-1", "path": "relative.trace"}),
+                    (False, "trace_read", {**inputs["trace_read"], "fields": ["instructions", "instructions"]}),
+                    (False, "trace_export", {**inputs["trace_export"], "range": {"first": "0", "count": "0"}})]
+    for name in ("breakpoints_create", "trace_start"):
+        extra_inputs.extend((False, name, {key: value for key, value in inputs[name].items() if key != missing}) for missing in ("stopEpoch", "leaseId"))
+    extra_inputs.append((False, "trace_start", {key: value for key, value in inputs["trace_start"].items() if key != "threadId"}))
+    hardware = copy.deepcopy(breakpoint)
+    hardware.update({"kind": "hardware", "hardwareSlot": 3, "options": {key: value for key, value in options.items() if key != "encoding"}})
+    hardware["options"].update({"access": "read_write", "size": 8})
+    invalid_hardware = {**hardware, "hardwareSlot": 4}
+    invalid_entry = {**entry, "index": 9007199254740993}
+    extra_outputs = [(True, "breakpoints_create", hardware), (False, "breakpoints_create", invalid_hardware),
+                     (False, "trace_read", {**rows, "items": [invalid_entry]}), (False, "trace_state", {**trace, "executedInstructions": "18446744073709551616"})]
+    effects = {name: ["modify"] for name in BREAKPOINT_TRACE_TOOLS[:8]}
+    effects.update({"breakpoints_list": ["inspect"], "trace_start": ["execute", "file_export"], "trace_stop": ["execute"], "trace_state": ["inspect"],
+                    "trace_open": ["configure"], "trace_read": ["inspect"], "trace_search": ["inspect"], "trace_export": ["inspect", "file_export"]})
+    required = {name: "instanceId" for name in BREAKPOINT_TRACE_TOOLS}
+    required.update({name: "traceArtifactId" for name in ("trace_read", "trace_search", "trace_export")})
+    executors = {name: "engine" for name in BREAKPOINT_TRACE_TOOLS}
+    executors.update({"trace_open": "gui", "trace_read": "broker", "trace_search": "broker", "trace_export": "broker"})
+    result = check_tool_family(probe, registry, validators, BREAKPOINT_TRACE_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects, required, executors)
+    result["nativeBreakpointKinds"] = ["software", "hardware", "memory", "module", "exception"]
+    result["traceLimitForms"] = ["instructions", "wall_time", "both"]
+    return result
+
+
+def check_assembly_file_contracts(probe, registry, validators):
+    context = tool_context_examples()
+    instruction = instruction_example()
+    encoding = {"architecture": "x64", "originHex": "0x140001000", "bytesHex": "b82a000000", "length": "5",
+                "boundaries": [{"offset": "0", "length": "5", "line": 1, "column": 1, "kind": "instruction"}], "labels": [], "backend": {"provider": "xedparse", "version": "controlled"}}
+    disassembly = {"architecture": "x64", "originHex": "0x140001000", "items": [instruction], "bytesConsumed": "5", "complete": True,
+                   "source": {"kind": "target", "sha256": None, "context": context.target}}
+    patch_range = {"addressHex": "0x140001000", "moduleId": "module-1", "rvaHex": "0x1000", "originalBytesHex": "b807000000", "replacementBytesHex": "b82a000000",
+                   "observedBytesHex": "b82a000000", "nativeTracked": True, "state": "applied", "breakpointIds": ["bp-1"], "restoration": "not_needed"}
+    patch = {"patchSetId": "patch-1", "revision": "rev-1", "name": "controlled", "target": context.target, "ranges": [patch_range], "ownership": "client", "complete": True}
+    file = {"file": {"path": "C:\\controlled.exe"}, "sha256": "0" * 64, "size": "4096", "architecture": "x64", "imageBaseHex": "0x140000000", "entryRvaHex": "0x1000",
+            "sections": [{"name": ".text", "rvaHex": "0x1000", "virtualSize": "4096", "rawOffset": "512", "rawSize": "512", "characteristicsHex": "0x60000020", "mapping": "valid"}],
+            "peStatus": "valid", "overlayOffset": None, "signature": "absent", "limitations": []}
+    changed = {"fileOffset": "512", "rvaHex": "0x1000", "originalBytesHex": "b807000000", "replacementBytesHex": "b82a000000"}
+    transaction = {"transactionId": "transaction-1", "mode": "save_as", "source": file, "published": {**file, "file": {"path": "C:\\controlled-patched.exe"}, "sha256": "1" * 64},
+                   "backupArtifact": None, "changes": [{**changed, "verified": True}], "outsidePlanPreserved": True, "journalState": "verified", "signatureImpact": "unchanged", "runtimeVerification": "unverified"}
+    plan = {"planId": "plan-1", "planDigest": "2" * 64, "source": file, "addressMode": "rva", "changes": [changed], "moduleIdentity": "3" * 64, "signatureImpact": "unchanged"}
+    inputs = {"disassembly_read": {**context.target, "addressHex": "0x140001000", "count": 16, "detail": "full"},
+              "disassembly_function": {**context.target, "moduleId": "module-1", "rvaHex": "0x1000", "boundarySource": "unwind"},
+              "assembly_encode": {"architecture": "x64", "origin": "0x140001000", "source": "mov eax,42", "mode": "instruction"},
+              "assembly_apply": {**context.mutation, "addressHex": "0x140001000", "source": "mov eax,42", "span": 5, "expectedBytes": {"bytesHex": "b807000000"}, "fill": "none"},
+              "patch_sets_create": {**context.target, "leaseId": "lease-1", "name": "controlled", "ranges": [{"address": {"addressHex": "0x140001000"}, "replacementBytesHex": "b82a000000", "expectedBytes": {"bytesHex": "b807000000"}}]},
+              "patch_sets_list": context.target, "patch_sets_read": {**context.target, "patchSetId": "patch-1", "revision": "rev-1"},
+              "patch_apply_runtime": {**context.mutation, "patchSetId": "patch-1", "revision": "rev-1"},
+              "patch_restore_runtime": {**context.mutation, "patchSetId": "patch-1", "expectedRevision": "rev-1"}, "patch_restore_all": {**context.mutation, "selection": ["patch-1"]},
+              "patch_export_file": {**context.target, "patchSetId": "patch-1", "revision": "rev-1", "path": "C:\\controlled.exe", "destination": "C:\\controlled-patched.exe", "mode": "save_as", "expectedSha256": "0" * 64},
+              "file_inspect": {"path": "C:\\controlled.exe"},
+              "file_patch_plan": {"artifactId": "artifact-1", "expectedSha256": "0" * 64, "changes": [{"positionHex": "0x1000", "replacementBytesHex": "b82a000000", "expectedBytesHex": "b807000000"}], "addressMode": "rva"},
+              "file_patch_apply": {"planId": "plan-1", "planDigest": "2" * 64, "destination": "C:\\controlled-patched.exe", "mode": "save_as"},
+              "file_patch_undo": {"transactionId": "transaction-1", "expectedCurrentSha256": "1" * 64},
+              "file_compare": {"left": {"path": "C:\\controlled.exe"}, "right": {"artifactId": "artifact-1"}, "ranges": [{"offset": "9007199254740993", "size": 5}]},
+              "file_export": {"artifactId": "artifact-1", "destination": "C:\\exported.bin", "overwrite": False}}
+    outputs = {"disassembly_read": disassembly, "disassembly_function": {"items": [instruction], "page": context.page, "startHex": "0x140001000", "endHex": "0x140001006", "boundarySource": "unwind", "certainty": "verified"},
+               "assembly_encode": encoding, "assembly_apply": {"patch": patch, "encoding": encoding, "disassembly": disassembly,
+                   "followingBytes": {"addressHex": "0x140001005", "expectedBytesHex": "c3", "observedBytesHex": "c3", "unchanged": True}},
+               "patch_sets_create": patch, "patch_sets_list": {"items": [patch], "page": context.page}, "patch_sets_read": patch,
+               "patch_apply_runtime": patch, "patch_restore_runtime": patch, "patch_restore_all": {"items": [patch], "page": context.page},
+               "patch_export_file": transaction, "file_inspect": file, "file_patch_plan": plan, "file_patch_apply": transaction, "file_patch_undo": {**transaction, "mode": "undo", "journalState": "restored"},
+               "file_compare": {"items": [{"offset": "512", "leftBytesHex": "07", "rightBytesHex": "2a"}], "page": context.page, "left": file, "right": transaction["published"]},
+               "file_export": {**transaction, "mode": "export"}}
+    extra_inputs = [(True, "disassembly_read", {"architecture": "x32", "bytes": "b82a000000c3", "origin": "0x401000"}),
+                    (True, "assembly_encode", {**inputs["assembly_encode"], "mode": "block", "source": "start:\nmov eax,42\njmp start"}),
+                    (True, "file_export", {**inputs["file_export"], "overwrite": "replace", "expectedDestinationSha256": "0" * 64}),
+                    (False, "disassembly_read", {**inputs["disassembly_read"], "architecture": "x64", "bytes": "90", "origin": "0x1000"}),
+                    (False, "disassembly_read", {"architecture": "x64", "bytes": "9", "origin": "0x1000"}),
+                    (False, "assembly_encode", {**inputs["assembly_encode"], "architecture": "arm64"}),
+                    (False, "assembly_encode", {**inputs["assembly_encode"], "origin": 9007199254740993}),
+                    (False, "assembly_apply", {**inputs["assembly_apply"], "span": 1048577}),
+                    (False, "assembly_apply", {**inputs["assembly_apply"], "fill": "truncate"}),
+                    (False, "patch_sets_create", {**inputs["patch_sets_create"], "ranges": []}),
+                    (False, "patch_sets_create", {**inputs["patch_sets_create"], "ranges": [{"address": {"addressHex": "0x1000"}, "replacementBytesHex": "90"}]}),
+                    (False, "patch_restore_all", {**inputs["patch_restore_all"], "selection": ["patch-1", "patch-1"]}),
+                    (False, "patch_export_file", {**inputs["patch_export_file"], "artifactId": "artifact-1"}),
+                    (False, "patch_export_file", {**inputs["patch_export_file"], "expectedSha256": "0" * 63}),
+                    (False, "file_inspect", {"path": "relative.exe"}),
+                    (False, "file_patch_plan", {**inputs["file_patch_plan"], "addressMode": "va"}),
+                    (False, "file_patch_plan", {**inputs["file_patch_plan"], "changes": [{"positionHex": "0x1000", "replacementBytesHex": "90", "expectedBytesHex": "GG"}]}),
+                    (False, "file_patch_apply", {**inputs["file_patch_apply"], "planDigest": "tampered"}),
+                    (False, "file_patch_apply", {**inputs["file_patch_apply"], "mode": "overwrite"}),
+                    (False, "file_patch_undo", {**inputs["file_patch_undo"], "expectedCurrentSha256": "not a hash"}),
+                    (False, "file_compare", {**inputs["file_compare"], "ranges": [{"offset": 9007199254740993, "size": 5}]}),
+                    (False, "file_export", {**inputs["file_export"], "overwrite": True}),
+                    (False, "file_export", {**inputs["file_export"], "overwrite": "replace"})]
+    for name in ("assembly_apply", "patch_apply_runtime", "patch_restore_runtime", "patch_restore_all"):
+        extra_inputs.extend((False, name, {key: value for key, value in inputs[name].items() if key != missing}) for missing in ("stopEpoch", "leaseId"))
+    invalid_patch = copy.deepcopy(patch)
+    invalid_patch["ranges"][0]["originalBytesHex"] = "G0"
+    invalid_encoding = copy.deepcopy(encoding)
+    invalid_encoding["boundaries"][0]["length"] = "0"
+    extra_outputs = [(False, "assembly_encode", invalid_encoding), (False, "patch_sets_read", invalid_patch),
+                     (False, "file_patch_apply", {**transaction, "runtimeVerification": "runnable"}),
+                     (False, "file_inspect", {**file, "size": 9007199254740993}), (False, "disassembly_read", {**disassembly, "items": [{**instruction, "length": 16}]})]
+    effects = {name: ["inspect"] for name in ASSEMBLY_FILE_TOOLS}
+    effects.update({name: ["modify"] for name in ("assembly_apply", "patch_sets_create", "patch_apply_runtime", "patch_restore_runtime", "patch_restore_all")})
+    effects.update({"patch_export_file": ["inspect", "file_export"], "file_patch_apply": ["file_export"], "file_patch_undo": ["file_replace"], "file_export": ["file_export"]})
+    required = {name: "instanceId" for name in ASSEMBLY_FILE_TOOLS}
+    required.update({"assembly_encode": "architecture", "file_inspect": "path", "file_patch_plan": "artifactId", "file_patch_apply": "planId", "file_patch_undo": "transactionId", "file_compare": "left", "file_export": "artifactId"})
+    executors = {name: "engine" for name in ASSEMBLY_FILE_TOOLS}
+    executors.update({name: "broker" for name in ("disassembly_read", "assembly_encode", "patch_export_file", "file_inspect", "file_patch_plan", "file_patch_apply", "file_patch_undo", "file_compare", "file_export")})
+    conditions = {"patch_export_file": [{"field": "mode", "equals": "replace", "effects": ["file_replace"]}],
+                  "file_patch_apply": [{"field": "mode", "equals": "replace", "effects": ["file_replace"]}], "file_export": [{"field": "overwrite", "equals": "replace", "effects": ["file_replace"]}]}
+    result = check_tool_family(probe, registry, validators, ASSEMBLY_FILE_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects, required, executors, conditions)
+    for name, field in (("patch_export_file", "mode"), ("file_patch_apply", "mode"), ("file_export", "overwrite")):
+        value = {**inputs[name], field: "replace"}
+        if name == "file_export":
+            value["expectedDestinationSha256"] = "0" * 64
+        expected = effects[name] + ["file_replace"]
+        assert validators[(name, "input")].is_valid(value) and probe.call("tool-input", value, name)["valid"]
+        assert probe.call("effects", value, name) == {"valid": True, "effects": expected}
+    result["conditionalReplacementEffects"] = 3
+    return result
 
 
 class StartupInfo(ctypes.Structure):
@@ -1100,6 +1291,10 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_inspection_contracts(probe, registry, tool_validators))
             elif name == "test_memory_contracts":
                 result.update(check_memory_contracts(probe, registry, tool_validators))
+            elif name == "test_breakpoint_trace_contracts":
+                result.update(check_breakpoint_trace_contracts(probe, registry, tool_validators))
+            elif name == "test_assembly_file_contracts":
+                result.update(check_assembly_file_contracts(probe, registry, tool_validators))
             elif name == "test_native_launch_arguments":
                 result.update(check_native_launch(probe, architecture))
             elif name == "test_native_component_builds":

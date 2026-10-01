@@ -273,6 +273,8 @@ const std::vector<ToolDefinition>& tool_registry()
         append_execution_tools(tools);
         append_inspection_tools(tools);
         append_memory_tools(tools);
+        append_breakpoint_trace_tools(tools);
+        append_assembly_file_tools(tools);
         std::sort(tools.begin(), tools.end(), [](const ToolDefinition& left, const ToolDefinition& right) { return left.name < right.name; });
         return tools;
     }();
