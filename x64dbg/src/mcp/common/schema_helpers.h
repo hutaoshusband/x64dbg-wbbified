@@ -16,4 +16,5 @@ Json with_deadline_schema(Json base);
 Json positive_decimal_schema();
 Json typed_setting_value_schema();
 Json effect_list_schema();
+Json job_state_schema();
 }

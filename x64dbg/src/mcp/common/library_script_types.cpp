@@ -163,7 +163,7 @@ Json script_run_schema()
         {"resultArtifactId", nullable_schema(id())}, {"error", nullable_schema(reference_schema("DomainError"))}, {"verification", reference_schema("Verification")}},
         {"stepId", "capabilityId", "operationId", "state", "resultArtifactId", "error", "verification"});
     return closed_object_schema({{"jobId", id()}, {"revision", reference_schema("LibraryRef")}, {"engine", string_schema("utf8-text", 256)},
-        {"state", enum_schema({"queued", "running", "waiting_for_debugger", "waiting_for_event", "awaiting_user_consent", "cancelling", "completed", "cancelled", "failed", "interrupted_by_user", "unknown"})},
+        {"state", job_state_schema()},
         {"context", nullable_schema(reference_schema("ResultContext"))}, {"steps", paged_data_schema(step)},
         {"artifacts", bounded_array_schema(id(), MaximumPageLimit, 0, true)}, {"logsArtifactId", nullable_schema(id())},
         {"verification", reference_schema("Verification")}, {"complete", boolean()}},

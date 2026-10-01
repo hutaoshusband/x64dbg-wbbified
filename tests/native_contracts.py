@@ -20,7 +20,7 @@ CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_
               "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
-              "test_provider_ui_contracts", "test_library_script_contracts", "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
+              "test_provider_ui_contracts", "test_library_script_contracts", "test_job_event_artifact_contracts", "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
 
 EXECUTION_TOOLS = ("execution_resume", "execution_pause", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to",
                    "execution_skip_instruction", "execution_wait", "threads_list", "threads_select", "threads_suspend", "threads_resume", "threads_context",
@@ -47,6 +47,9 @@ LIBRARY_SCRIPT_TOOLS = ("library_namespaces", "library_files_list", "library_fil
                         "library_search", "library_import", "library_export", "library_quota", "scripts_list", "scripts_create", "scripts_update", "scripts_read", "scripts_revisions",
                         "scripts_validate", "scripts_run", "scripts_delete", "script_languages", "native_script_load", "native_script_control", "native_script_breakpoint", "native_script_state", "workflows_run")
 SCRIPT_NATIVE_EFFECT_TOOLS = ("scripts_run", "native_script_load", "native_script_control", "native_script_breakpoint", "workflows_run")
+JOB_EVENT_ARTIFACT_TOOLS = ("jobs_list", "job_get", "job_wait", "job_cancel", "operation_reconcile", "events_read", "events_wait", "events_clear", "artifacts_list", "artifacts_create",
+                            "artifacts_upload_begin", "artifacts_upload_chunk", "artifacts_upload_finish", "artifacts_read", "artifacts_delete", "diagnostics_export")
+JOB_NATIVE_EFFECT_TOOLS = ("job_cancel",)
 
 
 def build_contract_fixture(output, architecture):
@@ -313,14 +316,14 @@ def registry_validators(registry, formats):
     validators = {}
     expected = {"server_info", "server_health", "capabilities_list", "capabilities_describe", "capabilities_search", "client_context_get", "client_context_set", "control_acquire", "control_renew", "control_release"}
     expected.update({"debugger_instances", "debugger_start", "debugger_focus", "debugger_close", "debugger_settings_get", "debugger_settings_set", "processes_list", "target_open", "target_attach", "target_state", "target_snapshot", "target_stop", "target_detach", "target_restart", "target_command_line_get", "target_command_line_set"})
-    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS + BREAKPOINT_TRACE_TOOLS + ASSEMBLY_FILE_TOOLS + MODULE_ANALYSIS_TOOLS + DATABASE_SETTINGS_TOOLS + PROVIDER_UI_TOOLS + LIBRARY_SCRIPT_TOOLS)
+    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS + BREAKPOINT_TRACE_TOOLS + ASSEMBLY_FILE_TOOLS + MODULE_ANALYSIS_TOOLS + DATABASE_SETTINGS_TOOLS + PROVIDER_UI_TOOLS + LIBRARY_SCRIPT_TOOLS + JOB_EVENT_ARTIFACT_TOOLS)
     assert registry["operationalTools"] == [] and {tool["name"] for tool in registry["tools"]} == expected
     assert [tool["name"] for tool in registry["tools"]] == sorted(expected)
     for tool in registry["tools"]:
         assert tool["schemaVersion"] == 1 and tool["operational"] is False
         assert tool["completionPredicate"] and tool["nativeSource"] and tool["recovery"] and tool["acceptanceIds"]
         assert tool["annotations"]["readOnlyHint"] == (tool["effects"] == ["inspect"] and not tool["effectConditions"])
-        assert tool.get("effectResolution") == ("native_classifier" if tool["name"] in NATIVE_EFFECT_TOOLS + SCRIPT_NATIVE_EFFECT_TOOLS else None)
+        assert tool.get("effectResolution") == ("native_classifier" if tool["name"] in NATIVE_EFFECT_TOOLS + SCRIPT_NATIVE_EFFECT_TOOLS + JOB_NATIVE_EFFECT_TOOLS else None)
         assert tool["executor"] in ("broker", "engine", "gui")
         assert tool["architectureRequirement"] == {"seh_chain": "x32", "unwind_info": "x64"}.get(tool["name"], "any")
         for direction in ("input", "output"):
@@ -1453,6 +1456,115 @@ def check_library_script_contracts(probe, registry, validators):
     return result
 
 
+def check_job_event_artifact_contracts(probe, registry, validators):
+    c = tool_context_examples()
+    instance = {"instanceId": "instance-1"}
+    ref = {"namespaceId": "private-1", "objectId": "object-1", "revision": "revision-1"}
+    recovery = {"capabilityId": "operation_reconcile", "retry": "after_reconciliation", "reason": "Observe actual effect state before retry"}
+    unverified = {"status": "unverified", "evidence": [], "followUp": recovery}
+    job = {"jobId": "job-1", "operationId": "operation-1", "ownerClientId": "client-1", "profileId": "profile-1", "capabilityId": "debugger_start", "version": "9007199254740993",
+           "state": "awaiting_user_consent", "context": instance, "createdUtcMs": "18446744073709551615", "updatedUtcMs": "18446744073709551615", "deadlineUtcMs": None,
+           "startingEventCursor": None, "progress": {"phase": "consent", "completed": "0", "total": None, "description": "Waiting for the human Windows decision"},
+           "steps": {"items": [], "page": c.page}, "pendingInteraction": {"kind": "os_consent", "instanceId": "instance-1", "dialogId": None, "description": "Windows consent", "userControlled": True},
+           "result": None, "effects": [], "verification": unverified, "pinnedRevisions": [ref], "artifactIds": [], "cancellationRequested": False, "reconciliationRequired": False, "complete": True}
+    digest = hashlib.sha256(b"\xff").hexdigest()
+    artifact = {**managed_artifact_example(), "size": "1", "sha256": digest, "name": "fixture.bin", "kind": "data", "ownerClientId": "client-1", "createdUtcMs": "9007199254740993",
+                "metadataVersion": "18446744073709551615", "provenance": {"operationId": "operation-1", "jobId": "job-1", "context": c.target, "sourceArtifactIds": []},
+                "referencedJobs": ["job-1"], "retainedEvidence": True, "trashed": False}
+    upload = {"uploadId": "upload-1", "namespaceId": "private-1", "ownerClientId": "client-1", "name": "fixture.bin", "kind": "data", "size": "1", "sha256": digest,
+              "receivedBytes": "0", "version": "9007199254740993", "expiresUtcMs": "18446744073709551615", "state": "allocated", "chunkLimit": 1048576,
+              "ranges": {"items": [], "page": c.page}, "artifactId": None, "complete": True}
+    event = {"cursor": "opaque:event/1", "sequence": "9007199254740993", "utcMs": "18446744073709551615", **instance, "target": c.target, "sourceThreadId": 123,
+             "type": "pause", "providerId": "engine", "operationId": "operation-1", "jobId": "job-1", "payload": {"ipHex": "0xffffffffffffffff", "stopEpoch": "18446744073709551615"}, "artifactId": None}
+    event_page = {"items": [event], "nextCursor": "opaque:event/1", "snapshotVersion": "18446744073709551615", "gap": None, "complete": True}
+    reconciled = {"operationId": "operation-1", "journalId": "journal-1", "version": "9007199254740993", "jobId": "job-1", "state": "unknown", "context": c.target,
+                  "effects": [{"stepId": "step-1", "status": "unknown", "summary": "Native owner disconnected"}],
+                  "observations": {"items": [{"kind": "target", "context": c.target, "source": "worker", "state": "unavailable", "sha256": None, "artifactId": None, "data": {}}], "page": c.page},
+                  "verification": unverified, "recovery": [recovery], "resumedMutation": False, "complete": False}
+    scope = {"kind": "operation", "operationId": "operation-1"}
+    inputs = {"jobs_list": {}, "job_get": {"jobId": "job-1"}, "job_wait": {"jobId": "job-1", "afterVersion": "9007199254740993", "timeoutMs": 60000},
+              "job_cancel": {"jobId": "job-1", "reason": "Controlled cancellation"}, "operation_reconcile": {"operationId": "operation-1"},
+              "events_read": {**c.target, "afterCursor": "opaque:event/0", "types": ["pause", "user_intervention"], "limit": 1000},
+              "events_wait": {**c.target, "afterCursor": "opaque:event/0", "filter": {"types": ["pause"], "operationId": "operation-1"}, "timeoutMs": 60000},
+              "events_clear": {**instance, "beforeCursor": "opaque:event/0"}, "artifacts_list": {"namespaceId": "private-1"},
+              "artifacts_create": {"namespaceId": "private-1", "name": "fixture.bin", "kind": "data", "content": {"encoding": "hex", "bytesHex": "ff"}},
+              "artifacts_upload_begin": {"namespaceId": "private-1", "name": "fixture.bin", "size": "1", "sha256": digest, "kind": "data"},
+              "artifacts_upload_chunk": {"uploadId": "upload-1", "offset": "0", "bytes": "ff", "chunkSha256": digest}, "artifacts_upload_finish": {"uploadId": "upload-1"},
+              "artifacts_read": {"artifactId": "artifact-1", "offset": "9007199254740993", "length": 1048576},
+              "artifacts_delete": {"artifactIds": ["artifact-1"], "expectedHashes": [digest]}, "diagnostics_export": {"scope": scope, "namespaceId": "private-1", "includeTargetContent": False}}
+    outputs = {"jobs_list": {"items": [job], "page": c.page}, "job_get": job, "job_wait": {"job": job, "changed": False, "timedOut": True},
+               "job_cancel": {"job": {**job, "state": "cancelling", "cancellationRequested": True}, "requestAccepted": True, "terminationObserved": False}, "operation_reconcile": reconciled,
+               "events_read": event_page, "events_wait": {**event_page, "matched": True, "timedOut": False},
+               "events_clear": {**instance, "removedEvents": "9007199254740993", "oldestAvailableCursor": "opaque:event/1", "version": "18446744073709551615", "affectedWaits": "1", "journalsPreserved": True, "retainedEvidencePreserved": True},
+               "artifacts_list": {"items": [artifact], "page": c.page}, "artifacts_create": artifact, "artifacts_upload_begin": upload,
+               "artifacts_upload_chunk": {"upload": {**upload, "receivedBytes": "1", "state": "receiving", "ranges": {"items": [{"offset": "0", "length": 1, "chunkSha256": digest}], "page": c.page}},
+                   "acceptedOffset": "0", "acceptedLength": 1, "chunkSha256": digest, "retransmission": False}, "artifacts_upload_finish": artifact,
+               "artifacts_read": {"artifact": artifact, "offset": "0", "length": 1, "bytesHex": "ff", "chunkSha256": digest, "eof": True},
+               "artifacts_delete": {"items": [{"artifactId": "artifact-1", "sha256": digest, "status": "retained", "trashId": None, "referencedJobs": ["job-1"], "retainedEvidence": True, "error": None}], "journalId": "journal-1", "complete": True},
+               "diagnostics_export": {"artifact": {**artifact, "kind": "diagnostics"}, "scope": scope, "includeTargetContent": False,
+                   "inventory": {"items": [{"kind": "journal", "source": "operation-1", "sha256": digest, "size": "1", "containsTargetContent": False, "redacted": True}], "page": c.page},
+                   "credentialsRedacted": True, "manifestSha256": digest, "complete": True}}
+    extra_inputs = [(False, "job_wait", {**inputs["job_wait"], "afterVersion": 9007199254740993}), (False, "job_wait", {**inputs["job_wait"], "timeoutMs": 60001}),
+                    (True, "jobs_list", {"state": "interrupted_by_user", **instance}), (False, "jobs_list", {"state": "accepted"}),
+                    (True, "events_read", instance), (False, "events_read", {**inputs["events_read"], "targetGeneration": 9007199254740993}),
+                    (False, "events_read", {**inputs["events_read"], "types": ["pause", "pause"]}),
+                    (False, "events_wait", {**inputs["events_wait"], "afterCursor": 1}), (False, "events_wait", {**inputs["events_wait"], "filter": {"unknown": "reject"}}),
+                    (False, "events_wait", {**inputs["events_wait"], "timeoutMs": 0}), (False, "events_wait", {**inputs["events_wait"], "timeoutMs": 60001}),
+                    (False, "events_wait", {key: value for key, value in inputs["events_wait"].items() if key != "filter"}),
+                    (True, "artifacts_create", {**inputs["artifacts_create"], "content": {"encoding": "hex", "bytesHex": ""}}),
+                    (True, "artifacts_create", {**inputs["artifacts_create"], "content": {"artifactId": "artifact-2", "sha256": digest}}),
+                    (False, "artifacts_upload_begin", {**inputs["artifacts_upload_begin"], "size": 9007199254740993}),
+                    (True, "artifacts_upload_begin", {**inputs["artifacts_upload_begin"], "size": "0"}),
+                    (False, "artifacts_upload_chunk", {**inputs["artifacts_upload_chunk"], "offset": "18446744073709551616"}),
+                    (False, "artifacts_upload_chunk", {**inputs["artifacts_upload_chunk"], "bytes": ""}),
+                    (False, "artifacts_upload_chunk", {**inputs["artifacts_upload_chunk"], "bytes": "f"}),
+                    (False, "artifacts_upload_chunk", {**inputs["artifacts_upload_chunk"], "chunkSha256": "0" * 63}),
+                    (False, "artifacts_read", {**inputs["artifacts_read"], "length": 0}), (False, "artifacts_read", {**inputs["artifacts_read"], "length": 1048577}),
+                    (False, "artifacts_delete", {**inputs["artifacts_delete"], "artifactIds": ["artifact-1", "artifact-1"]}),
+                    (False, "artifacts_delete", {**inputs["artifacts_delete"], "expectedHashes": []}),
+                    (False, "diagnostics_export", {**inputs["diagnostics_export"], "includeTargetContent": "false"}),
+                    (False, "diagnostics_export", {key: value for key, value in inputs["diagnostics_export"].items() if key != "includeTargetContent"}),
+                    (True, "diagnostics_export", {**inputs["diagnostics_export"], "scope": {"kind": "instance", **instance}, "includeTargetContent": True}),
+                    (False, "diagnostics_export", {**inputs["diagnostics_export"], "scope": {"kind": "instance"}})]
+    gap = {"requestedCursor": "opaque:event/0", "oldestAvailableCursor": "opaque:event/1", "missingFromSequence": "9007199254740993", "missingThroughSequence": "18446744073709551615",
+           "snapshotRoute": {**recovery, "capabilityId": "target_snapshot"}}
+    extra_outputs = [(True, "events_read", {**event_page, "items": [], "gap": gap, "complete": False}),
+                     (False, "events_read", {**event_page, "items": [{**event, "sequence": 9007199254740993}]}),
+                     (False, "events_read", {**event_page, "items": [{**event, "target": {**c.target, "targetGeneration": 9007199254740993}}]}),
+                     (False, "events_read", {**event_page, "gap": {key: value for key, value in gap.items() if key != "snapshotRoute"}}),
+                     (False, "events_clear", {**outputs["events_clear"], "journalsPreserved": False}),
+                     (False, "events_clear", {**outputs["events_clear"], "retainedEvidencePreserved": False}),
+                     (False, "operation_reconcile", {**reconciled, "resumedMutation": True}), (False, "job_get", {**job, "version": 9007199254740993}),
+                     (False, "job_get", {**job, "pendingInteraction": {**job["pendingInteraction"], "userControlled": False}}),
+                     (True, "job_get", {**job, "state": "unknown", "reconciliationRequired": True, "pendingInteraction": None}),
+                     (False, "artifacts_upload_begin", {**upload, "receivedBytes": 9007199254740993}),
+                     (False, "artifacts_upload_chunk", {**outputs["artifacts_upload_chunk"], "acceptedLength": 0}),
+                     (True, "artifacts_upload_chunk", {**outputs["artifacts_upload_chunk"], "retransmission": True}),
+                     (True, "artifacts_read", {**outputs["artifacts_read"], "length": 0, "bytesHex": "", "offset": "1"}),
+                     (False, "artifacts_read", {**outputs["artifacts_read"], "bytesHex": "ff0"}),
+                     (False, "artifacts_create", {**artifact, "size": "18446744073709551616"}),
+                     (False, "diagnostics_export", {**outputs["diagnostics_export"], "credentialsRedacted": False})]
+    states = ("queued", "running", "waiting_for_debugger", "waiting_for_event", "awaiting_user_consent", "cancelling", "completed", "cancelled", "failed", "interrupted_by_user", "unknown")
+    for state in states:
+        extra_inputs.append((True, "jobs_list", {"state": state}))
+        extra_outputs.append((True, "job_get", {**job, "state": state}))
+    effects = {name: ["inspect"] for name in JOB_EVENT_ARTIFACT_TOOLS}
+    effects.update({name: ["configure"] for name in ("events_clear", "artifacts_create", "artifacts_upload_begin", "artifacts_upload_chunk", "artifacts_upload_finish", "artifacts_delete")})
+    effects["diagnostics_export"] = ["inspect", "file_export"]
+    effects["job_cancel"] = ["inspect", "execute", "modify", "file_export", "file_replace", "elevate", "configure"]
+    required = {"jobs_list": None, "job_get": "jobId", "job_wait": "jobId", "job_cancel": "jobId", "operation_reconcile": "operationId",
+                "events_read": "instanceId", "events_wait": "instanceId", "events_clear": "instanceId", "artifacts_list": "namespaceId", "artifacts_create": "namespaceId",
+                "artifacts_upload_begin": "namespaceId", "artifacts_upload_chunk": "uploadId", "artifacts_upload_finish": "uploadId", "artifacts_read": "artifactId",
+                "artifacts_delete": "artifactIds", "diagnostics_export": "namespaceId"}
+    result = check_tool_family(probe, registry, validators, JOB_EVENT_ARTIFACT_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects, required,
+                               {name: "broker" for name in JOB_EVENT_ARTIFACT_TOOLS}, native_effect_tools=JOB_NATIVE_EFFECT_TOOLS)
+    assert validators[("job_wait", "input")].schema["properties"]["timeoutMs"]["default"] == 30000
+    assert all(form["properties"]["timeoutMs"]["default"] == 30000 for form in validators[("events_wait", "input")].schema["oneOf"])
+    result.update(nativeClassificationRequired=list(JOB_NATIVE_EFFECT_TOOLS), jobStates=list(states), waitDefaultMs=30000, waitMaximumMs=60000,
+                  protectedConsentAndRetention=True, actualJobsEventsOrPublicationVerified=False)
+    return result
+
+
 def check_native_launch(probe, architecture):
     import os
     import shutil
@@ -1765,6 +1877,8 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_provider_ui_contracts(probe, registry, tool_validators))
             elif name == "test_library_script_contracts":
                 result.update(check_library_script_contracts(probe, registry, tool_validators))
+            elif name == "test_job_event_artifact_contracts":
+                result.update(check_job_event_artifact_contracts(probe, registry, tool_validators))
             elif name == "test_native_launch_arguments":
                 result.update(check_native_launch(probe, architecture))
             elif name == "test_native_component_builds":

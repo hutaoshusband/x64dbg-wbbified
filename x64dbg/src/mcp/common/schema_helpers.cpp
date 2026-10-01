@@ -83,4 +83,9 @@ Json effect_list_schema()
 {
     return bounded_array_schema(enum_schema({"inspect", "execute", "modify", "file_export", "file_replace", "elevate", "configure"}), 7, 0, true);
 }
+
+Json job_state_schema()
+{
+    return enum_schema({"queued", "running", "waiting_for_debugger", "waiting_for_event", "awaiting_user_consent", "cancelling", "completed", "cancelled", "failed", "interrupted_by_user", "unknown"});
+}
 }
