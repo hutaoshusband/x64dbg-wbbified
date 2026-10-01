@@ -141,6 +141,7 @@ def parse_arguments():
                         help="Observe shipped legacy or source-built native GUI surface")
     parser.add_argument("--refresh-registries", action="store_true", help="Update the source parity candidate registry")
     parser.add_argument("--engine", choices=("TitanEngine", "GleeBug", "StaticEngine", "all"), default="TitanEngine")
+    parser.add_argument("--cmake", type=Path, help="CMake executable for the mcp-contracts source build")
     arguments = parser.parse_args()
     if not 1 <= arguments.timeout <= 60:
         parser.error("--timeout must be between 1 and 60 seconds")
@@ -152,6 +153,12 @@ def parse_arguments():
         parser.error("--refresh-registries requires --phase inventory")
     if arguments.surface_provider == "native" and arguments.phase != "surface":
         parser.error("--surface-provider native requires --phase surface")
+    if arguments.cmake:
+        if arguments.phase != "mcp-contracts":
+            parser.error("--cmake requires --phase mcp-contracts")
+        arguments.cmake = arguments.cmake.expanduser().resolve()
+        if not arguments.cmake.is_file():
+            parser.error("--cmake must identify an existing executable file")
     return arguments
 
 
@@ -226,7 +233,7 @@ def main():
         catalogs = []
         for architecture in architectures:
             try:
-                binary = build_contract_fixture(run_root, architecture)
+                binary = build_contract_fixture(run_root, architecture, arguments.cmake)
                 checks, catalog = run_contract_checks(binary, run_root / architecture, architecture, arguments.case, arguments.timeout)
                 results.extend(checks)
                 catalogs.append(catalog)

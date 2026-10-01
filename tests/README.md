@@ -28,9 +28,12 @@ python tests/run_tests.py --phase surface
 python tests/run_tests.py --phase surface --surface-provider native --arch all
 python tests/run_tests.py --phase defects
 python tests/run_tests.py --phase mcp-contracts --arch all
+python tests/run_tests.py --phase mcp-contracts --arch all --cmake C:/tools/cmake/bin/cmake.exe
 ```
 
 The `mcp-contracts` phase uses the test-only dependency in `tests/requirements.txt`. Install it in the Python environment used for the suite. Its native fixture is declared in the real cmkr input and kept out of default executable builds. New CMake directories fetch HTTP, JSON, SQLite and JavaScript sources by fixed URL and SHA-256; dependency metadata and licenses are retained in the build receipt. `X64DBG_BUILD_MCP=OFF` disables these new development targets for existing debugger-only builds.
+
+`--cmake` selects an existing CMake executable for this phase; other phases reject it. Without the option, the suite resolves CMake in the configured compiler environment. Every build records the selected CMake version and executable hash, the exact MSVC executable hash and the configure/build commands, including failed build attempts. Explicit forward-slash MSVC paths prevent another installed compiler from being selected. Automatic cmkr generation is disabled during verification so the recorded generated source remains fixed; regenerate CMakeLists.txt from cmake.toml before running the suite after a build-definition change. CMake handles manifest embedding while each executable retains an explicit `asInvoker` UAC setting. Actual build and runtime checks establish support for a selected toolchain; an executable selection does not establish a minimum compiler or older OS claim.
 
 The common contract registry describes twenty-six shared data contracts. It validates precise decimal/hex strings, explicit target/paused/mutation identities, exclusive address/file forms, library revisions, bounded pages/deadlines, expected byte ranges, native process identities, IPC envelopes and structured errors/evidence/timings. Pointer-width range checks run after address resolution. Thread-sensitive operations still require their own thread precondition, and identity/grant/lease checks belong to the real owner executor; a syntactically valid context alone authorizes no effect.
 

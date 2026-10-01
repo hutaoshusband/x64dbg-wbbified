@@ -1280,7 +1280,6 @@ if(X64DBG_BUILD_MCP) # mcp
 
 	if(MSVC) # msvc
 		target_link_options(mcp_broker PRIVATE
-			"/MANIFEST:EMBED"
 			"/MANIFESTUAC:level='asInvoker' uiAccess='false'"
 		)
 	endif()
@@ -1324,7 +1323,6 @@ if(X64DBG_BUILD_MCP) # mcp
 
 	if(MSVC) # msvc
 		target_link_options(mcp_connect PRIVATE
-			"/MANIFEST:EMBED"
 			"/MANIFESTUAC:level='asInvoker' uiAccess='false'"
 		)
 	endif()
@@ -1406,7 +1404,6 @@ if(X64DBG_BUILD_MCP) # mcp
 
 	if(MSVC) # msvc
 		target_link_options(mcp_contract_fixture PRIVATE
-			"/MANIFEST:EMBED"
 			"/MANIFESTUAC:level='asInvoker' uiAccess='false'"
 		)
 	endif()
@@ -1446,7 +1443,6 @@ if(X64DBG_BUILD_MCP) # mcp
 
 	if(MSVC) # msvc
 		target_link_options(mcp_launch_reference PRIVATE
-			"/MANIFEST:EMBED"
 			"/MANIFESTUAC:level='asInvoker' uiAccess='false'"
 		)
 	endif()

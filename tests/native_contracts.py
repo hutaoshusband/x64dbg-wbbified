@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import struct
 import subprocess
 import time
@@ -52,21 +53,36 @@ JOB_EVENT_ARTIFACT_TOOLS = ("jobs_list", "job_get", "job_wait", "job_cancel", "o
 JOB_NATIVE_EFFECT_TOOLS = ("job_cancel",)
 
 
-def build_contract_fixture(output, architecture):
+def build_contract_fixture(output, architecture, cmake=None):
     build = Path(output) / f"build-{architecture}"
     build.mkdir()
     source = ROOT / "x64dbg"
     environment = compiler_environment(architecture)
+    executable_path = next(value for key, value in environment.items() if key.lower() == "path")
+    cmake_path = shutil.which(str(cmake) if cmake else "cmake", path=executable_path)
+    compiler_path = shutil.which("cl.exe", path=executable_path)
+    if not cmake_path or not compiler_path:
+        raise McpError("Contract builds require resolved CMake and MSVC executables")
+    cmake_path = Path(cmake_path).resolve()
+    compiler_path = Path(compiler_path).resolve()
+    version = subprocess.run([str(cmake_path), "--version"], env=environment, capture_output=True, text=True, timeout=10,
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+    toolchain = {"cmake": file_identity(cmake_path), "compiler": file_identity(compiler_path),
+                 "cmakeVersion": version.stdout.strip(), "versionExitCode": version.returncode, "versionStderr": version.stderr}
+    write_json(build / "toolchain.json", toolchain)
+    if version.returncode or not version.stdout.startswith("cmake version "):
+        raise McpError("Selected CMake executable did not report a successful version")
     qt = source / ("build64" if architecture == "x64" else "build32") / "_deps/qt5-src/lib/cmake/Qt5"
-    configure = ["cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
-                 "-DX64DBG_BUILD_IN_TREE=OFF", "-DX64DBG_BUILD_MCP=ON", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
+    configure = [str(cmake_path), "-S", str(source), "-B", str(build), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+                 "-DX64DBG_BUILD_IN_TREE=OFF", "-DX64DBG_BUILD_MCP=ON", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "-DCMKR_SKIP_GENERATION=ON",
+                 f"-DCMAKE_C_COMPILER={compiler_path.as_posix()}", f"-DCMAKE_CXX_COMPILER={compiler_path.as_posix()}"]
     if qt.is_dir():
         configure.append(f"-DQt5_DIR={qt}")
     commands = []
     source_paths = [source / "cmake.toml", source / "CMakeLists.txt", *sorted((source / "src/mcp").rglob("*")), *sorted((source / "src/dbg/mcp").rglob("*"))]
     source_inputs = [file_identity(path) for path in source_paths if path.is_file()]
     with (build / "build.log").open("w", encoding="utf-8") as log:
-        for command in (configure, ["cmake", "--build", str(build), "--target", "mcp_contract_fixture", "mcp_launch_reference", "mcp_broker", "mcp_connect", "mcp_worker", "--parallel", "6"]):
+        for command in (configure, [str(cmake_path), "--build", str(build), "--target", "mcp_contract_fixture", "mcp_launch_reference", "mcp_broker", "mcp_connect", "mcp_worker", "--parallel", "6"]):
             print(f"Building MCP contracts {architecture}: {command[1]}", flush=True)
             process = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
             log.flush()
@@ -83,7 +99,7 @@ def build_contract_fixture(output, architecture):
         assert struct.unpack_from("<H", image, pe_offset + 4)[0] == (0x8664 if architecture == "x64" else 0x14c)
     manifest = {"architecture": architecture, "sourceHead": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                 "sourceStatus": subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True),
-                "sourceInputs": source_inputs, "commands": commands, "binary": file_identity(binary),
+                "sourceInputs": source_inputs, "commands": commands, "toolchain": toolchain, "binary": file_identity(binary),
                 "launchReference": file_identity(build / "wininspect-mcp-launch-reference.exe"),
                 "nativeComponents": [file_identity(path) for path in components],
                 "buildInputs": file_identity(build / "CMakeCache.txt"),
@@ -92,6 +108,8 @@ def build_contract_fixture(output, architecture):
                 "notices": [file_identity(path) for path in sorted((build / "mcp-notices").glob("*.txt"))]}
     for input_file in source_inputs:
         assert file_identity(input_file["path"])["sha256"] == input_file["sha256"], "Build source changed during compilation"
+    for key in ("cmake", "compiler"):
+        assert file_identity(toolchain[key]["path"]) == toolchain[key], "Build tool changed during compilation"
     write_json(build / "build-manifest.json", manifest)
     return binary
 

@@ -304,7 +304,7 @@ condition = "mcp"
 sources = ["src/mcp/broker/*.cpp"]
 link-libraries = ["::mcp_common"]
 compile-features = ["cxx_std_17"]
-msvc.link-options = ["/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
+msvc.link-options = ["/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
 
 [target.mcp_broker.properties]
 OUTPUT_NAME = "wininspect-mcp"
@@ -316,7 +316,7 @@ condition = "mcp"
 sources = ["src/mcp/connect/*.cpp"]
 link-libraries = ["::mcp_common"]
 compile-features = ["cxx_std_17"]
-msvc.link-options = ["/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
+msvc.link-options = ["/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
 
 [target.mcp_connect.properties]
 OUTPUT_NAME = "wininspect-mcp-connect"
@@ -336,7 +336,7 @@ condition = "mcp"
 sources = ["src/mcp/testing/contracts.cpp"]
 link-libraries = ["::mcp_common", "::mcp_worker", "mcp_http", "mcp_sqlite", "mcp_quickjs"]
 compile-features = ["cxx_std_17"]
-msvc.link-options = ["/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
+msvc.link-options = ["/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
 
 [target.mcp_contract_fixture.properties]
 OUTPUT_NAME = "wininspect-mcp-contract-fixture"
@@ -348,7 +348,7 @@ condition = "mcp"
 sources = ["src/mcp/testing/launch_reference.cpp"]
 link-libraries = ["mcp_json"]
 compile-features = ["cxx_std_17"]
-msvc.link-options = ["/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
+msvc.link-options = ["/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
 
 [target.mcp_launch_reference.properties]
 OUTPUT_NAME = "wininspect-mcp-launch-reference"
