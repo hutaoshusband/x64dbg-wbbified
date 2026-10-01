@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 from datetime import datetime, timezone
 import fnmatch
 import os
@@ -122,6 +123,42 @@ def run_native_execution_oracles(environment, results):
         "binary": binary_identity, "machine": machine, "receipt": receipt, "expected": expected,
         "observed": observed, "debuggerUsed": False}})
     print(f"[VERIFIED] Normal native {environment.architecture} nested execution canary", flush=True)
+
+
+def run_native_register_oracles(environment, results):
+    binary, binary_identity, machine = native_fixture_identity(environment, "issue3803")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = kernel.GetEnabledXStateFeatures
+    query.argtypes = []
+    query.restype = ctypes.c_ulonglong
+    enabled_features = query()
+    register_count = 16 if environment.architecture == "x64" else 8
+    prefix = 0x1020304000000000 if environment.architecture == "x64" else 0
+    observations = []
+    for sse_only in (False, True):
+        child_environment = {**os.environ, "WININSPECT_TEST_NORMAL": "1", "WININSPECT_TEST_REGISTER_SSE": "1" if sse_only else "0"}
+        receipt = run_owned_native_command([str(binary)], child_environment, 15)
+        write_json(environment.root / f"register-context-normal-{'sse' if sse_only else 'available'}.json", receipt)
+        assert receipt["exitCode"] == 69 and not receipt["timedOut"], "Normal register target failed"
+        lines = receipt["stdout"].splitlines()
+        assert len(lines) == 6 + register_count * 3 and all(line.count("=") == 1 for line in lines), "Register summary fields are malformed"
+        observed = dict(line.split("=", 1) for line in lines)
+        stack = int(observed["stack"], 16)
+        assert stack != 0 and stack & 15 == 0 and stack < (1 << (64 if environment.architecture == "x64" else 32)), "Register probe stack is invalid"
+        avx_available = not sse_only and enabled_features & 6 == 6
+        expected = {"phase": "3", "avxAvailable": "1" if avx_available else "0", "flags": "45", "mxcsr": "1f80",
+                    "stack": f"{stack:x}", "verified": "1"}
+        for index in range(register_count):
+            expected[f"gpr{index}"] = f"{stack if index == 7 else prefix + 0x11223300 + index:x}"
+            expected[f"xmm{index}"] = bytes(((index * 32 + lane) ^ 0x5A) & 255 for lane in range(16)).hex()
+            expected[f"ymm{index}"] = bytes(((index * 32 + lane) ^ 0x5A) & 255 for lane in range(32)).hex() if avx_available else bytes(32).hex()
+        assert observed == expected, f"Normal executed register values differ: {observed}"
+        assert file_identity(binary) == binary_identity
+        observations.append({"sseOnly": sse_only, "receipt": receipt, "observed": observed, "expected": expected})
+    results.append({"name": "test_native_register_oracles", "status": "verified", "oracle": {
+        "binary": binary_identity, "machine": machine, "enabledXStateFeatures": enabled_features,
+        "observations": observations, "debuggerUsed": False}})
+    print(f"[VERIFIED] Two normal native {environment.architecture} register context references", flush=True)
 
 
 def run_fixture_oracles(environment, results):
@@ -353,6 +390,7 @@ def run_native_suite(arguments, run_root):
     results = []
     environment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     environment.pop("WININSPECT_TEST_NORMAL", None)
+    environment.pop("WININSPECT_TEST_REGISTER_SSE", None)
     for architecture in architectures:
         for engine in engines:
             command = [sys.executable, str(ROOT / "x64dbg" / "src" / "tests" / "run.py"),
@@ -387,7 +425,7 @@ def main():
         names = ["test_native_runtime_surface_inventory"]
     if arguments.phase == "fixtures":
         names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles", "test_native_memory_oracles",
-                 "test_native_database_oracles", "test_native_stale_breakpoint_oracles", "test_native_execution_oracles"]
+                 "test_native_database_oracles", "test_native_stale_breakpoint_oracles", "test_native_execution_oracles", "test_native_register_oracles"]
     if arguments.phase == "runner":
         names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
@@ -477,6 +515,8 @@ def main():
                     run_native_stale_breakpoint_oracles(environment, architecture_results)
                 if "test_native_execution_oracles" in selected_names:
                     run_native_execution_oracles(environment, architecture_results)
+                if "test_native_register_oracles" in selected_names:
+                    run_native_register_oracles(environment, architecture_results)
                 if "test_native_database_oracles" in selected_names:
                     from database_checks import run_database_oracles
                     run_database_oracles(environment, architecture_results, arguments.engine, arguments.timeout,

@@ -49,7 +49,7 @@ if (CMAKE_GENERATOR MATCHES "Visual Studio")
     # target instead https://cmake.org/cmake/help/latest/command/target_compile_options.html
 
     # Enable multiprocessor compilation
-    add_compile_options(/MP)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/MP>)
 endif()
 
 if(MSVC)
@@ -62,7 +62,7 @@ if(MSVC)
         $<$<CONFIG:Release,MinSizeRel,RelWithDebInfo>:/OPT:ICF>
     )
     # Enable big objects (unity build)
-    add_compile_options(/bigobj)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/bigobj>)
 endif()
 
 # Make the project look nicer in IDEs

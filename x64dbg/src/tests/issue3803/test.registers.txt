@@ -1,0 +1,66 @@
+settingset Engine, HideDebugger, 0
+settingset Events, TlsCallbacks, 0
+settingset Events, SystemBreakpoint, 1
+settingset Events, EntryBreakpoint, 1
+mov register_mode, 1
+mov register_sse, 0
+call run_register_mode
+mov register_mode, 2
+call run_register_mode
+mov register_mode, 1
+mov register_sse, 1
+call run_register_mode
+mov register_mode, 2
+call run_register_mode
+testfinalize
+ret
+
+run_register_mode:
+init tests/issue3803.exe
+mov startup_stops, 0
+await_entry:
+cmp cip, issue3803:entry
+je entry_ready
+inc startup_stops
+testassert startup_stops <= .64, "register target entry stop limit"
+run
+jmp await_entry
+entry_ready:
+testassert cip == issue3803:entry, "register target stopped at the actual entry"
+mov dword:[issue3803:gRegisterMode], register_mode
+testassert dword:[issue3803:gRegisterMode] == register_mode, "register mode write readback"
+mov dword:[issue3803:gRegisterForceSse], register_sse
+testassert dword:[issue3803:gRegisterForceSse] == register_sse, "SIMD mode write readback"
+bp issue3803:RegisterStop
+bp issue3803:RegisterFinish
+run
+testassert cip == issue3803:RegisterStop, "known values reached the real probe stop"
+cmp register_sse, 0
+je check_context
+testassert dword:[issue3803:gRegisterAvxAvailable] == 0, "SSE-only mode does not execute AVX instructions"
+check_context:
+registercheck baseline
+cmp register_mode, 2
+jne continue_probe
+registermutate
+continue_probe:
+run
+testassert cip == issue3803:RegisterFinish, "register instructions reached the real finish"
+bpd issue3803:RegisterFinish
+rtr
+cmp register_mode, 2
+je stored_mutated
+registercheck stored-baseline
+jmp leave_finish
+stored_mutated:
+registercheck stored-mutated
+leave_finish:
+sti
+run
+cmp register_mode, 2
+je exited_mutated
+registerexit 69
+ret
+exited_mutated:
+registerexit 70
+ret

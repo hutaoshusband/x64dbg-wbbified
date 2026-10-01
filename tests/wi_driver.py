@@ -285,7 +285,7 @@ def build_debugger(output, architecture):
     artifacts = source / "bin" / architecture
     inputs = subprocess.check_output(["git", "ls-files", "x64dbg"], cwd=ROOT, text=True).splitlines()
     manifest = {"architecture": architecture, "sourceHead": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-                "sourceInputs": [file_identity(ROOT / path) for path in inputs if Path(path).suffix in (".cpp", ".c", ".h", ".toml", ".cmake", ".txt", ".rc", ".xml")],
+                "sourceInputs": [file_identity(ROOT / path) for path in inputs if Path(path).suffix in (".cpp", ".c", ".h", ".asm", ".toml", ".cmake", ".txt", ".rc", ".xml")],
                 "buildInputs": file_identity(build / "CMakeCache.txt"), "commands": results,
                 "artifacts": [file_identity(path) for path in sorted(artifacts.rglob("*"))
                               if path.is_file() and path.suffix.lower() in (".exe", ".dll", ".dp64", ".dp32")]}
