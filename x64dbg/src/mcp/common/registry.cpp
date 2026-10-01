@@ -19,6 +19,7 @@ Json descriptor_schema()
         {"outputSchema", schema_document}, {"effects", bounded_array_schema(enum_schema({"inspect", "execute", "modify", "file_export", "file_replace", "elevate", "configure"}), 7, 1, true)},
         {"effectConditions", bounded_array_schema(closed_object_schema({{"field", id}, {"equals", string_schema("utf8-text", 128)},
             {"effects", bounded_array_schema(enum_schema({"inspect", "execute", "modify", "file_export", "file_replace", "elevate", "configure"}), 7, 1, true)}}, {"field", "equals", "effects"}), 16)},
+        {"effectResolution", {{"const", "native_classifier"}}},
         {"executor", enum_schema({"broker", "engine", "gui", "script_host"})}, {"stateRequirement", enum_schema({"broker", "instance_ready", "target_present", "target_paused"})},
         {"architectureRequirement", enum_schema({"any", "x32", "x64"})}, {"completionPredicate", string_schema("utf8-text", 4096)},
         {"recovery", bounded_array_schema(id, 16)}, {"acceptanceIds", bounded_array_schema(id, 66, 1, true)},
@@ -186,7 +187,7 @@ Json page_output(Json item)
 ToolDefinition define_tool(std::string name, std::string description, std::string domain, Json input, Json data,
     std::vector<Effect> effects, Executor executor, StateRequirement state, ArchitectureRequirement architecture,
     std::string completion, std::vector<std::string> recovery, std::vector<std::string> acceptanceIds,
-    std::string nativeSource, bool idempotent, bool openWorld, RegistryHandler handler, std::vector<EffectCondition> effectConditions)
+    std::string nativeSource, bool idempotent, bool openWorld, RegistryHandler handler, std::vector<EffectCondition> effectConditions, bool nativeClassifiedEffects)
 {
     input = with_contract_definitions(std::move(input));
     input["$schema"] = "https://json-schema.org/draft/2020-12/schema";
@@ -195,7 +196,7 @@ ToolDefinition define_tool(std::string name, std::string description, std::strin
     output["$id"] = "urn:wininspect:mcp:tool:v1:" + name + ":output";
     return {std::move(name), std::move(description), std::move(domain), "wininspect.native", std::move(input), std::move(output),
         std::move(effects), executor, state, architecture, std::move(completion), std::move(recovery), std::move(acceptanceIds),
-        std::move(nativeSource), idempotent, openWorld, handler, std::move(effectConditions)};
+        std::move(nativeSource), idempotent, openWorld, handler, std::move(effectConditions), nativeClassifiedEffects};
 }
 
 const std::vector<ToolDefinition>& tool_registry()
@@ -277,6 +278,7 @@ const std::vector<ToolDefinition>& tool_registry()
         append_assembly_file_tools(tools);
         append_module_analysis_tools(tools);
         append_database_settings_tools(tools);
+        append_provider_ui_tools(tools);
         std::sort(tools.begin(), tools.end(), [](const ToolDefinition& left, const ToolDefinition& right) { return left.name < right.name; });
         return tools;
     }();
@@ -314,13 +316,16 @@ Json tool_descriptor(const ToolDefinition& tool)
     {
         return effect == Effect::Modify || effect == Effect::FileReplace || effect == Effect::Execute;
     });
-    return {{"capabilityId", tool.name}, {"name", tool.name}, {"description", tool.description}, {"domain", tool.domain}, {"provider", tool.provider},
+    Json descriptor = {{"capabilityId", tool.name}, {"name", tool.name}, {"description", tool.description}, {"domain", tool.domain}, {"provider", tool.provider},
         {"schemaVersion", ContractVersion}, {"inputSchema", tool.inputSchema}, {"outputSchema", tool.outputSchema}, {"effects", effect_names}, {"effectConditions", conditions},
         {"executor", executors[static_cast<std::size_t>(tool.executor)]}, {"stateRequirement", states[static_cast<std::size_t>(tool.state)]},
         {"architectureRequirement", architectures[static_cast<std::size_t>(tool.architecture)]}, {"completionPredicate", tool.completion},
         {"recovery", tool.recovery}, {"acceptanceIds", tool.acceptanceIds}, {"nativeSource", tool.nativeSource},
         {"availability", tool.handler ? "implemented" : "planned"}, {"operational", false},
         {"annotations", {{"readOnlyHint", tool.effects == std::vector<Effect>{Effect::Inspect} && tool.effectConditions.empty()}, {"destructiveHint", destructive}, {"idempotentHint", tool.idempotent}, {"openWorldHint", tool.openWorld}}}};
+    if(tool.nativeClassifiedEffects)
+        descriptor["effectResolution"] = "native_classifier";
+    return descriptor;
 }
 
 Checked<std::vector<Effect>> required_tool_effects(std::string_view name, const Json& input)
@@ -328,6 +333,8 @@ Checked<std::vector<Effect>> required_tool_effects(std::string_view name, const 
     if(auto error = validate_tool_input(name, input))
         return *error;
     const auto* tool = find_tool(name);
+    if(tool->nativeClassifiedEffects)
+        return ContractError{"unsupported_capability", "", "Effective permissions require the resolved native provider/action classifier"};
     auto effects = tool->effects;
     for(const auto& condition : tool->effectConditions)
         if(input.contains(condition.field) && input.at(condition.field) == condition.equals)
@@ -364,7 +371,7 @@ Checked<Json> call_registry_tool(std::string_view name, const Json& input, const
         return *error;
     if(!tool->handler)
         return ContractError{"unsupported_capability", "", "Declared capability has no implemented native handler"};
-    if(tool->effects != std::vector<Effect>{Effect::Inspect} || !tool->effectConditions.empty() || tool->executor != Executor::Broker || tool->state != StateRequirement::Broker)
+    if(tool->nativeClassifiedEffects || tool->effects != std::vector<Effect>{Effect::Inspect} || !tool->effectConditions.empty() || tool->executor != Executor::Broker || tool->state != StateRequirement::Broker)
         return ContractError{"unsupported_capability", "", "Registry metadata dispatch only executes broker inspection handlers"};
     const auto started = std::chrono::steady_clock::now();
     const auto utc = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();

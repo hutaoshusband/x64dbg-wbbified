@@ -43,13 +43,14 @@ struct ToolDefinition
     bool openWorld;
     RegistryHandler handler;
     std::vector<EffectCondition> effectConditions;
+    bool nativeClassifiedEffects;
 };
 
 ToolDefinition define_tool(std::string name, std::string description, std::string domain, Json input, Json data,
     std::vector<Effect> effects, Executor executor, StateRequirement state, ArchitectureRequirement architecture,
     std::string completion, std::vector<std::string> recovery, std::vector<std::string> acceptanceIds,
     std::string nativeSource, bool idempotent, bool openWorld, RegistryHandler handler = nullptr,
-    std::vector<EffectCondition> effectConditions = {});
+    std::vector<EffectCondition> effectConditions = {}, bool nativeClassifiedEffects = false);
 void append_lifecycle_tools(std::vector<ToolDefinition>& tools);
 void append_execution_tools(std::vector<ToolDefinition>& tools);
 void append_inspection_tools(std::vector<ToolDefinition>& tools);
@@ -58,6 +59,7 @@ void append_breakpoint_trace_tools(std::vector<ToolDefinition>& tools);
 void append_assembly_file_tools(std::vector<ToolDefinition>& tools);
 void append_module_analysis_tools(std::vector<ToolDefinition>& tools);
 void append_database_settings_tools(std::vector<ToolDefinition>& tools);
+void append_provider_ui_tools(std::vector<ToolDefinition>& tools);
 Checked<std::vector<Effect>> required_tool_effects(std::string_view name, const Json& input);
 
 const std::vector<ToolDefinition>& tool_registry();

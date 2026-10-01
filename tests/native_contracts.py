@@ -20,7 +20,7 @@ CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_
               "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
-              "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
+              "test_provider_ui_contracts", "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
 
 EXECUTION_TOOLS = ("execution_resume", "execution_pause", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to",
                    "execution_skip_instruction", "execution_wait", "threads_list", "threads_select", "threads_suspend", "threads_resume", "threads_context",
@@ -39,6 +39,10 @@ MODULE_ANALYSIS_TOOLS = ("modules_list", "modules_sections", "modules_imports", 
                          "analysis_loops", "analysis_encoding_get", "analysis_encoding_set", "analysis_function_set", "analysis_argument_set", "analysis_range_delete")
 DATABASE_SETTINGS_TOOLS = ("annotations_list", "annotations_set", "annotations_delete", "annotations_import", "annotations_export", "database_save", "database_load",
                            "database_clear", "database_info", "settings_list", "settings_apply", "favorites_list", "favorites_set")
+PROVIDER_UI_TOOLS = ("commands_list", "commands_describe", "commands_execute", "plugins_list", "plugins_actions", "plugins_invoke", "plugins_load", "plugins_unload",
+                     "ui_actions_list", "ui_action_invoke", "ui_views_list", "ui_view_read", "ui_view_navigate", "ui_view_configure", "ui_dialogs_list", "ui_dialog_read",
+                     "ui_dialog_update", "ui_dialog_submit", "ui_clipboard_export", "ui_capture")
+NATIVE_EFFECT_TOOLS = ("commands_execute", "plugins_invoke", "plugins_load", "plugins_unload", "ui_action_invoke", "ui_view_configure", "ui_dialog_update", "ui_dialog_submit")
 
 
 def build_contract_fixture(output, architecture):
@@ -293,13 +297,14 @@ def registry_validators(registry, formats):
     validators = {}
     expected = {"server_info", "server_health", "capabilities_list", "capabilities_describe", "capabilities_search", "client_context_get", "client_context_set", "control_acquire", "control_renew", "control_release"}
     expected.update({"debugger_instances", "debugger_start", "debugger_focus", "debugger_close", "debugger_settings_get", "debugger_settings_set", "processes_list", "target_open", "target_attach", "target_state", "target_snapshot", "target_stop", "target_detach", "target_restart", "target_command_line_get", "target_command_line_set"})
-    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS + BREAKPOINT_TRACE_TOOLS + ASSEMBLY_FILE_TOOLS + MODULE_ANALYSIS_TOOLS + DATABASE_SETTINGS_TOOLS)
+    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS + BREAKPOINT_TRACE_TOOLS + ASSEMBLY_FILE_TOOLS + MODULE_ANALYSIS_TOOLS + DATABASE_SETTINGS_TOOLS + PROVIDER_UI_TOOLS)
     assert registry["operationalTools"] == [] and {tool["name"] for tool in registry["tools"]} == expected
     assert [tool["name"] for tool in registry["tools"]] == sorted(expected)
     for tool in registry["tools"]:
         assert tool["schemaVersion"] == 1 and tool["operational"] is False
         assert tool["completionPredicate"] and tool["nativeSource"] and tool["recovery"] and tool["acceptanceIds"]
         assert tool["annotations"]["readOnlyHint"] == (tool["effects"] == ["inspect"] and not tool["effectConditions"])
+        assert tool.get("effectResolution") == ("native_classifier" if tool["name"] in NATIVE_EFFECT_TOOLS else None)
         assert tool["executor"] in ("broker", "engine", "gui")
         assert tool["architectureRequirement"] == {"seh_chain": "x32", "unwind_info": "x64"}.get(tool["name"], "any")
         for direction in ("input", "output"):
@@ -486,7 +491,7 @@ def tool_context_examples():
 
 
 def check_tool_family(probe, registry, validators, names, inputs, outputs, extra_inputs=(), extra_outputs=(), expected_effects=None,
-                      required_fields=None, executors=None, conditions=None):
+                      required_fields=None, executors=None, conditions=None, native_effect_tools=(), computed_effects=None):
     assert set(names) == set(inputs) == set(outputs)
     definitions = {tool["name"]: tool for tool in registry["tools"]}
     input_cases = []
@@ -516,7 +521,11 @@ def check_tool_family(probe, registry, validators, names, inputs, outputs, extra
         rejected = probe.call("call", value, name)
         assert not rejected["valid"] and rejected["error"]["code"] == "unsupported_capability", rejected
         effects = probe.call("effects", value, name)
-        assert effects["valid"] and effects["effects"] == expected_effects[name]
+        if name in native_effect_tools:
+            assert not effects["valid"] and effects["error"]["code"] == "unsupported_capability", effects
+            assert definition["effectResolution"] == "native_classifier"
+        else:
+            assert effects["valid"] and effects["effects"] == (computed_effects or {}).get(name, expected_effects[name])
         assert definition["effects"] == expected_effects[name]
     return {"declaredTools": len(names), "independentInputComparisons": len(input_cases), "independentOutputComparisons": len(output_cases),
             "plannedHandlersRejected": len(names), "exactEffectDeclarations": len(names)}
@@ -1194,6 +1203,124 @@ def check_database_settings_contracts(probe, registry, validators):
     return result
 
 
+def check_provider_ui_contracts(probe, registry, validators):
+    context = tool_context_examples()
+    instance = {"instanceId": "instance-1"}
+    ui_context = {"viewId": "view-1", "target": context.paused, "selection": ["row-1"], "sourceVersion": "9007199254740993"}
+    integer = {"kind": "integer", "bitsHex": "0xffffffffffffffff", "widthBits": 64, "signed": True}
+    value = {"kind": "object", "members": [{"name": "exact", "value": integer}, {"name": "choices", "value": {"kind": "array", "items": [{"kind": "boolean", "value": False}]}}]}
+    action = {"actionId": "action-1", "providerId": "provider-1", "providerBuildId": "0" * 64, "name": "controlled action", "kind": "menu", "aliases": [], "syntax": "",
+              "argumentsSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "resultSchema": None, "contextRequirement": "paused",
+              "executor": "gui", "effects": ["configure"], "classification": "known", "leaseRequired": False, "privilege": "user", "enabled": True,
+              "disabledReason": None, "completionPredicate": "Observed native state", "recovery": ["ui_view_read"]}
+    command = {**action, "kind": "command", "executor": "engine", "commandId": "command-1", "category": "inspection", "aliases": ["controlled", "Hu Tao ❤"], "syntax": "controlled [address]"}
+    unverified = {"status": "unverified", "evidence": [], "followUp": {"capabilityId": "operation_reconcile", "retry": "after_reconciliation", "reason": "Native postcondition unknown"}}
+    outcome = {"actionId": "action-1", "providerId": "provider-1", "providerBuildId": "0" * 64, "operationId": "operation-1", "jobId": "job-1", "dialogId": "dialog-1",
+               "state": "pending_input", "result": value, "effects": [], "verification": unverified, "complete": False}
+    plugin = {"pluginId": "plugin-1", "providerBuildId": "0" * 64, "name": "controlled", "image": {"path": "C:\\controlled.dp64"}, "sha256": "0" * 64, "architecture": "x64",
+              "version": None, "sdkVersion": 1, "loaded": True, "available": True, "trustedCodeRequired": True, "actionsCount": "9007199254740993", "missingRoutes": [], "limitations": []}
+    view = {**instance, "viewId": "view-1", "providerId": "provider-1", "name": "controlled view", "kind": "tree", "visible": True, "enabled": True, "disabledReason": None,
+            "version": "9007199254740993", "target": context.target, "querySchema": {"type": "object"}, "configurationSchema": None, "actions": {"items": [action], "page": context.page}, "complete": True}
+    field = {"fieldId": "field-1", "name": "Value", "controlKind": "line_edit", "value": integer, "valueSchema": {"type": "object"}, "enabled": True, "visible": True,
+             "writable": True, "validation": []}
+    dialog = {**instance, "dialogId": "dialog-1", "operationId": "operation-1", "ownerClientId": "client-1", "providerId": "provider-1", "version": "9007199254740993",
+              "state": "open", "interaction": "native_fields", "title": "Controlled dialog", "fields": {"items": [field], "page": context.page}, "actions": [action], "validation": [], "complete": True}
+    inputs = {"commands_list": instance, "commands_describe": {**instance, "commandId": "command-1"}, "commands_execute": {**context.mutation, "command": "controlled 0xffffffffffffffff", "timeoutMs": 60000},
+              "plugins_list": instance, "plugins_actions": {**instance, "pluginId": "plugin-1"}, "plugins_invoke": {**context.mutation, "pluginId": "plugin-1", "actionId": "action-1", "arguments": {"addressHex": "0x1000"}},
+              "plugins_load": {**instance, "path": "C:\\controlled.dp64", "expectedSha256": "0" * 64}, "plugins_unload": {**instance, "pluginId": "plugin-1", "expectedBuildId": "0" * 64},
+              "ui_actions_list": {**instance, "context": ui_context}, "ui_action_invoke": {**instance, "actionId": "action-1", "context": ui_context, "arguments": {"value": integer}, "expectedUiVersion": "9007199254740993", "leaseId": "lease-1"},
+              "ui_views_list": instance, "ui_view_read": {**instance, "viewId": "view-1", "query": {"afterRow": "row-0"}},
+              "ui_view_navigate": {**instance, "viewId": "view-1", "location": {"rowId": "row-1"}, "context": ui_context},
+              "ui_view_configure": {**instance, "viewId": "view-1", "changes": {"filter": "value"}, "expectedVersion": "9007199254740993"},
+              "ui_dialogs_list": instance, "ui_dialog_read": {**instance, "dialogId": "dialog-1"},
+              "ui_dialog_update": {**instance, "dialogId": "dialog-1", "values": [{"fieldId": "field-1", "value": integer}], "expectedVersion": "9007199254740993"},
+              "ui_dialog_submit": {**instance, "dialogId": "dialog-1", "action": "accept", "expectedVersion": "9007199254740993"},
+              "ui_clipboard_export": {**instance, "source": ui_context, "format": "text", "destination": "artifact", "namespaceId": "private-1"},
+              "ui_capture": {**instance, "viewId": "view-1", "namespaceId": "private-1"}}
+    cell = {"columnId": "column-1", "value": value, "displayText": "controlled", "status": "valid", "error": None}
+    row = {"rowId": "row-1", "parentRowId": None, "path": ["row-1"], "cells": [cell], "childIds": [], "childPage": None}
+    outputs = {"commands_list": {"items": [command], "page": context.page}, "commands_describe": command,
+               "commands_execute": {"commandId": "command-1", "callbackResult": None, "queued": True, "output": "", "outputTruncated": False, "eventCursor": None, "action": outcome},
+               "plugins_list": {"items": [plugin], "page": context.page}, "plugins_actions": {"items": [action], "page": context.page}, "plugins_invoke": outcome,
+               "plugins_load": plugin, "plugins_unload": {**plugin, "loaded": False}, "ui_actions_list": {"items": [action], "page": context.page}, "ui_action_invoke": outcome,
+               "ui_views_list": {"items": [view], "page": context.page}, "ui_view_read": {"view": view, "columns": [{"columnId": "column-1", "name": "Value", "valueSchema": None, "visible": True, "order": 0}],
+                   "rows": {"items": [row], "page": context.page}, "selection": ["row-1"], "value": None, "complete": True}, "ui_view_navigate": view, "ui_view_configure": view,
+               "ui_dialogs_list": {"items": [dialog], "page": context.page}, "ui_dialog_read": dialog, "ui_dialog_update": dialog, "ui_dialog_submit": outcome,
+               "ui_clipboard_export": {"destination": "artifact", "artifact": managed_artifact_example(), "clipboardSequence": None, "sourceVersion": "9007199254740993",
+                   "format": "text", "size": "9007199254740993", "sha256": "0" * 64, "complete": True},
+               "ui_capture": {"artifact": {**managed_artifact_example(), "mediaType": "image/png"}, "viewId": "view-1", "sourceVersion": "9007199254740993", "width": 1920, "height": 1080, "devicePixelRatio": "1.25", "complete": True}}
+    extra_inputs = [(True, "commands_execute", {**instance, "command": "controlled"}), (True, "commands_execute", {**context.target, "command": "controlled"}),
+                    (False, "commands_execute", {**inputs["commands_execute"], "targetGeneration": 9007199254740993}),
+                    (False, "commands_execute", {**inputs["commands_execute"], "timeoutMs": 60001}),
+                    (False, "commands_execute", {**inputs["commands_execute"], "command": ""}),
+                    (True, "plugins_invoke", {**instance, "pluginId": "plugin-1", "actionId": "action-1", "arguments": {"requestedEffects": ["elevate"]}}),
+                    (True, "plugins_load", {**instance, "artifactId": "artifact-1", "expectedSha256": "0" * 64}),
+                    (False, "plugins_load", {**inputs["plugins_load"], "artifactId": "artifact-1"}),
+                    (False, "plugins_load", {**inputs["plugins_load"], "expectedSha256": "0" * 63}),
+                    (False, "plugins_unload", {key: item for key, item in inputs["plugins_unload"].items() if key != "expectedBuildId"}),
+                    (False, "ui_action_invoke", {**inputs["ui_action_invoke"], "expectedUiVersion": 9007199254740993}),
+                    (False, "ui_action_invoke", {**inputs["ui_action_invoke"], "context": {**ui_context, "target": {**context.target, "stopEpoch": "1", "targetGeneration": 9007199254740993}}}),
+                    (False, "ui_view_navigate", {**inputs["ui_view_navigate"], "location": {"rowId": "row-1", "addressHex": "0x1000"}}),
+                    (True, "ui_view_navigate", {**inputs["ui_view_navigate"], "location": {"moduleId": "module-1", "rvaHex": "0x1000"}}),
+                    (True, "ui_view_navigate", {**inputs["ui_view_navigate"], "location": {"artifactId": "artifact-1", "offset": "18446744073709551615"}}),
+                    (False, "ui_dialog_update", {**inputs["ui_dialog_update"], "values": []}),
+                    (False, "ui_dialog_update", {**inputs["ui_dialog_update"], "expectedVersion": 9007199254740993}),
+                    (False, "ui_clipboard_export", {**inputs["ui_clipboard_export"], "destination": "external"}),
+                    (False, "ui_capture", {key: item for key, item in inputs["ui_capture"].items() if key != "namespaceId"})]
+    clipboard_request = {**instance, "source": ui_context, "format": "text", "destination": "clipboard", "expectedClipboardSequence": "4294967295"}
+    extra_inputs.extend([(True, "ui_clipboard_export", clipboard_request), (False, "ui_clipboard_export", {**clipboard_request, "namespaceId": "private-1"})])
+    for name in NATIVE_EFFECT_TOOLS:
+        extra_inputs.append((False, name, {**inputs[name], "effects": ["inspect"]}))
+    for name in ("ui_view_configure", "ui_dialog_update", "ui_dialog_submit"):
+        extra_inputs.append((False, name, {key: item for key, item in inputs[name].items() if key != "expectedVersion"}))
+    typed_values = [{"kind": "null"}, {"kind": "boolean", "value": True}, integer, {"kind": "text", "text": "Hu Tao ❤"}, {"kind": "bytes", "bytesHex": ""},
+                    {"kind": "bytes", "bytesHex": "0102"}, {"kind": "address", "addressHex": "0xffffffffffffffff"}, {"kind": "float", "widthBits": 32, "bytesHex": "00002842"},
+                    {"kind": "float", "widthBits": 64, "bytesHex": "0000000000004540"}, value]
+    for typed_value in typed_values:
+        extra_inputs.append((True, "ui_dialog_update", {**inputs["ui_dialog_update"], "values": [{"fieldId": "field-1", "value": typed_value}]}))
+    invalid_values = [{**integer, "bitsHex": 9007199254740993}, {**integer, "widthBits": 128}, {"kind": "float", "widthBits": 32, "bytesHex": "0000000000004540"},
+                      {"kind": "object", "members": [{"name": "bad", "value": {"kind": "integer", "bitsHex": "0x10000000000000000", "widthBits": 64, "signed": False}}]},
+                      {"kind": "bytes", "bytesHex": "0"}]
+    for typed_value in invalid_values:
+        extra_inputs.append((False, "ui_dialog_update", {**inputs["ui_dialog_update"], "values": [{"fieldId": "field-1", "value": typed_value}]}))
+    unknown_action = {**action, "classification": "unknown", "effects": [], "enabled": False, "disabledReason": "No native provider classification", "argumentsSchema": None, "completionPredicate": None}
+    consent = {**dialog, "state": "pending_consent", "interaction": "os_consent", "fields": {"items": [], "page": context.page}, "actions": []}
+    field_error = {"fieldId": "field-1", "code": "invalid_value", "message": "Native field validation failed"}
+    extra_outputs = [(True, "ui_actions_list", {"items": [unknown_action], "page": context.page}), (True, "ui_dialog_read", consent),
+                     (True, "ui_dialog_update", {**dialog, "fields": {"items": [{**field, "validation": [field_error]}], "page": context.page}, "validation": [field_error]}),
+                     (True, "ui_view_read", {**outputs["ui_view_read"], "rows": {"items": [{**row, "cells": [{**cell, "value": None, "status": "unreadable"}]}], "page": context.page}, "complete": False}),
+                     (False, "plugins_list", {"items": [{**plugin, "actionsCount": 9007199254740993}], "page": context.page}),
+                     (False, "plugins_load", {**plugin, "trustedCodeRequired": False}),
+                     (False, "ui_actions_list", {"items": [{**action, "effects": ["inspect", "inspect"]}], "page": context.page}),
+                     (False, "ui_dialog_read", {**dialog, "version": 9007199254740993}),
+                     (False, "ui_dialog_read", {**dialog, "interaction": "agent_approved_uac"}),
+                     (False, "ui_clipboard_export", {**outputs["ui_clipboard_export"], "sha256": "0" * 63}),
+                     (False, "ui_capture", {**outputs["ui_capture"], "width": 0}),
+                     (False, "ui_capture", {**outputs["ui_capture"], "sourceVersion": "18446744073709551616"}),
+                     (True, "ui_dialog_submit", {**outcome, "state": "cancelled", "dialogId": None, "result": None})]
+    for typed_value in typed_values:
+        extra_outputs.append((True, "ui_view_read", {**outputs["ui_view_read"], "value": typed_value}))
+    for typed_value in invalid_values:
+        extra_outputs.append((False, "ui_view_read", {**outputs["ui_view_read"], "value": typed_value}))
+    potential_effects = ["inspect", "execute", "modify", "file_export", "file_replace", "elevate", "configure"]
+    effects = {name: ["inspect"] for name in PROVIDER_UI_TOOLS}
+    effects.update({name: potential_effects for name in NATIVE_EFFECT_TOOLS})
+    effects.update({"ui_view_navigate": ["configure"], "ui_capture": ["inspect", "file_export"]})
+    executors = {name: ("engine" if name.startswith(("commands_", "plugins_")) else "gui") for name in PROVIDER_UI_TOOLS}
+    conditions = {"ui_clipboard_export": [{"field": "destination", "equals": "artifact", "effects": ["file_export"]}, {"field": "destination", "equals": "clipboard", "effects": ["configure"]}]}
+    result = check_tool_family(probe, registry, validators, PROVIDER_UI_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects, executors=executors, conditions=conditions,
+                               native_effect_tools=NATIVE_EFFECT_TOOLS, computed_effects={"ui_clipboard_export": ["inspect", "file_export"]})
+    for request, expected in ((inputs["ui_clipboard_export"], ["inspect", "file_export"]), (clipboard_request, ["inspect", "configure"])):
+        assert probe.call("effects", request, "ui_clipboard_export") == {"valid": True, "effects": expected}
+    for name in NATIVE_EFFECT_TOOLS:
+        request = {**inputs[name], "arguments": {"requestedEffects": ["inspect"], "grantApproved": True}} if name in ("plugins_invoke", "ui_action_invoke") else inputs[name]
+        rejected = probe.call("effects", request, name)
+        assert not rejected["valid"] and rejected["error"]["code"] == "unsupported_capability", rejected
+    result.update(nativeClassificationRequired=list(NATIVE_EFFECT_TOOLS), recursiveTypedValues=len(typed_values), rejectedUnsafeTypedValues=len(invalid_values),
+                  clipboardDestinationEffects=2, explicitPendingOsConsent=True)
+    return result
+
+
 def check_native_launch(probe, architecture):
     import os
     import shutil
@@ -1502,6 +1629,8 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_module_analysis_contracts(probe, registry, tool_validators))
             elif name == "test_database_settings_contracts":
                 result.update(check_database_settings_contracts(probe, registry, tool_validators))
+            elif name == "test_provider_ui_contracts":
+                result.update(check_provider_ui_contracts(probe, registry, tool_validators))
             elif name == "test_native_launch_arguments":
                 result.update(check_native_launch(probe, architecture))
             elif name == "test_native_component_builds":
