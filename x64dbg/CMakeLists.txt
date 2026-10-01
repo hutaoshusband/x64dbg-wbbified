@@ -1189,12 +1189,15 @@ if(X64DBG_BUILD_MCP) # mcp
 
 	set(mcp_common_SOURCES
 		cmake.toml
+		"src/mcp/common/analysis_types.cpp"
+		"src/mcp/common/analysis_types.h"
 		"src/mcp/common/assembly_file_tools.cpp"
 		"src/mcp/common/bootstrap.cpp"
 		"src/mcp/common/bootstrap.h"
 		"src/mcp/common/breakpoint_trace_tools.cpp"
 		"src/mcp/common/contracts.cpp"
 		"src/mcp/common/contracts.h"
+		"src/mcp/common/database_settings_tools.cpp"
 		"src/mcp/common/execution_tools.cpp"
 		"src/mcp/common/inspection_tools.cpp"
 		"src/mcp/common/inspection_types.cpp"
@@ -1205,6 +1208,7 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/lifecycle.cpp"
 		"src/mcp/common/lifecycle.h"
 		"src/mcp/common/memory_tools.cpp"
+		"src/mcp/common/module_analysis_tools.cpp"
 		"src/mcp/common/patch_types.cpp"
 		"src/mcp/common/patch_types.h"
 		"src/mcp/common/platform.cpp"

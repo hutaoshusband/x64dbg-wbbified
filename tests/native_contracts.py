@@ -19,7 +19,7 @@ CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_
               "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser",
               "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
-              "test_breakpoint_trace_contracts", "test_assembly_file_contracts",
+              "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
               "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
 
 EXECUTION_TOOLS = ("execution_resume", "execution_pause", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to",
@@ -34,6 +34,11 @@ BREAKPOINT_TRACE_TOOLS = ("breakpoints_list", "breakpoints_create", "breakpoints
 ASSEMBLY_FILE_TOOLS = ("disassembly_read", "disassembly_function", "assembly_encode", "assembly_apply", "patch_sets_create", "patch_sets_list", "patch_sets_read",
                        "patch_apply_runtime", "patch_restore_runtime", "patch_restore_all", "patch_export_file", "file_inspect", "file_patch_plan", "file_patch_apply",
                        "file_patch_undo", "file_compare", "file_export")
+MODULE_ANALYSIS_TOOLS = ("modules_list", "modules_sections", "modules_imports", "modules_exports", "modules_analyze_pe", "modules_oep_candidates", "symbols_list",
+                         "symbols_search", "symbols_load", "symbols_unload", "analysis_start", "analysis_functions", "analysis_blocks", "analysis_graph", "analysis_references",
+                         "analysis_loops", "analysis_encoding_get", "analysis_encoding_set", "analysis_function_set", "analysis_argument_set", "analysis_range_delete")
+DATABASE_SETTINGS_TOOLS = ("annotations_list", "annotations_set", "annotations_delete", "annotations_import", "annotations_export", "database_save", "database_load",
+                           "database_clear", "database_info", "settings_list", "settings_apply", "favorites_list", "favorites_set")
 
 
 def build_contract_fixture(output, architecture):
@@ -288,7 +293,7 @@ def registry_validators(registry, formats):
     validators = {}
     expected = {"server_info", "server_health", "capabilities_list", "capabilities_describe", "capabilities_search", "client_context_get", "client_context_set", "control_acquire", "control_renew", "control_release"}
     expected.update({"debugger_instances", "debugger_start", "debugger_focus", "debugger_close", "debugger_settings_get", "debugger_settings_set", "processes_list", "target_open", "target_attach", "target_state", "target_snapshot", "target_stop", "target_detach", "target_restart", "target_command_line_get", "target_command_line_set"})
-    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS + BREAKPOINT_TRACE_TOOLS + ASSEMBLY_FILE_TOOLS)
+    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS + BREAKPOINT_TRACE_TOOLS + ASSEMBLY_FILE_TOOLS + MODULE_ANALYSIS_TOOLS + DATABASE_SETTINGS_TOOLS)
     assert registry["operationalTools"] == [] and {tool["name"] for tool in registry["tools"]} == expected
     assert [tool["name"] for tool in registry["tools"]] == sorted(expected)
     for tool in registry["tools"]:
@@ -991,6 +996,204 @@ def run_launch_reference(plan, binary, output, expected_bits):
                 KERNEL.CloseHandle(handle)
 
 
+def database_example():
+    return {"target": tool_context_examples().target, "version": "9007199254740993", "loadedVersion": None, "savedVersion": None, "dirty": True,
+            "file": None, "sha256": None, "modules": [{"moduleId": "module-1", "imageSha256": "0" * 64, "loadGeneration": "18446744073709551615"}],
+            "provider": "native-database", "counts": [{"kind": "comments", "count": "9007199254740993"}], "complete": True}
+
+
+def managed_artifact_example():
+    return {"artifactId": "artifact-1", "namespaceId": "private-1", "revision": "rev-1", "sha256": "0" * 64,
+            "size": "9007199254740993", "mediaType": "application/json", "source": "target:target-1"}
+
+
+def check_module_analysis_contracts(probe, registry, validators):
+    context = tool_context_examples()
+    mutation = {**context.target, "leaseId": "lease-1"}
+    address_range = {"address": {"moduleId": "module-1", "rvaHex": "0x1000"}, "size": 4096}
+    section = {"name": ".text", "addressHex": "0x140001000", "rvaHex": "0x1000", "virtualSize": "4096", "rawOffset": "1024", "rawSize": "4096",
+               "characteristicsHex": "0x60000020", "protectionHex": "0x20", "mapping": "valid"}
+    module = {"moduleId": "module-1", "target": context.target, "loadGeneration": "9007199254740993", "name": "controlled.exe", "baseHex": "0x140000000",
+              "size": "8192", "entryHex": "0x140001000", "image": {"path": "C:\\controlled.exe", "sha256": "0" * 64, "size": "8192"}, "architecture": "x64",
+              "loaded": True, "sections": {"items": [section], "page": context.page}, "provider": "native-modules", "limitations": []}
+    symbol = {"symbolId": "symbol-1", "moduleId": "module-1", "providerId": "provider-1", "name": "controlled!value", "undecoratedName": None, "kind": "debug",
+              "addressHex": "0x140001000", "rvaHex": "0x1000", "size": None, "resolved": True, "sourceFile": None, "line": None}
+    provider = {"moduleId": "module-1", "providerId": "provider-1", "kind": "pdb", "source": {"path": "C:\\controlled.pdb"}, "sha256": "0" * 64,
+                "signature": "fixture-signature", "age": 1, "moduleMatch": "matched", "loaded": True, "networkUsed": False}
+    function = {"functionId": "function-1", "moduleId": "module-1", "startHex": "0x140001000", "endHex": "0x140001005", "name": None, "kind": "heuristic",
+                "source": "control-flow", "analysisVersion": "9007199254740993", "instructionCount": None, "parentFunctionId": None, "certainty": "heuristic"}
+    edge = {"fromBlockId": "block-1", "toBlockId": None, "targetHex": None, "kind": "indirect", "resolution": "unresolved"}
+    block = {"blockId": "block-1", "functionId": "function-1", "startHex": "0x140001000", "endHex": "0x140001005", "instructions": [instruction_example()],
+             "edges": [edge], "complete": False, "analysisVersion": "9007199254740993"}
+    encoding = {"target": context.target, "databaseVersion": "9007199254740993", "items": [{"addressHex": "0x140001000", "size": "4096", "encoding": "code",
+                "source": "native-encoding-map", "valid": True}], "complete": True}
+    inputs = {"modules_list": context.target, "modules_sections": {**context.target, "moduleId": "module-1"},
+              "modules_imports": {**context.target, "moduleId": "module-1"}, "modules_exports": {**context.target, "moduleId": "module-1"},
+              "modules_analyze_pe": {"path": "C:\\controlled.exe"}, "modules_oep_candidates": {**context.target, "moduleId": "module-1"},
+              "symbols_list": context.target, "symbols_search": {**context.target, "query": "value"},
+              "symbols_load": {**context.target, "moduleId": "module-1", "source": {"path": "C:\\controlled.pdb"}, "networkAllowed": False},
+              "symbols_unload": {**context.target, "moduleId": "module-1", "providerId": "provider-1"},
+              "analysis_start": {**mutation, "moduleId": "module-1", "mode": "control_flow", "range": address_range}, "analysis_functions": context.target,
+              "analysis_blocks": {**context.target, "functionId": "function-1"}, "analysis_graph": {**context.target, "functionId": "function-1", "format": "structured"},
+              "analysis_references": {**context.target, "expression": "rip", "direction": "from"}, "analysis_loops": context.target,
+              "analysis_encoding_get": {**context.target, **address_range}, "analysis_encoding_set": {**mutation, **address_range, "encoding": "code"},
+              "analysis_function_set": {**mutation, "range": address_range, "kind": "manual"}, "analysis_argument_set": {**mutation, "range": address_range, "kind": "automatic"},
+              "analysis_range_delete": {**mutation, "kind": "xref", "range": address_range}}
+    candidate = {"addressHex": "0x140001000", "moduleId": "module-1", "rank": 1, "score": 42, "method": "pe-entry", "rationale": ["Observed header entry"],
+                 "verification": {"status": "unverified", "evidence": [], "followUp": {"capabilityId": "execution_run_to", "retry": "after_refresh", "reason": "Execution proof pending"}}}
+    outputs = {"modules_list": {"items": [module], "page": context.page}, "modules_sections": {"moduleId": "module-1", "loadGeneration": "9007199254740993", "items": [section], "complete": True},
+               "modules_imports": {"items": [{"moduleId": "module-1", "name": None, "ordinal": "42", "iatAddressHex": "0x140002000", "providerName": "kernel32.dll",
+                                             "resolvedProviderId": None, "resolvedAddressHex": None, "resolved": False}], "page": context.page},
+               "modules_exports": {"items": [{"moduleId": "module-1", "name": "value", "ordinal": "42", "rvaHex": "0x1000", "addressHex": None,
+                                             "forwarder": "other.value", "resolved": False}], "page": context.page},
+               "modules_analyze_pe": {"sourceKind": "target", "module": module, "file": None, "facts": [{"name": "entry-point", "offset": "40", "size": "4",
+                                         "bytesHex": "00100000", "value": {"kind": "unsigned", "hex": "0x1000", "decimal": "4096", "widthBits": 32}, "status": "valid"}], "errors": [], "complete": True},
+               "modules_oep_candidates": {"items": [candidate], "complete": True}, "symbols_list": {"items": [symbol], "page": context.page},
+               "symbols_search": {"items": [symbol], "page": context.page}, "symbols_load": provider, "symbols_unload": {**provider, "loaded": False},
+               "analysis_start": {"target": context.target, "moduleId": "module-1", "analysisId": "analysis-1", "analysisVersion": "9007199254740993", "mode": "control_flow",
+                                  "jobId": "job-1", "state": "queued", "complete": False}, "analysis_functions": {"items": [function], "page": context.page},
+               "analysis_blocks": {"items": [block], "page": context.page}, "analysis_graph": {"functionId": "function-1", "analysisVersion": "9007199254740993", "blocks": [block],
+                                  "edges": [edge], "unresolvedEdges": "1", "artifact": None, "complete": False},
+               "analysis_references": {"items": [{"fromHex": "0x140001000", "toHex": None, "kind": "unknown", "source": "native-xrefs", "analysisVersion": "9007199254740993", "resolved": False}], "page": context.page},
+               "analysis_loops": {"items": [{"loopId": "loop-1", "functionId": None, "startHex": "0x140001000", "endHex": "0x140001005", "parentLoopId": None,
+                                           "depth": 0, "manual": True, "instructionCount": None, "analysisVersion": "9007199254740993"}], "page": context.page},
+               "analysis_encoding_get": encoding, "analysis_encoding_set": encoding,
+               "analysis_function_set": database_example(), "analysis_argument_set": database_example(), "analysis_range_delete": database_example()}
+    extra_inputs = [(True, "modules_analyze_pe", context.target), (True, "modules_analyze_pe", {"artifactId": "artifact-1"}),
+                    (False, "modules_analyze_pe", {**context.target, "path": "C:\\controlled.exe"}), (False, "modules_analyze_pe", {"path": "relative.exe"}),
+                    (False, "modules_sections", {**inputs["modules_sections"], "targetGeneration": 9007199254740993}),
+                    (True, "symbols_load", {**context.target, "moduleId": "module-1", "source": {"kind": "store", "location": "controlled-store"}, "networkAllowed": True}),
+                    (False, "symbols_load", {**inputs["symbols_load"], "source": {"path": "C:\\controlled.pdb", "kind": "store", "location": "reject mixed"}}),
+                    (False, "symbols_search", {**inputs["symbols_search"], "query": ""}), (False, "analysis_start", {**inputs["analysis_start"], "mode": "invented"}),
+                    (False, "analysis_encoding_set", {**inputs["analysis_encoding_set"], "encoding": "generic-data"}),
+                    (False, "analysis_encoding_get", {**inputs["analysis_encoding_get"], "size": 1048577}),
+                    (False, "analysis_encoding_get", {**inputs["analysis_encoding_get"], "address": {"addressHex": "0x1000", "expression": "rax"}}),
+                    (False, "analysis_range_delete", {**inputs["analysis_range_delete"], "kind": "everything"})]
+    encodings = ("unknown", "byte", "word", "dword", "fword", "qword", "tbyte", "oword", "mmword", "xmmword", "ymmword", "zmmword",
+                 "real4", "real8", "real10", "ascii", "unicode", "code", "junk", "middle")
+    for native_encoding in encodings:
+        extra_inputs.append((True, "analysis_encoding_set", {**inputs["analysis_encoding_set"], "encoding": native_encoding}))
+    for mode in ("linear", "exception_directory", "recursive", "xrefs", "advanced", "nukem"):
+        extra_inputs.append((True, "analysis_start", {**inputs["analysis_start"], "mode": mode}))
+    for name in ("analysis_start", "analysis_encoding_set", "analysis_function_set", "analysis_argument_set", "analysis_range_delete"):
+        extra_inputs.append((False, name, {key: value for key, value in inputs[name].items() if key != "leaseId"}))
+    missing_followup = copy.deepcopy(candidate)
+    del missing_followup["verification"]["followUp"]
+    unproved_verified = {**candidate, "verification": {"status": "verified", "evidence": []}}
+    extra_outputs = [(False, "modules_oep_candidates", {"items": [missing_followup], "complete": True}),
+                     (False, "modules_oep_candidates", {"items": [unproved_verified], "complete": True}),
+                     (False, "modules_sections", {**outputs["modules_sections"], "items": [{**section, "characteristicsHex": "0x100000000"}]}),
+                     (True, "modules_sections", {**outputs["modules_sections"], "items": [{**section, "name": "", "rawOffset": None, "rawSize": None, "mapping": "ambiguous"}]}),
+                     (False, "modules_list", {"items": [{**module, "size": "0"}], "page": context.page}),
+                     (False, "symbols_list", {"items": [{**symbol, "addressHex": "0x10000000000000000"}], "page": context.page}),
+                     (True, "symbols_list", {"items": [{**symbol, "addressHex": None, "resolved": False, "kind": "unknown"}], "page": context.page}),
+                     (False, "analysis_graph", {**outputs["analysis_graph"], "edges": [{**edge, "resolution": "guessed"}]}),
+                     (False, "analysis_graph", {**outputs["analysis_graph"], "unresolvedEdges": 9007199254740993}),
+                     (False, "analysis_functions", {"items": [{**function, "instructionCount": "18446744073709551616"}], "page": context.page}),
+                     (True, "symbols_load", {**provider, "moduleMatch": "mismatched", "loaded": False}),
+                     (True, "analysis_graph", {**outputs["analysis_graph"], "artifact": managed_artifact_example()})]
+    for native_encoding in encodings:
+        extra_outputs.append((True, "analysis_encoding_get", {**encoding, "items": [{**encoding["items"][0], "encoding": native_encoding}]}))
+    effects = {name: ["inspect"] for name in MODULE_ANALYSIS_TOOLS}
+    effects.update({name: ["configure"] for name in ("symbols_load", "symbols_unload", "analysis_start", "analysis_encoding_set", "analysis_function_set", "analysis_argument_set", "analysis_range_delete")})
+    required = {name: "instanceId" for name in MODULE_ANALYSIS_TOOLS}
+    required["modules_analyze_pe"] = "path"
+    executors = {name: "engine" for name in MODULE_ANALYSIS_TOOLS}
+    executors["modules_analyze_pe"] = "broker"
+    conditions = {"analysis_graph": [{"field": "format", "equals": "svg", "effects": ["file_export"]}, {"field": "format", "equals": "png", "effects": ["file_export"]}]}
+    result = check_tool_family(probe, registry, validators, MODULE_ANALYSIS_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects, required, executors, conditions)
+    for graph_format in ("svg", "png"):
+        value = {**inputs["analysis_graph"], "format": graph_format}
+        assert validators[("analysis_graph", "input")].is_valid(value) and probe.call("tool-input", value, "analysis_graph")["valid"]
+        assert probe.call("effects", value, "analysis_graph") == {"valid": True, "effects": ["inspect", "file_export"]}
+    result.update(nativeEncodings=list(encodings), nativeAnalysisModes=7, conditionalGraphExportEffects=2, explicitUnresolvedCfgAndOepEvidence=True)
+    return result
+
+
+def check_database_settings_contracts(probe, registry, validators):
+    context = tool_context_examples()
+    mutation = {**context.target, "leaseId": "lease-1"}
+    instance = {"instanceId": "instance-1"}
+    library = {"namespaceId": "private-1", "objectId": "annotations-1", "revision": "rev-1"}
+    annotation = {"annotationId": "annotation-1", "revision": "rev-1", "target": context.target, "addressHex": "0x140001000", "moduleId": "module-1",
+                  "rvaHex": "0x1000", "origin": "manual", "present": True, "databaseVersion": "9007199254740993", "kind": "comment", "value": "controlled annotation"}
+    database = database_example()
+    record = {"recordId": "record-1", "annotationId": "annotation-1", "kind": "comment", "status": "conflict", "revision": "rev-1", "error": None}
+    changed = {"database": database, "records": [record], "preservedKinds": ["label", "bookmark", "color"], "complete": False}
+    setting = {"settingId": "setting-1", "section": "Gui", "key": "Controlled", "value": {"kind": "uint64", "value": "18446744073709551615"},
+               "valueSchema": {"type": "string", "format": "uint64-decimal"}, "storage": "both", "requiresRestart": True, "nativeWidth": 64,
+               "provider": "native-configuration", "effects": ["configure"], "enabled": True, "disabledReason": None}
+    favorite = {"favoriteId": "favorite-1", "name": "controlled", "description": "", "shortcut": "", "kind": "command", "commandText": "pause"}
+    observed = {**favorite, "actionId": "favorite:favorite-1", "effects": ["execute"], "classification": "known", "enabled": True, "disabledReason": None}
+    favorites = {**instance, "version": "9007199254740993", "entries": [observed], "persisted": True, "complete": True}
+    inputs = {"annotations_list": context.target, "annotations_set": {**mutation, "moduleId": "module-1", "rvaHex": "0x1000", "kind": "comment", "value": "controlled annotation", "expectedRevision": "rev-1"},
+              "annotations_delete": {**mutation, "annotationIds": ["annotation-1"]}, "annotations_import": {**mutation, **library, "mergePolicy": "reject"},
+              "annotations_export": {**context.target, "namespaceId": "private-1", "selection": {"kinds": ["comment"]}},
+              "database_save": {**context.target, "destination": "C:\\controlled.dd64"}, "database_load": {**mutation, "path": "C:\\controlled.dd64", "mergePolicy": "reject"},
+              "database_clear": {**mutation, "kinds": ["comments"]}, "database_info": context.target, "settings_list": {**instance, "filter": {"section": "Gui"}},
+              "settings_apply": {**instance, "changes": [{"settingId": "setting-1", "value": setting["value"]}], "expectedVersion": "9007199254740993"},
+              "favorites_list": instance, "favorites_set": {**instance, "entries": [favorite], "expectedVersion": "9007199254740993"}}
+    outputs = {"annotations_list": {"items": [annotation], "page": context.page}, "annotations_set": annotation, "annotations_delete": changed, "annotations_import": changed,
+               "annotations_export": {"artifact": managed_artifact_example(), "database": database, "recordCount": "9007199254740993", "complete": True},
+               "database_save": {**database, "savedVersion": database["version"], "dirty": False, "file": {"path": "C:\\controlled.dd64"}, "sha256": "0" * 64},
+               "database_load": {**database, "loadedVersion": database["version"], "file": {"path": "C:\\controlled.dd64"}, "sha256": "0" * 64},
+               "database_clear": database, "database_info": database, "settings_list": {"items": [setting], "page": context.page},
+               "settings_apply": {**instance, "version": "9007199254740993", "items": [setting], "pendingRestartIds": ["setting-1"], "persisted": True, "complete": True},
+               "favorites_list": favorites, "favorites_set": favorites}
+    extra_inputs = [(True, "annotations_import", {**mutation, "path": "C:\\annotations.json", "mergePolicy": "keep_existing"}),
+                    (True, "annotations_import", {**mutation, "artifactId": "artifact-1", "mergePolicy": "replace"}),
+                    (False, "annotations_import", {**inputs["annotations_import"], "path": "C:\\annotations.json"}),
+                    (False, "annotations_import", {key: value for key, value in inputs["annotations_import"].items() if key != "revision"}),
+                    (False, "annotations_import", {**inputs["annotations_import"], "mergePolicy": "silent_replace"}),
+                    (False, "annotations_set", {**inputs["annotations_set"], "addressHex": "0x1000"}),
+                    (False, "annotations_delete", {**inputs["annotations_delete"], "annotationIds": ["annotation-1", "annotation-1"]}),
+                    (True, "database_load", {**mutation, "artifactId": "artifact-1"}), (False, "database_load", {**inputs["database_load"], "artifactId": "artifact-1"}),
+                    (False, "database_save", {**inputs["database_save"], "destination": "relative.dd64"}),
+                    (False, "database_clear", {**inputs["database_clear"], "kinds": ["comments", "comments"]}),
+                    (False, "database_clear", {**inputs["database_clear"], "kinds": ["unknown-provider-category"]}),
+                    (False, "settings_apply", {**inputs["settings_apply"], "expectedVersion": 9007199254740993}),
+                    (False, "settings_apply", {**inputs["settings_apply"], "changes": []}),
+                    (False, "favorites_set", {**inputs["favorites_set"], "entries": [{**favorite, "effects": ["execute"]}]}),
+                    (True, "favorites_set", {**inputs["favorites_set"], "entries": []})]
+    favorite_tool = {"favoriteId": "favorite-2", "name": "controlled tool", "kind": "tool", "file": {"path": "C:\\controlled.exe"}, "rawCommandLine": '"C:\\controlled.exe" raw', "cwd": "C:\\"}
+    favorite_script = {"favoriteId": "favorite-3", "name": "controlled script", "kind": "script", "script": {**library, "objectId": "script-1"}}
+    for entry in (favorite_tool, favorite_script, {**favorite_script, "script": {"artifactId": "script-1"}}):
+        extra_inputs.append((True, "favorites_set", {**inputs["favorites_set"], "entries": [entry]}))
+    extra_inputs.extend([(False, "favorites_set", {**inputs["favorites_set"], "entries": [{**favorite_tool, "commandText": "pause"}]}),
+                         (False, "favorites_set", {**inputs["favorites_set"], "entries": [{**favorite_script, "script": {key: value for key, value in library.items() if key != "revision"}}]})])
+    for kind, value in (("label", "value"), ("comment", ""), ("bookmark", True), ("color", "0xffffffff")):
+        extra_inputs.append((True, "annotations_set", {**inputs["annotations_set"], "kind": kind, "value": value}))
+    extra_inputs.extend([(False, "annotations_set", {**inputs["annotations_set"], "kind": "bookmark", "value": "true"}),
+                         (False, "annotations_set", {**inputs["annotations_set"], "kind": "color", "value": "0x100000000"})])
+    for kind, value in (("boolean", False), ("uint64", "18446744073709551615"), ("text", "Hu Tao ❤")):
+        extra_inputs.append((True, "settings_apply", {**inputs["settings_apply"], "changes": [{"settingId": "setting-1", "value": {"kind": kind, "value": value}}]}))
+    extra_inputs.append((False, "settings_apply", {**inputs["settings_apply"], "changes": [{"settingId": "setting-1", "value": {"kind": "uint64", "value": "18446744073709551616"}}]}))
+    for name in ("annotations_set", "annotations_delete", "annotations_import", "database_load", "database_clear"):
+        extra_inputs.append((False, name, {key: value for key, value in inputs[name].items() if key != "leaseId"}))
+    for name in ("settings_apply", "favorites_set"):
+        extra_inputs.append((False, name, {key: value for key, value in inputs[name].items() if key != "expectedVersion"}))
+    extra_outputs = [(False, "database_info", {**database, "version": 9007199254740993}),
+                     (False, "database_save", {**outputs["database_save"], "sha256": "0" * 63}),
+                     (False, "database_info", {**database, "counts": [{"kind": "comments", "count": "18446744073709551616"}]}),
+                     (False, "annotations_set", {**annotation, "origin": "guessed"}),
+                     (False, "annotations_import", {**changed, "records": [{**record, "status": "pretend-success"}]}),
+                     (False, "settings_list", {"items": [{**setting, "valueSchema": False}], "page": context.page}),
+                     (False, "settings_list", {"items": [{**setting, "effects": ["configure", "configure"]}], "page": context.page}),
+                     (False, "settings_list", {"items": [{**setting, "nativeWidth": 128}], "page": context.page}),
+                     (True, "favorites_list", {**favorites, "entries": [{**observed, "effects": [], "classification": "unknown", "enabled": False, "disabledReason": "Native command effect unresolved"}]}),
+                     (False, "favorites_list", {**favorites, "entries": [{**observed, "classification": "trusted"}]})]
+    for kind, value in (("label", "value"), ("comment", ""), ("bookmark", True), ("color", "0xffffffff")):
+        extra_outputs.append((True, "annotations_set", {**annotation, "kind": kind, "value": value}))
+    effects = {name: ["inspect"] for name in DATABASE_SETTINGS_TOOLS}
+    effects.update({name: ["configure"] for name in ("annotations_set", "annotations_delete", "annotations_import", "database_load", "database_clear", "settings_apply", "favorites_set")})
+    effects.update({"annotations_export": ["inspect", "file_export"], "database_save": ["configure", "file_export"]})
+    executors = {name: "engine" for name in DATABASE_SETTINGS_TOOLS}
+    executors.update({name: "gui" for name in ("settings_list", "settings_apply", "favorites_list", "favorites_set")})
+    result = check_tool_family(probe, registry, validators, DATABASE_SETTINGS_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects, executors=executors)
+    result.update(annotationKinds=4, pinnedLibraryOrFileSources=True, explicitConflictAndPersistenceObservations=True, storingFavoritesHasNoExecuteEffect=True, guiOwnerContracts=4)
+    return result
+
+
 def check_native_launch(probe, architecture):
     import os
     import shutil
@@ -1295,6 +1498,10 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_breakpoint_trace_contracts(probe, registry, tool_validators))
             elif name == "test_assembly_file_contracts":
                 result.update(check_assembly_file_contracts(probe, registry, tool_validators))
+            elif name == "test_module_analysis_contracts":
+                result.update(check_module_analysis_contracts(probe, registry, tool_validators))
+            elif name == "test_database_settings_contracts":
+                result.update(check_database_settings_contracts(probe, registry, tool_validators))
             elif name == "test_native_launch_arguments":
                 result.update(check_native_launch(probe, architecture))
             elif name == "test_native_component_builds":

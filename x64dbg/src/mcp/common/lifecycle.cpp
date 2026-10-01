@@ -1,5 +1,6 @@
 #include "lifecycle.h"
 #include "registry.h"
+#include "schema_helpers.h"
 #include <limits>
 
 namespace wininspect::mcp
@@ -54,18 +55,9 @@ Json page_data(Json item)
         {"page", reference_schema("ResultPagination")}}, {"items", "page"});
 }
 
-Json typed_setting_value()
-{
-    Json choices = Json::array();
-    for(const auto& entry : std::vector<std::pair<std::string, Json>>{{"boolean", {{"type", "boolean"}}},
-        {"uint64", reference_schema("Decimal64")}, {"text", string_schema("utf8-text", 32767, 0)}})
-        choices.push_back(closed_object_schema({{"kind", {{"const", entry.first}}}, {"value", entry.second}}, {"kind", "value"}));
-    return {{"oneOf", std::move(choices)}};
-}
-
 Json setting_schema(bool observed)
 {
-    Json properties = {{"section", string_schema("utf8-text", 128)}, {"key", string_schema("utf8-text", 128)}, {"value", typed_setting_value()}};
+    Json properties = {{"section", string_schema("utf8-text", 128)}, {"key", string_schema("utf8-text", 128)}, {"value", typed_setting_value_schema()}};
     Json required = {"section", "key", "value"};
     if(observed)
     {

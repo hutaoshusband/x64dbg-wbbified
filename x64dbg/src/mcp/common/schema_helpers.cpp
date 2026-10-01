@@ -69,4 +69,18 @@ Json positive_decimal_schema()
     schema["not"] = {{"const", "0"}};
     return schema;
 }
+
+Json typed_setting_value_schema()
+{
+    Json choices = Json::array();
+    for(const auto& entry : std::vector<std::pair<std::string, Json>>{{"boolean", {{"type", "boolean"}}},
+        {"uint64", reference_schema("Decimal64")}, {"text", string_schema("utf8-text", 32767, 0)}})
+        choices.push_back(closed_object_schema({{"kind", {{"const", entry.first}}}, {"value", entry.second}}, {"kind", "value"}));
+    return {{"oneOf", std::move(choices)}};
+}
+
+Json effect_list_schema()
+{
+    return bounded_array_schema(enum_schema({"inspect", "execute", "modify", "file_export", "file_replace", "elevate", "configure"}), 7, 0, true);
+}
 }
