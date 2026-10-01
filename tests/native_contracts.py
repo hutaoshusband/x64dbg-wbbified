@@ -18,7 +18,7 @@ from wi_driver import KERNEL, McpError, OwnedJob, ROOT, compiler_environment, fi
 CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_context_roundtrip",
               "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser",
               "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
-              "test_lifecycle_contracts", "test_native_launch_arguments")
+              "test_lifecycle_contracts", "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
 
 
 def build_contract_fixture(output, architecture):
@@ -32,10 +32,10 @@ def build_contract_fixture(output, architecture):
     if qt.is_dir():
         configure.append(f"-DQt5_DIR={qt}")
     commands = []
-    source_paths = [source / "cmake.toml", source / "CMakeLists.txt", *sorted((source / "src/mcp").rglob("*"))]
+    source_paths = [source / "cmake.toml", source / "CMakeLists.txt", *sorted((source / "src/mcp").rglob("*")), *sorted((source / "src/dbg/mcp").rglob("*"))]
     source_inputs = [file_identity(path) for path in source_paths if path.is_file()]
     with (build / "build.log").open("w", encoding="utf-8") as log:
-        for command in (configure, ["cmake", "--build", str(build), "--target", "mcp_contract_fixture", "mcp_launch_reference", "--parallel", "6"]):
+        for command in (configure, ["cmake", "--build", str(build), "--target", "mcp_contract_fixture", "mcp_launch_reference", "mcp_broker", "mcp_connect", "mcp_worker", "--parallel", "6"]):
             print(f"Building MCP contracts {architecture}: {command[1]}", flush=True)
             process = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
             log.flush()
@@ -44,7 +44,8 @@ def build_contract_fixture(output, architecture):
             if process.returncode:
                 raise McpError(f"Contract fixture build failed: {(build / 'build.log').read_text(encoding='utf-8')[-6000:]}")
     binary = build / "wininspect-mcp-contract-fixture.exe"
-    for artifact in (binary, build / "wininspect-mcp-launch-reference.exe"):
+    components = [build / "wininspect-mcp.exe", build / "wininspect-mcp-connect.exe"]
+    for artifact in (binary, build / "wininspect-mcp-launch-reference.exe", *components):
         image = artifact.read_bytes()
         pe_offset = struct.unpack_from("<I", image, 0x3c)[0]
         assert image[:2] == b"MZ" and image[pe_offset:pe_offset + 4] == b"PE\0\0"
@@ -53,6 +54,7 @@ def build_contract_fixture(output, architecture):
                 "sourceStatus": subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True),
                 "sourceInputs": source_inputs, "commands": commands, "binary": file_identity(binary),
                 "launchReference": file_identity(build / "wininspect-mcp-launch-reference.exe"),
+                "nativeComponents": [file_identity(path) for path in components],
                 "buildInputs": file_identity(build / "CMakeCache.txt"),
                 "compiledDependencies": [file_identity(path) for path in sorted(build.glob("mcp_*.lib"))],
                 "compileCommands": json.loads((build / "compile_commands.json").read_text(encoding="utf-8")),
@@ -76,6 +78,12 @@ class ContractProbe:
         if argument is not None:
             command.append(argument)
         payload = raw if raw is not None else b"" if value is None else json.dumps(value, ensure_ascii=False).encode("utf-8")
+        stdout, stderr, observation = self.execute(command, payload)
+        response = json.loads(stdout)
+        observation["response"] = response
+        return response
+
+    def execute(self, command, payload=b"", expected_exit=0):
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    creationflags=subprocess.CREATE_NO_WINDOW)
         timed_out = False
@@ -92,13 +100,12 @@ class ContractProbe:
             process.communicate()
             raise
         observation = {"command": command, "inputSha256": hashlib.sha256(payload).hexdigest(), "inputSize": len(payload),
-                       "processIdentity": identity, "exitCode": process.returncode, "timedOut": timed_out, "stderr": stderr.decode("utf-8", "replace")}
+                       "processIdentity": identity, "exitCode": process.returncode, "expectedExitCode": expected_exit,
+                       "timedOut": timed_out, "stderr": stderr.decode("utf-8", "replace")}
         self.observations.append(observation)
         assert not timed_out, f"Owned contract fixture timed out: {identity}"
-        assert process.returncode == 0, observation
-        response = json.loads(stdout)
-        observation["response"] = response
-        return response
+        assert process.returncode == expected_exit, observation
+        return stdout, stderr, observation
 
 
 def independent_validators(catalog):
@@ -156,6 +163,11 @@ def contract_examples():
     recovery = {"capabilityId": "operation_reconcile", "retry": "after_reconciliation", "reason": "Inspect the operation"}
     evidence = {"kind": "readback", "source": "native_fixture", "summary": "Observed exact bytes"}
     examples.update({
+        "IpcEnvelope": [(True, {"context": {"brokerGeneration": "18446744073709551615"}, "deadlineUtcMs": "9007199254740993", "authenticationContextId": "context-fixture", "payload": {"method": "ping"}}),
+                        (False, {"context": target, "deadlineUtcMs": 9007199254740993, "authenticationContextId": "context-fixture", "payload": {}}),
+                        (False, {"context": target, "deadlineUtcMs": "1", "authenticationContextId": "context-fixture", "payload": []})],
+        "NativeProcessIdentity": [(True, {"pid": 1, "creationTime": "18446744073709551615", "sessionId": 1, "userSid": "S-1-5-21-1", "logonSid": "S-1-5-5-1-2", "integrity": "medium", "elevated": False, "architecture": "x64",
+            "image": {"path": "C:\\controlled.exe", "sha256": "0" * 64, "size": "1", "volumeSerial": 1, "fileIndex": "18446744073709551615"}}), (False, {"pid": 1})],
         "LibraryRef": [(True, {"namespaceId": "private-1", "objectId": "script-1", "revision": "rev-2"}), (False, {"namespaceId": "private-1", "objectId": "script-1"})],
         "JobRef": [(True, {"jobId": "job-1"}), (False, {"jobId": None})],
         "EventRef": [(True, {"cursor": "opaque:9007199254740993"}), (False, {"cursor": 9007199254740993})],
@@ -557,6 +569,160 @@ def check_native_launch(probe, architecture):
     return {"actualNativeLaunches": outputs, "rejectedPreflightCases": len(rejected), "environmentMutation": "isolated child block only"}
 
 
+class SidAndAttributes(ctypes.Structure):
+    _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
+
+
+class TokenGroups(ctypes.Structure):
+    _fields_ = [("count", wintypes.DWORD), ("groups", SidAndAttributes * 1)]
+
+
+class NativeFileInformation(ctypes.Structure):
+    _fields_ = [("attributes", wintypes.DWORD), ("created", wintypes.FILETIME), ("accessed", wintypes.FILETIME),
+                ("written", wintypes.FILETIME), ("volume", wintypes.DWORD), ("sizeHigh", wintypes.DWORD),
+                ("sizeLow", wintypes.DWORD), ("links", wintypes.DWORD), ("indexHigh", wintypes.DWORD), ("indexLow", wintypes.DWORD)]
+
+
+def parent_token_oracle():
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    KERNEL.GetCurrentProcess.restype = wintypes.HANDLE
+    KERNEL.LocalFree.argtypes = [ctypes.c_void_p]
+    KERNEL.LocalFree.restype = ctypes.c_void_p
+    token = wintypes.HANDLE()
+    if not advapi.OpenProcessToken(KERNEL.GetCurrentProcess(), 8, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    queries = []
+    try:
+        def information(kind):
+            size = wintypes.DWORD()
+            queried = advapi.GetTokenInformation(token, kind, None, 0, ctypes.byref(size))
+            queries.append({"class": kind, "success": bool(queried), "error": ctypes.get_last_error(), "size": size.value})
+            assert 0 < size.value <= 1048576
+            buffer = ctypes.create_string_buffer(size.value)
+            if not advapi.GetTokenInformation(token, kind, buffer, size, ctypes.byref(size)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return buffer
+
+        def sid_text(address):
+            text = wintypes.LPWSTR()
+            if not advapi.ConvertSidToStringSidW(address, ctypes.byref(text)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                return text.value
+            finally:
+                KERNEL.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+        user = information(1)
+        groups = information(2)
+        count = wintypes.DWORD.from_buffer(groups).value
+        offset = TokenGroups.groups.offset
+        assert offset + count * ctypes.sizeof(SidAndAttributes) <= len(groups)
+        entries = (SidAndAttributes * count).from_buffer(groups, offset)
+        logon_sids = [sid_text(entry.sid) for entry in entries if entry.attributes & 0xc0000000 == 0xc0000000]
+        assert len(logon_sids) == 1
+        integrity = information(25)
+        sid = SidAndAttributes.from_buffer(integrity).sid
+        subauthorities = ctypes.c_ubyte.from_address(sid + 1).value
+        assert subauthorities
+        level = wintypes.DWORD.from_address(sid + 8 + (subauthorities - 1) * 4).value
+        label = "untrusted" if level < 0x1000 else "low" if level < 0x2000 else "medium" if level < 0x3000 else "high" if level < 0x4000 else "system" if level < 0x5000 else "protected"
+        observed = {"userSid": sid_text(SidAndAttributes.from_buffer(user).sid), "logonSid": logon_sids[0], "integrity": label,
+                    "sessionId": wintypes.DWORD.from_buffer(information(12)).value, "elevated": bool(wintypes.DWORD.from_buffer(information(20)).value)}
+        return observed, queries
+    finally:
+        KERNEL.CloseHandle(token)
+
+
+def file_handle_oracle(binary):
+    KERNEL.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    KERNEL.CreateFileW.restype = wintypes.HANDLE
+    KERNEL.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.POINTER(NativeFileInformation)]
+    handle = KERNEL.CreateFileW(str(binary), 0x80000000, 1, None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        information = NativeFileInformation()
+        if not KERNEL.GetFileInformationByHandle(handle, ctypes.byref(information)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return {"volumeSerial": information.volume, "fileIndex": str(information.indexHigh << 32 | information.indexLow),
+                "size": str(information.sizeHigh << 32 | information.sizeLow)}
+    finally:
+        KERNEL.CloseHandle(handle)
+
+
+def check_native_components(probe, architecture, validators, catalog):
+    expected_token, token_queries = parent_token_oracle()
+    observations = []
+    def verify(information, identity, binary, component):
+        assert set(information) == {"schemaVersion", "component", "buildId", "wireVersion", "process", "declaredToolCount", "implementedTransports", "operationalTools"}
+        assert information["schemaVersion"] == information["wireVersion"] == 1 and information["component"] == component
+        assert information["buildId"] == catalog["buildId"] and information["declaredToolCount"] == 26
+        assert information["implementedTransports"] == information["operationalTools"] == []
+        process = information["process"]
+        assert validators["NativeProcessIdentity"].is_valid(process)
+        assert {key: process[key] for key in identity} == identity and process["architecture"] == architecture
+        assert {key: process[key] for key in expected_token} == expected_token
+        image = process["image"]
+        assert Path(image["path"]).resolve() == binary.resolve() and image["sha256"] == file_identity(binary)["sha256"]
+        assert {key: image[key] for key in ("volumeSerial", "fileIndex", "size")} == file_handle_oracle(binary)
+        observations.append({"information": information, "processIdentity": identity, "artifact": file_identity(binary)})
+    for component, name in (("broker", "wininspect-mcp.exe"), ("connector", "wininspect-mcp-connect.exe")):
+        binary = probe.binary.parent / name
+        stdout, stderr, receipt = probe.execute([str(binary), "--build-info"])
+        assert not stderr
+        information = json.loads(stdout)
+        receipt["response"] = information
+        verify(information, receipt["processIdentity"], binary, component)
+        for arguments in ([], ["--serve"], ["--unknown"]):
+            stdout, stderr, receipt = probe.execute([str(binary), *arguments], expected_exit=64)
+            assert not stdout and json.loads(stderr)["code"] == "unsupported_capability"
+        stdout, stderr, receipt = probe.execute([str(binary), "--help"])
+        assert not stdout and b"--build-info" in stderr
+    worker = probe.call("worker-build-info")
+    assert worker["valid"], worker
+    verify(worker["information"], probe.observations[-1]["processIdentity"], probe.binary, "worker_adapter")
+    write_json(probe.output / "native-components.json", observations)
+    return {"componentProcesses": observations, "inheritedTokenOracle": expected_token, "tokenQueryStatuses": token_queries,
+            "unimplementedTransportStartsRejected": 6, "workerLinked": True}
+
+
+def check_ipc_wire(probe):
+    envelope = {"context": {"brokerGeneration": "18446744073709551615"}, "deadlineUtcMs": "9007199254740993", "authenticationContextId": "fixture-context",
+                "payload": {"jsonrpc": "2.0", "id": "request-1", "method": "fixture", "params": {"text": "Hu Tao ❤ 😀", "value": "18446744073709551615"}}}
+    body = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    packets = []
+    for kind in range(1, 8):
+        request_id = 0 if kind == 5 else 2**64 - 1
+        packet = struct.pack("<4sHHIIQ", b"WIMC", 1, kind, len(body) + 24, 0, request_id) + body
+        encoded = probe.call("ipc-encode", {"kind": kind, "requestId": str(request_id), "envelope": envelope})
+        assert encoded["valid"] and bytes.fromhex(encoded["bytesHex"]) == packet
+        expected_header = {"wireVersion": 1, "kind": kind, "totalLength": len(packet), "requestId": str(request_id)}
+        assert probe.call("ipc-header", raw=packet[:24]) == {"valid": True, "header": expected_header}
+        assert probe.call("ipc-decode", raw=packet) == {"valid": True, "header": expected_header, "envelope": envelope}
+        packets.append({"kind": kind, "sha256": hashlib.sha256(packet).hexdigest(), "bytes": len(packet)})
+    def header(magic=b"WIMC", version=1, kind=3, size=len(body) + 24, flags=0, request_id=1):
+        return struct.pack("<4sHHIIQ", magic, version, kind, size, flags, request_id)
+    invalid_headers = [header(magic=b"BAD!"), header(version=2), header(kind=0), header(kind=8), header(size=25),
+                       header(size=8 * 1024 * 1024 + 1), header(flags=1), header(request_id=0), header()[:23]]
+    for value in invalid_headers:
+        assert not probe.call("ipc-header", raw=value)["valid"]
+    assert probe.call("ipc-header", raw=header(size=8 * 1024 * 1024))["valid"]
+    invalid_bodies = [b"[]", b"\xff", b'{"deadlineUtcMs":"1","deadlineUtcMs":"2"}', json.dumps({**envelope, "unknown": 1}).encode(),
+                      json.dumps({**envelope, "deadlineUtcMs": 9007199254740993}).encode(),
+                      json.dumps({**envelope, "context": {"instanceId": "i", "targetId": "t"}}).encode()]
+    for value in invalid_bodies:
+        assert not probe.call("ipc-decode", raw=header(size=len(value) + 24) + value)["valid"]
+    for value in (header() + body[:-1], header() + body + b"x", b"", header(size=8 * 1024 * 1024)):
+        assert not probe.call("ipc-decode", raw=value)["valid"]
+    for request in ({"kind": 3, "requestId": "0", "envelope": envelope}, {"kind": 8, "requestId": "1", "envelope": envelope},
+                    {"kind": 3, "requestId": "18446744073709551616", "envelope": envelope}):
+        assert not probe.call("ipc-encode", request)["valid"]
+    return {"wirePackets": packets, "independentByteComparisons": 7, "rejectedHeaders": len(invalid_headers), "rejectedBodies": len(invalid_bodies) + 4, "rejectedEncodeInputs": 3}
+
+
 def run_contract_checks(binary, output, architecture, selected, timeout):
     probe = ContractProbe(binary, output, timeout)
     catalog = probe.call("catalog")
@@ -655,6 +821,10 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_lifecycle_contracts(probe, tool_validators))
             elif name == "test_native_launch_arguments":
                 result.update(check_native_launch(probe, architecture))
+            elif name == "test_native_component_builds":
+                result.update(check_native_components(probe, architecture, validators, catalog))
+            elif name == "test_ipc_wire_codec":
+                result.update(check_ipc_wire(probe))
         except Exception as error:
             result.update(status="failed", error=str(error))
         result["seconds"] = round(time.monotonic() - started, 3)

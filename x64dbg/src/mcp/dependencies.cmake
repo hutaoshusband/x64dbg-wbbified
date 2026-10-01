@@ -63,8 +63,12 @@ configure_file("${mcp_json_source_SOURCE_DIR}/LICENSE.MIT" "${mcp_notice_directo
 configure_file("${mcp_quickjs_source_SOURCE_DIR}/LICENSE" "${mcp_notice_directory}/quickjs.txt" COPYONLY)
 configure_file("${CMAKE_CURRENT_LIST_DIR}/notices/sqlite.txt" "${mcp_notice_directory}/sqlite.txt" COPYONLY)
 
-file(GLOB_RECURSE mcp_contract_inputs CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/common/*")
-list(APPEND mcp_contract_inputs "${CMAKE_CURRENT_LIST_FILE}" "${PROJECT_SOURCE_DIR}/cmake.toml")
+file(GLOB_RECURSE mcp_contract_inputs CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_LIST_DIR}/common/*"
+    "${CMAKE_CURRENT_LIST_DIR}/broker/*"
+    "${CMAKE_CURRENT_LIST_DIR}/connect/*"
+    "${PROJECT_SOURCE_DIR}/src/dbg/mcp/*")
+list(APPEND mcp_contract_inputs "${CMAKE_CURRENT_LIST_FILE}" "${CMAKE_CURRENT_LIST_DIR}/dependencies.json" "${PROJECT_SOURCE_DIR}/cmake.toml")
 list(SORT mcp_contract_inputs)
 set(mcp_build_input "${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_SIZEOF_VOID_P};${CMAKE_BUILD_TYPE};${CMAKE_MSVC_RUNTIME_LIBRARY};${CMAKE_CXX_FLAGS};${CMAKE_CXX_FLAGS_RELEASE}")
 foreach(mcp_input IN LISTS mcp_contract_inputs)

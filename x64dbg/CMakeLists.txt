@@ -1189,11 +1189,17 @@ if(X64DBG_BUILD_MCP) # mcp
 
 	set(mcp_common_SOURCES
 		cmake.toml
+		"src/mcp/common/bootstrap.cpp"
+		"src/mcp/common/bootstrap.h"
 		"src/mcp/common/contracts.cpp"
 		"src/mcp/common/contracts.h"
+		"src/mcp/common/ipc.cpp"
+		"src/mcp/common/ipc.h"
 		"src/mcp/common/launch.cpp"
 		"src/mcp/common/lifecycle.cpp"
 		"src/mcp/common/lifecycle.h"
+		"src/mcp/common/platform.cpp"
+		"src/mcp/common/platform.h"
 		"src/mcp/common/registry.cpp"
 		"src/mcp/common/registry.h"
 	)
@@ -1202,6 +1208,12 @@ if(X64DBG_BUILD_MCP) # mcp
 
 	target_sources(mcp_common PRIVATE ${mcp_common_SOURCES})
 	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${mcp_common_SOURCES})
+
+	target_compile_definitions(mcp_common PUBLIC
+		WIN32_LEAN_AND_MEAN
+		NOMINMAX
+		_WIN32_WINNT=0x0601
+	)
 
 	target_compile_features(mcp_common PUBLIC
 		cxx_std_17
@@ -1213,6 +1225,126 @@ if(X64DBG_BUILD_MCP) # mcp
 
 	target_link_libraries(mcp_common PUBLIC
 		mcp_json
+		advapi32
+		bcrypt
+	)
+
+endif()
+# Target: mcp_broker
+if(X64DBG_BUILD_MCP) # mcp
+	set(mcp_broker_SOURCES
+		cmake.toml
+		"src/mcp/broker/main.cpp"
+	)
+
+	add_executable(mcp_broker)
+
+	target_sources(mcp_broker PRIVATE ${mcp_broker_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${mcp_broker_SOURCES})
+
+	target_compile_features(mcp_broker PRIVATE
+		cxx_std_17
+	)
+
+	if(NOT TARGET mcp_common)
+		message(FATAL_ERROR "Target \"mcp_common\" referenced by \"mcp_broker\" does not exist!")
+	endif()
+
+	target_link_libraries(mcp_broker PRIVATE
+		mcp_common
+	)
+
+	if(MSVC) # msvc
+		target_link_options(mcp_broker PRIVATE
+			"/MANIFEST:EMBED"
+			"/MANIFESTUAC:level='asInvoker' uiAccess='false'"
+		)
+	endif()
+
+	set_target_properties(mcp_broker PROPERTIES
+		OUTPUT_NAME
+			wininspect-mcp
+		EXCLUDE_FROM_ALL
+			ON
+	)
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT mcp_broker)
+	endif()
+
+endif()
+# Target: mcp_connect
+if(X64DBG_BUILD_MCP) # mcp
+	set(mcp_connect_SOURCES
+		cmake.toml
+		"src/mcp/connect/main.cpp"
+	)
+
+	add_executable(mcp_connect)
+
+	target_sources(mcp_connect PRIVATE ${mcp_connect_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${mcp_connect_SOURCES})
+
+	target_compile_features(mcp_connect PRIVATE
+		cxx_std_17
+	)
+
+	if(NOT TARGET mcp_common)
+		message(FATAL_ERROR "Target \"mcp_common\" referenced by \"mcp_connect\" does not exist!")
+	endif()
+
+	target_link_libraries(mcp_connect PRIVATE
+		mcp_common
+	)
+
+	if(MSVC) # msvc
+		target_link_options(mcp_connect PRIVATE
+			"/MANIFEST:EMBED"
+			"/MANIFESTUAC:level='asInvoker' uiAccess='false'"
+		)
+	endif()
+
+	set_target_properties(mcp_connect PROPERTIES
+		OUTPUT_NAME
+			wininspect-mcp-connect
+		EXCLUDE_FROM_ALL
+			ON
+	)
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT mcp_connect)
+	endif()
+
+endif()
+# Target: mcp_worker
+if(X64DBG_BUILD_MCP) # mcp
+	set(mcp_worker_SOURCES
+		cmake.toml
+		"src/dbg/mcp/worker.cpp"
+		"src/dbg/mcp/worker.h"
+	)
+
+	add_library(mcp_worker STATIC)
+
+	target_sources(mcp_worker PRIVATE ${mcp_worker_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${mcp_worker_SOURCES})
+
+	target_compile_features(mcp_worker PUBLIC
+		cxx_std_17
+	)
+
+	target_include_directories(mcp_worker PUBLIC
+		"src/dbg/mcp"
+	)
+
+	if(NOT TARGET mcp_common)
+		message(FATAL_ERROR "Target \"mcp_common\" referenced by \"mcp_worker\" does not exist!")
+	endif()
+
+	target_link_libraries(mcp_worker PUBLIC
+		mcp_common
 	)
 
 endif()
@@ -1236,8 +1368,13 @@ if(X64DBG_BUILD_MCP) # mcp
 		message(FATAL_ERROR "Target \"mcp_common\" referenced by \"mcp_contract_fixture\" does not exist!")
 	endif()
 
+	if(NOT TARGET mcp_worker)
+		message(FATAL_ERROR "Target \"mcp_worker\" referenced by \"mcp_contract_fixture\" does not exist!")
+	endif()
+
 	target_link_libraries(mcp_contract_fixture PRIVATE
 		mcp_common
+		mcp_worker
 		mcp_http
 		mcp_sqlite
 		mcp_quickjs

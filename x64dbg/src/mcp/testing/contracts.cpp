@@ -1,6 +1,8 @@
 #include "contracts.h"
 #include "registry.h"
 #include "lifecycle.h"
+#include "ipc.h"
+#include "worker.h"
 #include <boost/beast/http.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/version.hpp>
@@ -228,6 +230,13 @@ int main(int argc, char** argv)
             reply = result_examples();
         else if(mode == "dependencies" && argc == 2)
             reply = dependency_probe();
+        else if(mode == "worker-build-info" && argc == 2)
+        {
+            const auto information = worker_build_info();
+            reply = checked_reply(information);
+            if(const auto* value = std::get_if<Json>(&information))
+                reply["information"] = *value;
+        }
         else
         {
             const auto bytes = read_input();
@@ -235,6 +244,23 @@ int main(int argc, char** argv)
                 reply = {{"valid", false}, {"error", error_json(*error)}};
             else if(mode == "http" && argc == 2)
                 reply = http_probe(std::get<std::string>(bytes));
+            else if(mode == "ipc-header" && argc == 2)
+            {
+                const auto header = decode_ipc_header(std::get<std::string>(bytes));
+                reply = checked_reply(header);
+                if(const auto* value = std::get_if<IpcHeader>(&header))
+                    reply["header"] = ipc_header_json(*value);
+            }
+            else if(mode == "ipc-decode" && argc == 2)
+            {
+                const auto frame = decode_ipc_frame(std::get<std::string>(bytes));
+                reply = checked_reply(frame);
+                if(const auto* value = std::get_if<IpcFrame>(&frame))
+                {
+                    reply["header"] = ipc_header_json(value->header);
+                    reply["envelope"] = value->envelope;
+                }
+            }
             else
             {
                 const auto parsed = parse_bounded_json(std::get<std::string>(bytes));
@@ -245,6 +271,31 @@ int main(int argc, char** argv)
                     const auto& input = std::get<Json>(parsed);
                     if(mode == "launch-plan" && argc == 2)
                         reply = launch_plan_probe(input);
+                    else if(mode == "ipc-encode" && argc == 2)
+                    {
+                        const auto schema = with_contract_definitions(closed_object_schema({{"kind", bounded_integer_schema(1, 7)},
+                            {"requestId", reference_schema("Decimal64")}, {"envelope", reference_schema("IpcEnvelope")}}, {"kind", "requestId", "envelope"}));
+                        if(auto error = validate_schema(schema, input))
+                            reply = {{"valid", false}, {"error", error_json(*error)}};
+                        else
+                        {
+                            const auto frame = encode_ipc_frame(static_cast<IpcMessageKind>(input.at("kind").get<std::uint16_t>()),
+                                std::get<std::uint64_t>(parse_decimal64(input.at("requestId").get<std::string>())), input.at("envelope"));
+                            reply = checked_reply(frame);
+                            if(const auto* bytes = std::get_if<std::string>(&frame))
+                            {
+                                constexpr char digits[] = "0123456789abcdef";
+                                std::string encoded;
+                                for(const auto character : *bytes)
+                                {
+                                    const auto byte = static_cast<unsigned char>(character);
+                                    encoded.push_back(digits[byte >> 4]);
+                                    encoded.push_back(digits[byte & 15]);
+                                }
+                                reply["bytesHex"] = std::move(encoded);
+                            }
+                        }
+                    }
                     else if(mode == "effects" && argc == 3)
                     {
                         const auto required = required_tool_effects(argv[2], input);
@@ -311,7 +362,7 @@ int main(int argc, char** argv)
                         }
                     }
                     else
-                        throw std::runtime_error("Expected catalog, registry, result-cases, dependencies, http, validate, normalize, range, tool-input, tool-output or call mode");
+                        throw std::runtime_error("Unknown development fixture mode");
                 }
             }
         }

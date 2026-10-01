@@ -294,14 +294,47 @@ condition = "mcp"
 sources = ["src/mcp/common/*.cpp", "src/mcp/common/*.h"]
 include-before = ["src/mcp/dependencies.cmake"]
 include-directories = ["src/mcp/common"]
-link-libraries = ["mcp_json"]
+link-libraries = ["mcp_json", "advapi32", "bcrypt"]
+compile-features = ["cxx_std_17"]
+compile-definitions = ["WIN32_LEAN_AND_MEAN", "NOMINMAX", "_WIN32_WINNT=0x0601"]
+
+[target.mcp_broker]
+type = "executable"
+condition = "mcp"
+sources = ["src/mcp/broker/*.cpp"]
+link-libraries = ["::mcp_common"]
+compile-features = ["cxx_std_17"]
+msvc.link-options = ["/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
+
+[target.mcp_broker.properties]
+OUTPUT_NAME = "wininspect-mcp"
+EXCLUDE_FROM_ALL = true
+
+[target.mcp_connect]
+type = "executable"
+condition = "mcp"
+sources = ["src/mcp/connect/*.cpp"]
+link-libraries = ["::mcp_common"]
+compile-features = ["cxx_std_17"]
+msvc.link-options = ["/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
+
+[target.mcp_connect.properties]
+OUTPUT_NAME = "wininspect-mcp-connect"
+EXCLUDE_FROM_ALL = true
+
+[target.mcp_worker]
+type = "static"
+condition = "mcp"
+sources = ["src/dbg/mcp/*.cpp", "src/dbg/mcp/*.h"]
+include-directories = ["src/dbg/mcp"]
+link-libraries = ["::mcp_common"]
 compile-features = ["cxx_std_17"]
 
 [target.mcp_contract_fixture]
 type = "executable"
 condition = "mcp"
 sources = ["src/mcp/testing/contracts.cpp"]
-link-libraries = ["::mcp_common", "mcp_http", "mcp_sqlite", "mcp_quickjs"]
+link-libraries = ["::mcp_common", "::mcp_worker", "mcp_http", "mcp_sqlite", "mcp_quickjs"]
 compile-features = ["cxx_std_17"]
 msvc.link-options = ["/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
 

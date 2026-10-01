@@ -496,7 +496,18 @@ const std::vector<ContractDefinition>& contract_registry()
             {"ResultWarning", "A bounded nonsecret warning that does not replace an execution error.", closed_object_schema({{"code", id}, {"message", text_schema("utf8-text", 4096)}}, {"code", "message"})},
             {"ResultTimings", "Exact unsigned 64-bit UTC milliseconds and monotonic elapsed/queue microseconds.", closed_object_schema({{"startedUtcMs", decimal}, {"elapsedUs", decimal}, {"queueUs", decimal}}, {"startedUtcMs", "elapsedUs", "queueUs"})},
             {"EffectObservation", "A per-step observation retained when an operation fails, is cancelled or is uncertain.", closed_object_schema({{"stepId", id}, {"status", enum_schema({"applied", "restored", "failed", "unknown"})}, {"summary", text_schema("utf8-text", 4096)}}, {"stepId", "status", "summary"})},
-            {"ResultPagination", "A stable snapshot version and either complete coverage or an explicit continuation cursor.", {{"oneOf", Json::array({page_complete, page_more})}}}
+            {"ResultPagination", "A stable snapshot version and either complete coverage or an explicit continuation cursor.", {{"oneOf", Json::array({page_complete, page_more})}}},
+            {"IpcEnvelope", "Bounded wire context and payload; identity and authentication claims are revalidated against the actual pipe peer.", closed_object_schema({
+                {"context", {{"oneOf", Json::array({closed_object_schema({{"brokerGeneration", decimal}}, {"brokerGeneration"}), closed_object_schema({{"instanceId", id}}, {"instanceId"}), target, paused})}}},
+                {"deadlineUtcMs", decimal}, {"authenticationContextId", id},
+                {"payload", {{"type", "object"}, {"properties", Json::object()}, {"additionalProperties", true}}}}, {"context", "deadlineUtcMs", "authenticationContextId", "payload"})},
+            {"NativeProcessIdentity", "Actual owning-process token, creation identity and handle-read executable hash; a received claim does not authenticate a peer.", closed_object_schema({
+                {"pid", integer_schema(1, std::numeric_limits<std::uint32_t>::max())}, {"creationTime", decimal}, {"sessionId", integer_schema(0, std::numeric_limits<std::uint32_t>::max())},
+                {"userSid", text_schema("utf8-text", 184)}, {"logonSid", text_schema("utf8-text", 184)}, {"integrity", enum_schema({"untrusted", "low", "medium", "high", "system", "protected"})},
+                {"elevated", {{"type", "boolean"}}}, {"architecture", enum_schema({"x32", "x64"})}, {"image", closed_object_schema({
+                    {"path", text_schema("windows-absolute-path", 32767)}, {"sha256", text_schema("sha256", 64)}, {"size", decimal},
+                    {"volumeSerial", integer_schema(0, std::numeric_limits<std::uint32_t>::max())}, {"fileIndex", decimal}}, {"path", "sha256", "size", "volumeSerial", "fileIndex"})}},
+                {"pid", "creationTime", "sessionId", "userSid", "logonSid", "integrity", "elevated", "architecture", "image"})}
         };
         for(auto& entry : entries)
         {
