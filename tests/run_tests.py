@@ -425,7 +425,8 @@ def main():
         names = ["test_native_runtime_surface_inventory"]
     if arguments.phase == "fixtures":
         names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles", "test_native_memory_oracles",
-                 "test_native_database_oracles", "test_native_stale_breakpoint_oracles", "test_native_execution_oracles", "test_native_register_oracles"]
+                 "test_native_database_oracles", "test_native_stale_breakpoint_oracles", "test_native_execution_oracles", "test_native_register_oracles",
+                 "test_native_module_oracles"]
     if arguments.phase == "runner":
         names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
@@ -517,6 +518,9 @@ def main():
                     run_native_execution_oracles(environment, architecture_results)
                 if "test_native_register_oracles" in selected_names:
                     run_native_register_oracles(environment, architecture_results)
+                if "test_native_module_oracles" in selected_names:
+                    from module_checks import run_module_oracles
+                    run_module_oracles(environment, architecture_results, native_fixture_identity, run_owned_native_command)
                 if "test_native_database_oracles" in selected_names:
                     from database_checks import run_database_oracles
                     run_database_oracles(environment, architecture_results, arguments.engine, arguments.timeout,

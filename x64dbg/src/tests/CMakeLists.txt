@@ -170,6 +170,7 @@ set(X64DBG_STANDARD_TESTS
     swbp_stale
     trace_cmd_condition
     database_callbacks
+    random_dll
 )
 
 foreach(test_name IN LISTS X64DBG_STANDARD_TESTS)
@@ -205,4 +206,9 @@ x64dbg_add_test(
 
 x64dbg_add_membp_test()
 
-# random_dll intentionally remains excluded while its scaffold stays disabled.
+add_library(test_random_dll_library SHARED random_dll/test_dll.cpp)
+x64dbg_apply_test_defaults(test_random_dll_library)
+set_target_properties(test_random_dll_library PROPERTIES OUTPUT_NAME random)
+x64dbg_set_output_dir(test_random_dll_library "${X64DBG_TEST_OUTPUT_DIR}")
+target_link_libraries(test_random_dll_target PRIVATE psapi)
+add_dependencies(test_random_dll_target test_random_dll_library)

@@ -1,0 +1,74 @@
+settingset Engine, HideDebugger, 0
+settingset Events, TlsCallbacks, 0
+settingset Events, SystemBreakpoint, 1
+settingset Events, EntryBreakpoint, 1
+init tests/random_dll.exe
+mov startup_stops, 0
+await_entry:
+cmp cip, random_dll:entry
+je entry_ready
+inc startup_stops
+testassert startup_stops <= .64, "module target entry stop limit"
+run
+jmp await_entry
+entry_ready:
+testassert cip == random_dll:entry, "module target stopped at its actual entry"
+mov dword:[random_dll:gModuleMode], 1
+testassert dword:[random_dll:gModuleMode] == 1, "module mode write readback"
+bp random_dll:ModuleReady
+bp random_dll:ModuleLoaded
+bp random_dll:ModuleReferenceReleased
+bp random_dll:ModuleUnloaded
+bp random_dll:ModuleFinish
+run
+testassert cip == random_dll:ModuleReady, "module target reached its prepared directory"
+bpd random_dll:ModuleReady
+rtr
+modulecheck ready
+sti
+run
+testassert cip == random_dll:ModuleLoaded, "first DLL reached its actual loaded stop"
+testassert arg.get(0) == 0, "first loaded stop has the correct index"
+bpd random_dll:ModuleLoaded
+rtr
+modulecheck loaded0
+sti
+run
+testassert cip == random_dll:ModuleReferenceReleased, "first DLL released only its extra reference"
+bpd random_dll:ModuleReferenceReleased
+rtr
+modulecheck reference
+sti
+run
+testassert cip == random_dll:ModuleUnloaded, "first DLL completed its final release"
+testassert arg.get(0) == 0, "first unloaded stop has the correct index"
+bpd random_dll:ModuleUnloaded
+rtr
+modulecheck unloaded0
+bpe random_dll:ModuleLoaded
+bpe random_dll:ModuleUnloaded
+sti
+run
+testassert cip == random_dll:ModuleLoaded, "second DLL reached its actual loaded stop"
+testassert arg.get(0) == 1, "second loaded stop has the correct index"
+bpd random_dll:ModuleLoaded
+rtr
+modulecheck loaded1
+sti
+run
+testassert cip == random_dll:ModuleUnloaded, "second DLL completed its final release"
+testassert arg.get(0) == 1, "second unloaded stop has the correct index"
+bpd random_dll:ModuleUnloaded
+rtr
+modulecheck unloaded1
+sti
+run
+testassert cip == random_dll:ModuleFinish, "module target reached its actual finish"
+bpd random_dll:ModuleFinish
+rtr
+modulecheck finish
+sti
+run
+moduleexit 43
+testfinalize
+ret
