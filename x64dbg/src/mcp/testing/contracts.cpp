@@ -150,7 +150,7 @@ Json normalized_contract(std::string_view name, const Json& input)
 
 Json result_examples()
 {
-    const RecoveryRoute recovery{"jobs_get", RetryPolicy::AfterReconciliation, "Inspect the retained operation before another attempt"};
+    const RecoveryRoute recovery{"operation_reconcile", RetryPolicy::AfterReconciliation, "Inspect the retained operation before another attempt"};
     const VerificationEvidence evidence{"fixture_observation", "native_contract_fixture", "Typed serialization fixture", {}, {}};
     ResultHeader header{{"operation-fixture"}, PausedContext{{{"instance-1"}, {"target-1"}, UINT64_MAX}, 9007199254740993ull, 1}, UINT64_MAX,
         {VerificationStatus::Verified, {evidence}, {}}, {}, {9007199254740993ull, UINT64_MAX, 0}};

@@ -145,7 +145,7 @@ def contract_examples():
         "Hex64": [(True, "0x0"), (True, "0xffffffffffffffff"), (False, 18446744073709551615), (False, "0x10000000000000000"), (False, "0x00"), (False, "0xFF")],
         "Decimal64": [(True, "0"), (True, "18446744073709551615"), (False, "18446744073709551616"), (False, "01"), (False, "-1"), (False, 9007199254740993)]
     }
-    recovery = {"capabilityId": "jobs_get", "retry": "after_reconciliation", "reason": "Inspect the operation"}
+    recovery = {"capabilityId": "operation_reconcile", "retry": "after_reconciliation", "reason": "Inspect the operation"}
     evidence = {"kind": "readback", "source": "native_fixture", "summary": "Observed exact bytes"}
     examples.update({
         "LibraryRef": [(True, {"namespaceId": "private-1", "objectId": "script-1", "revision": "rev-2"}), (False, {"namespaceId": "private-1", "objectId": "script-1"})],
@@ -184,6 +184,7 @@ def check_results(probe, formats):
         assert result["timings"]["elapsedUs"] == "18446744073709551615"
     mutations = []
     assert results[0]["jobId"] == "job-fixture" and results[5]["effects"][0]["status"] == "applied" and results[5]["partial"] is True
+    assert results[2]["recovery"]["capabilityId"] == results[5]["reconciliation"]["capabilityId"] == results[6]["verification"]["followUp"]["capabilityId"] == "operation_reconcile"
     for index, field in ((0, "operationId"), (1, "jobId"), (2, "effects"), (2, "recovery"), (5, "reconciliation"), (5, "effects")):
         changed = copy.deepcopy(results[index])
         del changed[field]
