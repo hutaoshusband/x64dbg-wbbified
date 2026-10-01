@@ -207,10 +207,10 @@ void append_lifecycle_tools(std::vector<ToolDefinition>& tools)
     add("debugger_instances", "List live and stale debugger instances with exact process identity, rights, architecture and engine readiness.", instances_input, page_data(instance),
         {Effect::Inspect}, Executor::Broker, StateRequirement::Broker, "Matching live/stale registration records reconcile to actual worker process identities.", {"debugger_start", "server_health"}, {"A-01", "A-02", "A-10"}, "broker/instances", true);
     add("debugger_start", "Start the selected ordinary or administrator GUI/headless engine. Administrator requests require an additional elevation grant and real visible Windows consent.",
-        closed_object_schema({{"architecture", architecture}, {"mode", mode}, {"privilege", enum_schema({"user", "admin"})}, {"installationId", id}, {"profileId", id}, {"idempotencyKey", id}}, {"architecture", "mode", "privilege"}),
+        closed_object_schema({{"architecture", architecture}, {"mode", mode}, {"privilege", enum_schema({"user", "administrator"})}, {"installationId", id}, {"profileId", id}, {"idempotencyKey", id}}, {"architecture", "mode", "privilege"}),
         closed_object_schema({{"instance", instance}, {"launchJobId", id}}, {"instance", "launchJobId"}), {Effect::Execute}, Executor::Broker, StateRequirement::Broker,
         "Requested engine is registered and ready with observed process architecture/integrity; pending consent or launch is accepted rather than completed.", {"job_get", "debugger_instances"}, {"A-01", "A-11", "A-14", "A-15", "A-16"}, "broker/worker_launch", false, true,
-        {{"privilege", "admin", {Effect::Elevate}}});
+        {{"privilege", "administrator", {Effect::Elevate}}});
     add("debugger_focus", "Focus the actual GUI instance; a headless instance returns explicit unavailability.", instance_input(),
         closed_object_schema({{"instanceId", id}, {"visible", {{"type", "boolean"}}}, {"focused", {{"type", "boolean"}}}}, {"instanceId", "visible", "focused"}), {Effect::Configure}, Executor::Gui, StateRequirement::InstanceReady,
         "Actual GUI visibility/focus is observed after dispatch on the GUI owner thread.", {"debugger_instances"}, {"A-11", "A-51"}, "src/gui/Src/MainWindow.cpp", true);

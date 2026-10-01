@@ -367,12 +367,13 @@ def check_lifecycle_contracts(probe, validators):
         (False, "target_command_line_set", {**mutation, "expectedVersion": "1"}),
         (False, "target_restart", {**target, "launchOverrides": {}}),
         (False, "debugger_start", {**valid["debugger_start"], "privilege": "silent_admin"}),
+        (False, "debugger_start", {**valid["debugger_start"], "privilege": "admin"}),
         (False, "debugger_settings_set", {**valid["debugger_settings_set"], "changes": [{"section": "Engine", "key": "Test", "value": {"kind": "uint64", "value": 9007199254740993}}]})])
     for index, (expected, name, value) in enumerate(cases):
         assert validators[(name, "input")].is_valid(value) == expected, f"Independent lifecycle case {index}"
         assert probe.call("tool-input", value, name)["valid"] == expected, f"Native lifecycle case {index}"
     assert probe.call("effects", valid["debugger_start"], "debugger_start") == {"valid": True, "effects": ["execute"]}
-    assert probe.call("effects", {**valid["debugger_start"], "privilege": "admin"}, "debugger_start") == {"valid": True, "effects": ["execute", "elevate"]}
+    assert probe.call("effects", {**valid["debugger_start"], "privilege": "administrator"}, "debugger_start") == {"valid": True, "effects": ["execute", "elevate"]}
     for name, value in valid.items():
         rejected = probe.call("call", value, name)
         assert not rejected["valid"] and rejected["error"]["code"] == "unsupported_capability"
