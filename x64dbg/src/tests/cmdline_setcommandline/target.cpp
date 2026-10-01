@@ -55,6 +55,8 @@ int wmain(int argc, wchar_t** argv)
     }
 
     InterlockedExchange(&ObservedReady, 1);
-    __debugbreak();
+    if(!WriteNormalCommandLineObservation(ObservedReady, ObservedCrtArgc, ObservedWinArgc, ObservedCommandLine,
+                                        ObservedCrtArgv1, ObservedCrtArgv2, ObservedWinArgv1, ObservedWinArgv2))
+        __debugbreak();
     return 0;
 }

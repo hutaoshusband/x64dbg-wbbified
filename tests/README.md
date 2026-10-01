@@ -11,7 +11,7 @@ Run `python tests/run_tests.py` from the repository root. This is the shared ent
 | `defects` | Actual target argument delivery and executable assembly patch; known external failures remain failures |
 | `contracts` | Authenticated responses for every catalog tool with empty arguments and no target |
 | `surface` | GUI-thread inventory of menus, widgets, commands and script providers; shipped plugin resource dialogs, menus and configuration keys |
-| `fixtures` | Five fixture executables run normally with independent expected markers, arguments and exit codes |
+| `fixtures` | Five standalone fixtures and two source-built native argument fixtures run normally with independent expected markers, arguments and exit codes |
 | `inventory` | Source registration/form candidates reconciled with the captured legacy catalog and optional runtime surface |
 | `build` | Fresh Release source builds of the GUI debugger, headless debugger and existing native fixtures |
 | `native` | Existing headless regression bundles, preserving their assertion failures and process exit results |
@@ -20,8 +20,10 @@ Run `python tests/run_tests.py` from the repository root. This is the shared ent
 `--arch x64`, `--arch x32` and `--arch all` select architectures. `--case` can be repeated; baseline case selections accept globs, while native selections use existing native bundle IDs. `--engine` selects TitanEngine, GleeBug, StaticEngine or all available backends for the native phase. `--list` lists cases without launching or writing artifacts. `--timeout` bounds requests and execution waits between 1 and 60 seconds. Defaults are x64, baseline, and 45 seconds.
 
 ```powershell
-python tests/run_tests.py --phase fixtures --arch all
 python tests/run_tests.py --phase build --arch all
+python tests/run_tests.py --phase fixtures --arch all
+python tests/run_tests.py --phase fixtures --arch all --case test_fixture_oracles
+python tests/run_tests.py --phase fixtures --arch all --case test_native_argument_oracles
 python tests/run_tests.py --phase native --arch all --case commandparser --case script_run_exit
 python tests/run_tests.py --phase contracts
 python tests/run_tests.py --phase surface
@@ -109,6 +111,8 @@ The x64 external plugin is the available behavioral baseline. The shipped x32 pl
 Build phases use new out-of-tree CMake directories. Existing local Qt SDKs may supply the configured Qt package, while build output remains in the debugger's ignored `bin/<arch>` directory. No obsolete cached source directory is reused. Build receipts retain actual commands, source inputs and artifact hashes.
 
 The native `cmdline_init` and `cmdline_setcommandline` fixtures have a target TLS callback and use the static MSVC runtime. Their startup assertions require a pause before that callback executes. This makes `SetCmdline` occur before the target runtime captures and parses its command line; a dynamic runtime can already have cached it in DLL initialization. Their scripts advance through at most 64 stops until the target sets `ObservedReady`, then check the exact CRT arguments, Windows arguments and command-line text. Additional DLL TLS stops cannot stand in for the target observation. The launch fixture also restarts with different explicit arguments after saving its database. Settings apply only to the isolated test profile.
+
+`test_native_argument_oracles` requires those native fixtures to be built first. It launches the exact source-built executables normally with `WININSPECT_TEST_NORMAL=1` only in their child environment. They emit their captured values as ASCII fields with UTF-16 bytes represented in hex and exit instead of breaking. The checker supplies Unicode, embedded quotes and a trailing backslash independently, compares both argument parsers and the complete raw command line, and records actual process identities and executable/output hashes. Omitting the environment selection preserves their debugger observation break. `--case test_fixture_oracles` remains available for the five independently built standalone fixtures.
 
 Evidence includes requests without authentication headers, catalog contracts, target markers, compiler output, fixture hashes, process modules and verification summaries. Failed and unexecuted requested cases remain visible. A contracts or inventory pass verifies capture/reconciliation; it does not claim that the external tool's behavior or a native replacement is correct.
 

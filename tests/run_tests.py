@@ -14,7 +14,56 @@ sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
 import cases
-from wi_driver import McpError, ROOT, SuiteEnvironment, WinInspect, build_debugger, build_targets, read_kv, write_json
+from wi_driver import McpError, OwnedJob, ROOT, SuiteEnvironment, WinInspect, build_debugger, build_targets, file_identity, process_identity, read_kv, write_json
+
+
+def run_native_argument_oracles(environment, results):
+    intended_arguments = ["Hu Tao \u2764\ufe0f", 'quoted "word"\\']
+    observations = []
+    normal_environment = {**os.environ, "WININSPECT_TEST_NORMAL": "1"}
+    for name in ("cmdline_init", "cmdline_setcommandline"):
+        binary = ROOT / "x64dbg" / "bin" / environment.architecture / "tests" / f"{name}.exe"
+        if not binary.is_file():
+            raise McpError("Native argument fixtures are missing; run --phase build for the selected architecture")
+        command = [str(binary), *intended_arguments]
+        binary_identity = file_identity(binary)
+        image = binary.read_bytes()
+        assert len(image) >= 64 and image[:2] == b"MZ", f"Native fixture {name} has no PE header"
+        pe_offset = int.from_bytes(image[0x3c:0x40], "little")
+        assert pe_offset <= len(image) - 6 and image[pe_offset:pe_offset + 4] == b"PE\0\0"
+        machine = int.from_bytes(image[pe_offset + 4:pe_offset + 6], "little")
+        assert machine == (0x8664 if environment.architecture == "x64" else 0x14c), f"Native fixture {name} has the wrong architecture"
+        ownership = OwnedJob()
+        process = None
+        try:
+            process = subprocess.Popen(command, cwd=environment.targets, env=normal_environment,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+            identity = process_identity(process)
+            ownership.assign(process)
+            stdout, stderr = process.communicate(timeout=10)
+        finally:
+            if process is not None and process.poll() is None:
+                ownership.close()
+                process.kill()
+                process.communicate()
+            ownership.close()
+        stdout_path = environment.root / f"{name}-normal.txt"
+        stdout_path.write_bytes(stdout)
+        observed = read_kv(stdout_path)
+        assert process.returncode == 0 and not stderr, f"Normal native fixture {name} failed"
+        assert {key: observed[key] for key in ("ready", "startupCallback", "crtArgc", "winArgc")} == {
+            "ready": "1", "startupCallback": "1", "crtArgc": "3", "winArgc": "3"}
+        decoded = {key: bytes.fromhex(observed[key]).decode("utf-16-le")
+                   for key in ("commandLine", "crtArgv1", "crtArgv2", "winArgv1", "winArgv2")}
+        assert [decoded["crtArgv1"], decoded["crtArgv2"]] == intended_arguments
+        assert [decoded["winArgv1"], decoded["winArgv2"]] == intended_arguments
+        assert decoded["commandLine"] == subprocess.list2cmdline(command)
+        assert file_identity(binary) == binary_identity
+        observations.append({"name": name, "binary": binary_identity, "command": command, "processIdentity": identity,
+                             "exitCode": process.returncode, "stdout": file_identity(stdout_path), "observed": observed,
+                             "intendedArguments": intended_arguments, "machine": machine, "debuggerUsed": False})
+    results.append({"name": "test_native_argument_oracles", "status": "verified", "oracle": observations})
+    print(f"[VERIFIED] Two normal native {environment.architecture} argument outcomes", flush=True)
 
 
 def run_fixture_oracles(environment, results):
@@ -203,8 +252,10 @@ def main():
     native_surface = arguments.phase == "surface" and arguments.surface_provider == "native"
     if native_surface:
         names = ["test_native_runtime_surface_inventory"]
-    if arguments.phase in ("fixtures", "inventory"):
-        names = ["test_fixture_oracles" if arguments.phase == "fixtures" else "test_source_inventory"]
+    if arguments.phase == "fixtures":
+        names = ["test_fixture_oracles", "test_native_argument_oracles"]
+    if arguments.phase == "inventory":
+        names = ["test_source_inventory"]
     if arguments.phase in ("native", "build"):
         names = [arguments.phase]
     if arguments.phase == "mcp-contracts":
@@ -265,7 +316,7 @@ def main():
         environment = SuiteEnvironment(run_root / architecture, architecture, arguments.deploy or deployment)
         architecture_results = []
         try:
-            if not native_surface:
+            if not native_surface and (arguments.phase != "fixtures" or "test_fixture_oracles" in selected_names):
                 build_targets(environment)
             if arguments.phase == "surface":
                 from inventory import build_inventory_fixture
@@ -273,7 +324,10 @@ def main():
             if native_surface:
                 run_native_surface(environment, architecture_results, arguments.timeout)
             if arguments.phase == "fixtures":
-                run_fixture_oracles(environment, architecture_results)
+                if "test_fixture_oracles" in selected_names:
+                    run_fixture_oracles(environment, architecture_results)
+                if "test_native_argument_oracles" in selected_names:
+                    run_native_argument_oracles(environment, architecture_results)
             functional = [function for function in functions if function.__name__ in selected_names]
             if functional:
                 run_functional(environment, functional, architecture_results, arguments.timeout)
