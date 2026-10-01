@@ -1,0 +1,11 @@
+# exceptions_unwind
+
+The source-built x64/x32 reference has three explicitly selected paths. Mode 1 executes a real UD2 fault, reaches an SEH handler through a nested finally scope, restores the caller context and exits 73. Mode 3 changes the exception context to the following instruction and accumulator value 2468ACE0, executes that instruction, completes the normal finally path and exits 74. Mode 2 declines the exception and terminates with actual Windows code C000001D after a second-chance debugger event.
+
+The x64 MASM frames save nonvolatile registers and XMM6 with actual unwind metadata. The probe changes those values before its fault; the wrapper's executed stores must recover its independently seeded caller values after handling. The x32 path uses actual compiled SEH scopes and preserves its caller's integer registers. x32 XMM registers are volatile; the fixture does not claim x64 SIMD preservation semantics for that ABI.
+
+The target records the real fault stack, source instruction, original accumulator, valid SIMD exception context, nested return addresses, handler/finally/continuation markers and executed post-fault value. The normal checker compares 34 completed output fields with independently supplied canaries, source PE exports and exact direct-call bytes. The unhandled reference checks its search fields and actual OS exit.
+
+Select normal execution through child-only WININSPECT_TEST_NORMAL=1 and WININSPECT_TEST_EXCEPTION_MODE=1, 2 or 3. Missing or malformed explicit normal modes exit 238. Without normal selection or a debugger mode write, the default exits zero.
+
+One native scenario runs all three paths in fresh target sessions. It reaches the actual entry within 64 stops, selects and reads back the mode, installs an exception breakpoint for all chances, and explicitly passes the stopped exception to the target. Bounded raw Windows event records verify chance, code, source, PID and thread; breakpoint callbacks supply a separate count. Paused checks verify the actual register context and native call stack against target-owned stack/return observations. Callback code performs no file I/O, debugger calls, waits or logging. Actual target instructions and the exit callback establish the final result. Debugger hiding and unrelated DLL TLS stops are disabled only in the isolated test profile.

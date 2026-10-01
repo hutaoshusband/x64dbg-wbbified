@@ -171,6 +171,7 @@ set(X64DBG_STANDARD_TESTS
     trace_cmd_condition
     database_callbacks
     random_dll
+    exceptions_unwind
 )
 
 foreach(test_name IN LISTS X64DBG_STANDARD_TESTS)
@@ -180,10 +181,15 @@ endforeach()
 enable_language(ASM_MASM)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_sources(test_issue3803_target PRIVATE "issue3803/register_context64.asm")
+    target_sources(test_exceptions_unwind_target PRIVATE "exceptions_unwind/fault64.asm")
 else()
     target_sources(test_issue3803_target PRIVATE "issue3803/register_context32.asm")
+    target_sources(test_exceptions_unwind_target PRIVATE "exceptions_unwind/fault32.asm")
 endif()
 target_link_options(test_issue3803_target PRIVATE "LINKER:/EXPORT:RegisterProbe" "LINKER:/EXPORT:RegisterStop")
+target_link_options(test_exceptions_unwind_target PRIVATE
+    "LINKER:/EXPORT:ExceptionRun" "LINKER:/EXPORT:ExceptionProbe" "LINKER:/EXPORT:ExceptionFault"
+    "LINKER:/EXPORT:ExceptionAfterFault" "LINKER:/EXPORT:ExceptionAfterHandled")
 
 if(MSVC)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)

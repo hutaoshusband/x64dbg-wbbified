@@ -1,0 +1,75 @@
+settingset Engine, HideDebugger, 0
+settingset Events, TlsCallbacks, 0
+settingset Events, SystemBreakpoint, 1
+settingset Events, EntryBreakpoint, 1
+mov exception_mode, 1
+call run_exception_mode
+mov exception_mode, 3
+call run_exception_mode
+mov exception_mode, 2
+call run_exception_mode
+testfinalize
+ret
+
+run_exception_mode:
+init tests/exceptions_unwind.exe
+mov startup_stops, 0
+await_entry:
+cmp cip, exceptions_unwind:entry
+je entry_ready
+inc startup_stops
+testassert startup_stops <= .64, "exception target entry stop limit"
+run
+jmp await_entry
+entry_ready:
+testassert cip == exceptions_unwind:entry, "exception target reached its actual entry"
+mov dword:[exceptions_unwind:gExceptionMode], exception_mode
+testassert dword:[exceptions_unwind:gExceptionMode] == exception_mode, "exception mode write readback"
+bp exceptions_unwind:ExceptionReady
+bp exceptions_unwind:ExceptionFinish
+run
+testassert cip == exceptions_unwind:ExceptionReady, "exception target reached its real ready stop"
+bpd exceptions_unwind:ExceptionReady
+rtr
+cmp exception_mode, 1
+je prepare_handled
+cmp exception_mode, 3
+je prepare_continued
+exceptionprepare 2
+jmp prepared
+prepare_handled:
+exceptionprepare 1
+jmp prepared
+prepare_continued:
+exceptionprepare 3
+prepared:
+DeleteExceptionBPX
+SetExceptionBPX C000001D, all
+sti
+run
+exceptioncheck first
+con 1
+run
+cmp exception_mode, 2
+je unhandled
+testassert cip == exceptions_unwind:ExceptionFinish, "exception target reached its actual continuation finish"
+bpd exceptions_unwind:ExceptionFinish
+rtr
+exceptioncheck result
+sti
+DeleteExceptionBPX
+run
+cmp exception_mode, 1
+je exited_handled
+exceptionexit 74
+ret
+exited_handled:
+exceptionexit 73
+ret
+unhandled:
+exceptioncheck second
+DeleteExceptionBPX
+con 1
+run
+exceptionexit 3221225501
+ret
