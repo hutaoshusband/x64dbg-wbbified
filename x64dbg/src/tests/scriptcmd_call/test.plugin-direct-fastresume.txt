@@ -1,8 +1,19 @@
-settingset Events, EntryBreakpoint, 0
+settingset Events, TlsCallbacks, 0
+settingset Events, EntryBreakpoint, 1
 varnew $outer, 0
 varnew $inner, 0
 varnew $plugin_direct_mode, 1
 init tests/scriptcmd_call.exe
+mov startup_stops, 0
+await_entry:
+cmp cip, scriptcmd_call:entry
+je entry_ready
+inc startup_stops
+testassert startup_stops <= .64, "execution fixture entry stop limit"
+run
+jmp await_entry
+entry_ready:
+testassert cip == scriptcmd_call:entry, "execution fixture must stop at its actual entry point"
 bp scriptcmd_call:OuterHit
 SetBreakpointSilent scriptcmd_call:OuterHit, 1
 SetBreakpointCondition scriptcmd_call:OuterHit, 0
