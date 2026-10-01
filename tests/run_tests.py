@@ -106,6 +106,24 @@ def run_native_stale_breakpoint_oracles(environment, results):
     print(f"[VERIFIED] Normal native {environment.architecture} restored-instruction workers", flush=True)
 
 
+def run_native_execution_oracles(environment, results):
+    binary, binary_identity, machine = native_fixture_identity(environment, "scriptcmd_call")
+    receipt = run_owned_native_command([str(binary)], {**os.environ, "WININSPECT_TEST_NORMAL": "1"}, 15)
+    write_json(environment.root / "execution-canary-normal.json", receipt)
+    assert receipt["exitCode"] == 42 and not receipt["timedOut"], "Normal execution canary failed"
+    expected = {"phase": "2", "originalValue": "3", "base": "7", "loops": "4", "outerCalls": "4", "innerCalls": "4",
+                "evenBranches": "2", "oddBranches": "2", "result": "42"}
+    lines = receipt["stdout"].splitlines()
+    assert len(lines) == len(expected) and all(line.count("=") == 1 for line in lines), "Execution summary fields are malformed"
+    observed = dict(line.split("=", 1) for line in lines)
+    assert observed == expected, f"Normal execution outcomes differ: {observed}"
+    assert file_identity(binary) == binary_identity
+    results.append({"name": "test_native_execution_oracles", "status": "verified", "oracle": {
+        "binary": binary_identity, "machine": machine, "receipt": receipt, "expected": expected,
+        "observed": observed, "debuggerUsed": False}})
+    print(f"[VERIFIED] Normal native {environment.architecture} nested execution canary", flush=True)
+
+
 def run_fixture_oracles(environment, results):
     expected_markers = {"exitmark": {"marker": "done"}, "bpmain": {"marker": "done", "hits": "2"},
                         "probe": {"BeingDebugged": "0"}, "patch_canary": {"value": "7"}}
@@ -369,7 +387,7 @@ def main():
         names = ["test_native_runtime_surface_inventory"]
     if arguments.phase == "fixtures":
         names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles", "test_native_memory_oracles",
-                 "test_native_database_oracles", "test_native_stale_breakpoint_oracles"]
+                 "test_native_database_oracles", "test_native_stale_breakpoint_oracles", "test_native_execution_oracles"]
     if arguments.phase == "runner":
         names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
@@ -457,6 +475,8 @@ def main():
                     run_native_memory_oracles(environment, architecture_results)
                 if "test_native_stale_breakpoint_oracles" in selected_names:
                     run_native_stale_breakpoint_oracles(environment, architecture_results)
+                if "test_native_execution_oracles" in selected_names:
+                    run_native_execution_oracles(environment, architecture_results)
                 if "test_native_database_oracles" in selected_names:
                     from database_checks import run_database_oracles
                     run_database_oracles(environment, architecture_results, arguments.engine, arguments.timeout,

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstring>
 #include <string>
+#include <charconv>
 
 #include "_plugins.h"
 #include "bridgemain.h"
@@ -13,6 +14,8 @@ namespace
     int gPluginHandle = 0;
     std::atomic<unsigned int> gOuterDispatchCount{ 0 };
     std::atomic<unsigned int> gInnerDispatchCount{ 0 };
+    std::atomic<DWORD> gExecutionExitCode{0};
+    std::atomic<bool> gExecutionExitObserved{false};
 
     bool pluginDirectModeEnabled()
     {
@@ -37,6 +40,16 @@ namespace
         {
             gOuterDispatchCount = 0;
             gInnerDispatchCount = 0;
+            gExecutionExitCode = 0;
+            gExecutionExitObserved = false;
+            return;
+        }
+
+        if(cbType == CB_EXITPROCESS)
+        {
+            const auto info = static_cast<PLUG_CB_EXITPROCESS*>(callbackInfo);
+            gExecutionExitCode.store(info->ExitProcess->dwExitCode, std::memory_order_relaxed);
+            gExecutionExitObserved.store(true, std::memory_order_release);
             return;
         }
 
@@ -61,6 +74,20 @@ namespace
             return false;
         return _plugin_testassert(gInnerDispatchCount.load() == 1, "expected exactly 1 plugin-direct inner dispatch, got %u", gInnerDispatchCount.load());
     }
+
+    bool cbExecutionExitAssert(int argc, char** argv)
+    {
+        if(!_plugin_testassert(argc == 2, "executionexit requires one decimal exit code"))
+            return false;
+        DWORD expected = 0;
+        const auto end = argv[1] + strlen(argv[1]);
+        const auto parsed = std::from_chars(argv[1], end, expected);
+        if(!_plugin_testassert(parsed.ec == std::errc{} && parsed.ptr == end, "executionexit requires a valid 32-bit decimal exit code"))
+            return false;
+        if(!_plugin_testassert(gExecutionExitObserved.load(std::memory_order_acquire), "the execution canary actually exited"))
+            return false;
+        return _plugin_testassert(gExecutionExitCode.load() == expected, "actual execution canary exit is %lu, expected %lu", gExecutionExitCode.load(), expected);
+    }
 }
 
 extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* initStruct)
@@ -71,12 +98,14 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* initStruct)
     gPluginHandle = initStruct->pluginHandle;
     _plugin_registercallback(gPluginHandle, CB_INITDEBUG, cbPlugin);
     _plugin_registercallback(gPluginHandle, CB_BREAKPOINT, cbPlugin);
+    _plugin_registercallback(gPluginHandle, CB_EXITPROCESS, cbPlugin);
     _plugin_registercommand(gPluginHandle, "plugindirectassert", cbPluginDirectAssert, false);
-    return true;
+    return _plugin_registercommand(gPluginHandle, "executionexit", cbExecutionExitAssert, false);
 }
 
-extern "C" __declspec(dllexport) void plugstop()
+extern "C" __declspec(dllexport) bool plugstop()
 {
+    return true;
 }
 
 extern "C" __declspec(dllexport) void plugsetup(PLUG_SETUPSTRUCT*)

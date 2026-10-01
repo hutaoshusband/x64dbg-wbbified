@@ -1,0 +1,89 @@
+settingset Engine, HideDebugger, 0
+settingset Events, TlsCallbacks, 0
+settingset Events, SystemBreakpoint, 1
+settingset Events, EntryBreakpoint, 1
+varnew $plugin_direct_mode, 0
+init tests/scriptcmd_call.exe
+mov startup_stops, 0
+await_entry:
+cmp cip, scriptcmd_call:entry
+je entry_ready
+inc startup_stops
+testassert startup_stops <= .64, "execution target entry stop limit"
+run
+jmp await_entry
+entry_ready:
+testassert cip == scriptcmd_call:entry, "execution target stopped at the actual entry"
+mov dword:[scriptcmd_call:gExecutionMode], 1
+testassert dword:[scriptcmd_call:gExecutionMode] == 1, "execution mode mutation readback"
+bp scriptcmd_call:ExecutionCall
+bp scriptcmd_call:ExecutionFinish
+run
+testassert cip == scriptcmd_call:ExecutionCall, "first loop stopped at its real wrapper"
+testassert arg.get(0) == 0, "first wrapper received index zero"
+testassert dword:[scriptcmd_call:gObservedBase] == 7, "target executed the baseline canary"
+testassert dword:[scriptcmd_call:gOuterCount] == 0, "nested execution has not started"
+mov over_steps, 0
+find_over_call:
+cmp dis.iscall(cip), 1
+jne advance_over
+cmp dis.branchdest(cip), scriptcmd_call:ExecutionOuter
+je over_call_ready
+advance_over:
+inc over_steps
+testassert over_steps <= .32, "step-over call search limit"
+sti
+jmp find_over_call
+over_call_ready:
+mov over_call_address, cip
+sto
+testassert cip != over_call_address, "step-over advanced past the actual call"
+testassert dword:[scriptcmd_call:gOuterCount] == 1, "step-over executed the outer function exactly once"
+testassert dword:[scriptcmd_call:gInnerCount] == 1, "step-over executed the nested function exactly once"
+testassert dword:[scriptcmd_call:gEvenCount] == 1, "step-over executed the even branch"
+testassert dword:[scriptcmd_call:gOddCount] == 0, "step-over preserved the unexecuted odd branch"
+testassert cax == 8, "step-over returned the independently known nested value"
+run
+testassert cip == scriptcmd_call:ExecutionCall, "second loop stopped at its real wrapper"
+testassert arg.get(0) == 1, "second wrapper received index one"
+testassert dword:[scriptcmd_call:gLoopCount] == 1, "first loop completed before the second call"
+testassert dword:[scriptcmd_call:gExecutionResult] == 8, "first loop saved its real return value"
+mov into_steps, 0
+find_into_call:
+cmp dis.iscall(cip), 1
+jne advance_into
+cmp dis.branchdest(cip), scriptcmd_call:ExecutionOuter
+je into_call_ready
+advance_into:
+inc into_steps
+testassert into_steps <= .32, "step-into call search limit"
+sti
+jmp find_into_call
+into_call_ready:
+sti
+testassert cip == scriptcmd_call:ExecutionOuter, "step-into reached the expected callee"
+testassert arg.get(0) == 1, "nested callee received the real index"
+testassert dword:[scriptcmd_call:gOuterCount] == 1, "callee body has not executed at its entry"
+rtr
+testassert dis.isret(cip), "run-to-return reached the callee return instruction"
+testassert cax == .11, "nested odd call produced its known result"
+testassert dword:[scriptcmd_call:gOuterCount] == 2, "run-to-return executed the second outer call"
+testassert dword:[scriptcmd_call:gInnerCount] == 2, "run-to-return executed the second inner call"
+testassert dword:[scriptcmd_call:gOddCount] == 1, "run-to-return executed the odd branch"
+sti
+bpd scriptcmd_call:ExecutionCall
+run
+testassert cip == scriptcmd_call:ExecutionFinish, "remaining loops reached the real completion function"
+testassert dword:[scriptcmd_call:gLoopCount] == 4, "all four loops executed"
+testassert dword:[scriptcmd_call:gOuterCount] == 4, "all four outer calls executed"
+testassert dword:[scriptcmd_call:gInnerCount] == 4, "all four nested calls executed"
+testassert dword:[scriptcmd_call:gEvenCount] == 2, "two even branches executed"
+testassert dword:[scriptcmd_call:gOddCount] == 2, "two odd branches executed"
+testassert dword:[scriptcmd_call:gExecutionResult] == .42, "executed loop result matches the independent sum"
+bpd scriptcmd_call:ExecutionFinish
+rtr
+testassert dword:[scriptcmd_call:gExecutionPhase] == 2, "completion function executed its phase transition"
+sti
+run
+executionexit 42
+testfinalize
