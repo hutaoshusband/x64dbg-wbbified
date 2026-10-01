@@ -20,7 +20,7 @@ CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_
               "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
-              "test_provider_ui_contracts", "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
+              "test_provider_ui_contracts", "test_library_script_contracts", "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
 
 EXECUTION_TOOLS = ("execution_resume", "execution_pause", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to",
                    "execution_skip_instruction", "execution_wait", "threads_list", "threads_select", "threads_suspend", "threads_resume", "threads_context",
@@ -43,6 +43,10 @@ PROVIDER_UI_TOOLS = ("commands_list", "commands_describe", "commands_execute", "
                      "ui_actions_list", "ui_action_invoke", "ui_views_list", "ui_view_read", "ui_view_navigate", "ui_view_configure", "ui_dialogs_list", "ui_dialog_read",
                      "ui_dialog_update", "ui_dialog_submit", "ui_clipboard_export", "ui_capture")
 NATIVE_EFFECT_TOOLS = ("commands_execute", "plugins_invoke", "plugins_load", "plugins_unload", "ui_action_invoke", "ui_view_configure", "ui_dialog_update", "ui_dialog_submit")
+LIBRARY_SCRIPT_TOOLS = ("library_namespaces", "library_files_list", "library_file_read", "library_file_write", "library_file_rename", "library_file_delete", "library_file_restore",
+                        "library_search", "library_import", "library_export", "library_quota", "scripts_list", "scripts_create", "scripts_update", "scripts_read", "scripts_revisions",
+                        "scripts_validate", "scripts_run", "scripts_delete", "script_languages", "native_script_load", "native_script_control", "native_script_breakpoint", "native_script_state", "workflows_run")
+SCRIPT_NATIVE_EFFECT_TOOLS = ("scripts_run", "native_script_load", "native_script_control", "native_script_breakpoint", "workflows_run")
 
 
 def build_contract_fixture(output, architecture):
@@ -149,6 +153,18 @@ def independent_validators(catalog):
     }
     checks["windows-command-line"] = lambda value: "\0" not in value and len(value.encode("utf-16-le")) // 2 <= 32766
     checks["windows-environment-name"] = lambda value: bool(value) and "=" not in value and "\0" not in value and len(value.encode("utf-16-le")) // 2 <= 32766
+    def virtual_path(value):
+        parts = value.split("/")
+        if len(value.encode("utf-16-le")) // 2 > 4096 or len(parts) > 64 or re.search(r'[\x00-\x1f<>:"\\|?*]', value):
+            return False
+        for part in parts:
+            if not part or part in (".", "..") or part.endswith((".", " ")) or len(part.encode("utf-16-le")) // 2 > 255:
+                return False
+            stem = part.partition(".")[0].rstrip(" ").translate(str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+            if stem in ("CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$") or re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", stem):
+                return False
+        return True
+    checks["library-virtual-path"] = virtual_path
     for name, check in checks.items():
         formats.checks(name)(lambda value, check=check: not isinstance(value, str) or check(value))
     validators = {}
@@ -297,14 +313,14 @@ def registry_validators(registry, formats):
     validators = {}
     expected = {"server_info", "server_health", "capabilities_list", "capabilities_describe", "capabilities_search", "client_context_get", "client_context_set", "control_acquire", "control_renew", "control_release"}
     expected.update({"debugger_instances", "debugger_start", "debugger_focus", "debugger_close", "debugger_settings_get", "debugger_settings_set", "processes_list", "target_open", "target_attach", "target_state", "target_snapshot", "target_stop", "target_detach", "target_restart", "target_command_line_get", "target_command_line_set"})
-    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS + BREAKPOINT_TRACE_TOOLS + ASSEMBLY_FILE_TOOLS + MODULE_ANALYSIS_TOOLS + DATABASE_SETTINGS_TOOLS + PROVIDER_UI_TOOLS)
+    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS + BREAKPOINT_TRACE_TOOLS + ASSEMBLY_FILE_TOOLS + MODULE_ANALYSIS_TOOLS + DATABASE_SETTINGS_TOOLS + PROVIDER_UI_TOOLS + LIBRARY_SCRIPT_TOOLS)
     assert registry["operationalTools"] == [] and {tool["name"] for tool in registry["tools"]} == expected
     assert [tool["name"] for tool in registry["tools"]] == sorted(expected)
     for tool in registry["tools"]:
         assert tool["schemaVersion"] == 1 and tool["operational"] is False
         assert tool["completionPredicate"] and tool["nativeSource"] and tool["recovery"] and tool["acceptanceIds"]
         assert tool["annotations"]["readOnlyHint"] == (tool["effects"] == ["inspect"] and not tool["effectConditions"])
-        assert tool.get("effectResolution") == ("native_classifier" if tool["name"] in NATIVE_EFFECT_TOOLS else None)
+        assert tool.get("effectResolution") == ("native_classifier" if tool["name"] in NATIVE_EFFECT_TOOLS + SCRIPT_NATIVE_EFFECT_TOOLS else None)
         assert tool["executor"] in ("broker", "engine", "gui")
         assert tool["architectureRequirement"] == {"seh_chain": "x32", "unwind_info": "x64"}.get(tool["name"], "any")
         for direction in ("input", "output"):
@@ -497,8 +513,9 @@ def check_tool_family(probe, registry, validators, names, inputs, outputs, extra
     input_cases = []
     for name, value in inputs.items():
         missing = "instanceId" if required_fields is None else required_fields[name]
-        input_cases.extend(((True, name, value), (False, name, {**value, "unknown": "reject"}),
-                            (False, name, {key: item for key, item in value.items() if key != missing})))
+        input_cases.extend(((True, name, value), (False, name, {**value, "unknown": "reject"})))
+        if missing is not None:
+            input_cases.append((False, name, {key: item for key, item in value.items() if key != missing}))
     input_cases.extend(extra_inputs)
     for expected, name, value in input_cases:
         assert validators[(name, "input")].is_valid(value) == expected, f"Independent input {name}: expected {expected}"
@@ -1321,6 +1338,121 @@ def check_provider_ui_contracts(probe, registry, validators):
     return result
 
 
+def check_library_script_contracts(probe, registry, validators):
+    c = tool_context_examples()
+    instance = {"instanceId": "instance-1"}
+    ref = {"namespaceId": "private-1", "objectId": "object-1", "revision": "revision-1"}
+    library = {**ref, "virtualPath": "scripts/Hu Tao ❤/controlled.js", "kind": "script", "mediaType": "text/javascript", "size": "9007199254740993",
+               "sha256": "0" * 64, "createdAtUtc": "2026-10-01T12:00:00Z", "metadataVersion": "18446744073709551615", "tags": ["controlled"], "pinnedReferences": "1", "trashed": False}
+    quota = {"namespaceId": "private-1", "usedBytes": "17", "reservedBytes": "0", "retainedBytes": "17", "pinnedBytes": "17", "namespaceLimit": "1073741824",
+             "profileUsedBytes": "17", "profileLimit": "4294967296", "scriptSourceLimit": "16777216", "artifactLimit": "268435456", "chunkLimit": 1048576, "cleanupCandidates": [], "complete": True}
+    limits = {"memoryBytes": 67108864, "cpuMs": 30000, "wallMs": 300000, "hostCalls": 10000, "logBytes": 8388608, "steps": 10000, "loopIterations": 10000, "waitMs": 30000}
+    manifest = {"manifestVersion": "1", "apiRequirements": [{"apiId": "dbg", "version": "1"}], "dependencies": [ref],
+                "targetRequirements": {"architecture": "x64", "context": "paused", "modules": [{"name": "controlled.exe", "sha256": "0" * 64}], "features": ["sse2"]},
+                "effects": ["inspect", "modify"], "parametersSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "limits": limits, "failurePolicy": "stop", "tags": ["controlled"]}
+    diagnostics = {"items": [], "page": c.page}
+    script = {"object": library, "scriptId": "script-1", "name": "scripts/controlled.js", "engine": "x64dbg-js/v1", "engineBuildId": "0" * 64, "apiVersion": "1",
+              "manifest": manifest, "previousRevision": None, "diagnostics": diagnostics, "validationStatus": "unvalidated", "trustedCode": False, "complete": True}
+    trash = {"trashId": "trash-1", "object": {**library, "trashed": True}, "deletedAtUtc": "2026-10-01T12:00:00Z", "recoverable": True, "retainedRevision": ref}
+    unverified = {"status": "unverified", "evidence": [], "followUp": {"capabilityId": "job_get", "retry": "after_reconciliation", "reason": "Actual runtime proof pending"}}
+    job = {"jobId": "job-1", "revision": ref, "engine": "x64dbg-workflow/v1", "state": "queued", "context": None, "steps": {"items": [], "page": c.page},
+           "artifacts": [], "logsArtifactId": None, "verification": unverified, "complete": False}
+    native = {**instance, "ownerClientId": "client-1", "runtimeId": "runtime-1", "revision": ref, "version": "9007199254740993", "state": "ready", "ipLine": 1,
+              "lineCount": "3", "lines": {"items": [{"line": 1, "text": "ret", "kind": "command", "branchTarget": None, "breakpoint": False, "enabled": True, "error": None}], "page": c.page},
+              "error": None, "jobId": None, "trustedCode": True, "complete": True}
+    inputs = {"library_namespaces": {}, "library_files_list": {"namespaceId": "private-1"}, "library_file_read": {**ref, "offset": "9007199254740993", "length": 1048576},
+              "library_file_write": {"namespaceId": "private-1", "virtualPath": "scripts/Hu Tao ❤/controlled.js", "content": {"encoding": "utf8", "text": ""}, "expectedRevision": None},
+              "library_file_rename": {**ref, "newVirtualPath": "scripts/renamed.js", "expectedRevision": "revision-1"}, "library_file_delete": {**ref, "expectedRevision": "revision-1"},
+              "library_file_restore": {"namespaceId": "private-1", "trashId": "trash-1", "destination": "scripts/restored.js"},
+              "library_search": {"namespaceId": "private-1", "query": "controlled"}, "library_import": {"namespaceId": "private-1", "path": "C:\\controlled.txt", "name": "scripts/imported.txt", "kind": "script", "expectedSha256": "0" * 64},
+              "library_export": {**ref, "destination": "C:\\controlled.txt", "overwrite": False}, "library_quota": {"namespaceId": "private-1"},
+              "scripts_list": {"namespaceId": "private-1", "engine": "x64dbg-js/v1", "tags": ["controlled"]},
+              "scripts_create": {"namespaceId": "private-1", "name": "scripts/controlled.js", "engine": "x64dbg-js/v1", "source": "await dbg.call('target_state', context);", "manifest": manifest},
+              "scripts_update": {**ref, "source": {"artifactId": "artifact-1", "sha256": "0" * 64}, "expectedRevision": "revision-1"}, "scripts_read": ref,
+              "scripts_revisions": {"namespaceId": "private-1", "scriptId": "script-1"}, "scripts_validate": {**ref, "targetContext": c.paused},
+              "scripts_run": {**ref, "instanceId": "instance-1", "targetContext": c.paused, "leaseId": "lease-1", "parameters": {"expected": "42"}, "limits": limits},
+              "scripts_delete": {**ref, "expectedRevision": "revision-1"}, "script_languages": instance, "native_script_load": {**instance, "library": ref, "leaseId": "lease-1"},
+              "native_script_control": {**instance, "action": "run", "line": 3, "expectedRuntimeId": "runtime-1", "expectedVersion": "9007199254740993", "leaseId": "lease-1"},
+              "native_script_breakpoint": {**instance, "line": 1, "enabled": True, "expectedRevision": "revision-1"}, "native_script_state": instance,
+              "workflows_run": {**ref, "context": {"instanceId": "instance-1", "targetContext": c.paused, "leaseId": "lease-1"}, "parameters": {}, "limits": limits}}
+    validation = {"revision": ref, "engine": "x64dbg-js/v1", "engineBuildId": "0" * 64, "status": "valid", "diagnostics": diagnostics, "dependencies": [ref],
+                  "resolvedEffects": ["inspect"], "classification": "known", "limits": limits, "executed": False, "complete": True}
+    language = {"engine": "x64dbg-native", "name": "Native", "providerId": "native", "providerBuildId": "0" * 64, "apiVersion": "1", "available": True, "disabledReason": None,
+                "architecture": "any", "executor": "engine", "trustedCode": True, "containment": "none", "manifestSchema": {"type": "object"}, "limits": limits,
+                "controls": ["load", "run", "step", "abort", "unload", "set_ip", "breakpoint", "state"]}
+    outputs = {"library_namespaces": {"items": [{"namespaceId": "private-1", "name": "Private", "visibility": "private", "ownerClientId": "client-1", "access": "read_write", "version": "1", "quota": quota}], "complete": True},
+               "library_files_list": {"items": [library], "page": c.page}, "library_file_read": {"object": library, "offset": "9007199254740993", "length": 0, "bytesHex": "", "chunkSha256": "0" * 64, "eof": True},
+               "library_file_write": library, "library_file_rename": library, "library_file_delete": trash, "library_file_restore": library,
+               "library_search": {"items": [{"object": library, "source": "content", "offset": "9007199254740993", "snippet": "controlled", "snippetTruncated": False}], "page": c.page},
+               "library_import": library, "library_export": {"revision": ref, "destination": "C:\\controlled.txt", "sha256": "0" * 64, "size": "9007199254740993", "replaced": False, "backupArtifactId": None, "journalId": "journal-1", "verified": True},
+               "library_quota": quota, "scripts_list": {"items": [script], "page": c.page}, "scripts_create": script, "scripts_update": {**script, "previousRevision": "revision-1"},
+               "scripts_read": {"script": script, "source": {"artifactId": "artifact-1", "sha256": "0" * 64}, "complete": True}, "scripts_revisions": {"items": [script], "page": c.page},
+               "scripts_validate": validation, "scripts_run": job, "scripts_delete": trash, "script_languages": {"items": [language], "complete": True},
+               "native_script_load": native, "native_script_control": native, "native_script_breakpoint": native, "native_script_state": native, "workflows_run": job}
+    extra_inputs = [(True, "library_file_write", {**inputs["library_file_write"], "content": {"encoding": "hex", "bytesHex": ""}}),
+                    (True, "library_file_write", {**inputs["library_file_write"], "content": {"artifactId": "artifact-1", "sha256": "0" * 64}}),
+                    (True, "scripts_create", {**inputs["scripts_create"], "engine": "x64dbg-workflow/v1", "source": "x" * 65536}),
+                    (False, "scripts_create", {**inputs["scripts_create"], "source": "x" * 65537}),
+                    (False, "scripts_create", {**inputs["scripts_create"], "source": {"artifactId": "artifact-1"}}),
+                    (False, "scripts_create", {**inputs["scripts_create"], "manifest": {**manifest, "dependencies": [{key: value for key, value in ref.items() if key != "revision"}]}}),
+                    (False, "scripts_create", {**inputs["scripts_create"], "manifest": {**manifest, "dependencies": [ref, ref]}}),
+                    (False, "library_file_read", {**ref, "length": 0}), (False, "library_file_read", {**ref, "length": 1048577}),
+                    (False, "library_file_read", {**ref, "offset": 9007199254740993}), (False, "library_file_read", {**ref, "offset": "18446744073709551616"}),
+                    (False, "library_import", {**inputs["library_import"], "artifactId": "artifact-1"}),
+                    (True, "library_import", {key: value for key, value in {**inputs["library_import"], "artifactId": "artifact-1"}.items() if key != "path"}),
+                    (False, "library_export", {**inputs["library_export"], "overwrite": True}),
+                    (False, "library_export", {**inputs["library_export"], "overwrite": "replace"}),
+                    (True, "library_export", {**inputs["library_export"], "overwrite": "replace", "expectedDestinationSha256": "0" * 64}),
+                    (True, "scripts_run", ref), (True, "workflows_run", {**ref, "context": {}}),
+                    (False, "native_script_breakpoint", {**inputs["native_script_breakpoint"], "line": 0}),
+                    (False, "native_script_control", {**instance, "action": "set_ip"}),
+                    (True, "native_script_control", {**instance, "action": "set_ip", "line": 3}),
+                    (False, "native_script_control", {**instance, "action": "abort", "line": 3}),
+                    (False, "native_script_control", {**instance, "action": "run_to_line", "line": 3}),
+                    (False, "scripts_run", {**inputs["scripts_run"], "targetContext": {**c.target, "targetGeneration": 9007199254740993}})]
+    good_paths = ["scripts/Hu Tao ❤/probe.js", "a", ".cache/log", "COM0.txt", "NULx.txt", "folder/" + "a" * 255, "folder/" + "😀" * 127]
+    bad_paths = ["", ".", "..", "../other", "a/../other", "a/./b", "/absolute", "C:/outside", "a\\b", "a:stream", "a//b", "a/", "a. ", "a.", "a ",
+                 "NUL", "aux.txt", "con .txt", "COM1.txt", "Lpt9", "COM¹.txt", "LPT²", "CONIN$", "conout$.txt", "a\x01b", "a?b", "a|b", "a*b", "a<b", "a>b", 'a"b', "a" * 256, "😀" * 128, "/".join(["a"] * 65)]
+    for expected, paths in ((True, good_paths), (False, bad_paths)):
+        for value in paths:
+            extra_inputs.append((expected, "library_file_write", {**inputs["library_file_write"], "virtualPath": value}))
+    for key, maximum in (("memoryBytes", 67108864), ("cpuMs", 30000), ("wallMs", 300000), ("hostCalls", 10000), ("logBytes", 8388608), ("steps", 100000), ("loopIterations", 100000), ("waitMs", 60000)):
+        for value in (0, maximum + 1, "1"):
+            extra_inputs.append((False, "scripts_run", {**inputs["scripts_run"], "limits": {key: value}}))
+    for policy in ("stop", "declared_rollback", "independent_continuation"):
+        extra_inputs.append((True, "scripts_create", {**inputs["scripts_create"], "manifest": {**manifest, "failurePolicy": policy}}))
+    for action in ("run", "step", "abort", "unload"):
+        extra_inputs.append((True, "native_script_control", {**instance, "action": action}))
+    extra_outputs = [(False, "scripts_validate", {**validation, "executed": True}), (False, "library_file_write", {**library, "size": 9007199254740993}),
+                     (False, "library_file_write", {**library, "virtualPath": "../other"}), (False, "library_quota", {**quota, "profileLimit": 4294967296}),
+                     (False, "library_file_read", {**outputs["library_file_read"], "bytesHex": "f"}),
+                     (True, "library_file_read", {**outputs["library_file_read"], "length": 1, "bytesHex": "ff", "eof": False}),
+                     (False, "scripts_read", {**outputs["scripts_read"], "source": {"artifactId": "artifact-1", "sha256": "0" * 63}}),
+                     (False, "native_script_state", {**native, "ipLine": 0}), (False, "native_script_state", {**native, "version": 9007199254740993}),
+                     (False, "native_script_state", {**native, "trustedCode": False}),
+                     (True, "native_script_state", {**native, "state": "unloaded", "ownerClientId": None, "runtimeId": None, "revision": None, "ipLine": None, "lineCount": "0", "lines": diagnostics}),
+                     (False, "scripts_create", {**script, "manifest": {**manifest, "effects": ["inspect", "inspect"]}})]
+    for state in ("queued", "running", "waiting_for_debugger", "waiting_for_event", "awaiting_user_consent", "cancelling", "completed", "cancelled", "failed", "interrupted_by_user", "unknown"):
+        extra_outputs.append((True, "scripts_run", {**job, "state": state}))
+    effects = {name: ["inspect"] for name in LIBRARY_SCRIPT_TOOLS}
+    effects.update({name: ["configure"] for name in ("library_file_write", "library_file_rename", "library_file_delete", "library_file_restore", "library_import", "scripts_create", "scripts_update", "scripts_delete")})
+    effects["library_export"] = ["file_export"]
+    effects.update({name: ["inspect", "execute", "modify", "file_export", "file_replace", "elevate", "configure"] for name in SCRIPT_NATIVE_EFFECT_TOOLS})
+    executors = {name: ("engine" if name.startswith("native_script_") or name == "script_languages" else "broker") for name in LIBRARY_SCRIPT_TOOLS}
+    required = {name: ("instanceId" if executors[name] == "engine" else "namespaceId") for name in LIBRARY_SCRIPT_TOOLS}
+    required["library_namespaces"] = None
+    conditions = {"library_export": [{"field": "overwrite", "equals": "replace", "effects": ["file_replace"]}]}
+    result = check_tool_family(probe, registry, validators, LIBRARY_SCRIPT_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects, required, executors, conditions, SCRIPT_NATIVE_EFFECT_TOOLS)
+    replacement = {**inputs["library_export"], "overwrite": "replace", "expectedDestinationSha256": "0" * 64}
+    assert probe.call("effects", replacement, "library_export") == {"valid": True, "effects": ["file_export", "file_replace"]}
+    for name in SCRIPT_NATIVE_EFFECT_TOOLS:
+        rejected = probe.call("effects", {**inputs[name], "permissions": ["all"]}, name)
+        assert not rejected["valid"] and rejected["error"]["code"] == "invalid_argument"
+    result.update(nativeClassificationRequired=list(SCRIPT_NATIVE_EFFECT_TOOLS), virtualPathsAccepted=len(good_paths), virtualPathsRejected=len(bad_paths),
+                  sourceInlineCharacterLimit=65536, largeSourcePinnedArtifactRoute=True, chunkByteLimit=1048576, actualRuntimeExecutionVerified=False)
+    return result
+
+
 def check_native_launch(probe, architecture):
     import os
     import shutil
@@ -1631,6 +1763,8 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_database_settings_contracts(probe, registry, tool_validators))
             elif name == "test_provider_ui_contracts":
                 result.update(check_provider_ui_contracts(probe, registry, tool_validators))
+            elif name == "test_library_script_contracts":
+                result.update(check_library_script_contracts(probe, registry, tool_validators))
             elif name == "test_native_launch_arguments":
                 result.update(check_native_launch(probe, architecture))
             elif name == "test_native_component_builds":

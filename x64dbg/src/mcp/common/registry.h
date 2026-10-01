@@ -60,6 +60,7 @@ void append_assembly_file_tools(std::vector<ToolDefinition>& tools);
 void append_module_analysis_tools(std::vector<ToolDefinition>& tools);
 void append_database_settings_tools(std::vector<ToolDefinition>& tools);
 void append_provider_ui_tools(std::vector<ToolDefinition>& tools);
+void append_library_script_tools(std::vector<ToolDefinition>& tools);
 Checked<std::vector<Effect>> required_tool_effects(std::string_view name, const Json& input);
 
 const std::vector<ToolDefinition>& tool_registry();

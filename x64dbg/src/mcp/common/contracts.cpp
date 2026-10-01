@@ -1,6 +1,7 @@
 #include "contracts.h"
 #include "lifecycle.h"
 #include "build_identity.h"
+#include "library_script_types.h"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -124,6 +125,8 @@ bool valid_format(std::string_view format, std::string_view value)
         });
     if(format == "windows-absolute-path")
         return absolute_windows_path(value);
+    if(format == "library-virtual-path")
+        return safe_virtual_path(value);
     if(format == "windows-command-line" || format == "windows-environment-name")
     {
         const auto converted = launch_utf16(value);
@@ -184,7 +187,7 @@ std::optional<ContractError> validate_schema_dialect(const Json& schema, const J
     }
     if(type == "string")
     {
-        static const std::unordered_set<std::string> formats = {"uint64-decimal", "uint64-hex", "opaque-id", "hex-bytes", "sha256", "utf8-text", "windows-absolute-path", "windows-command-line", "windows-environment-name"};
+        static const std::unordered_set<std::string> formats = {"uint64-decimal", "uint64-hex", "opaque-id", "hex-bytes", "sha256", "utf8-text", "windows-absolute-path", "windows-command-line", "windows-environment-name", "library-virtual-path"};
         const auto format = schema.at("format").get<std::string>();
         if(!formats.count(format) || (schema.contains("pattern") && text_schema(format).value("pattern", "") != schema.at("pattern")))
             return rejected();

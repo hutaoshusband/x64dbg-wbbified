@@ -279,6 +279,7 @@ const std::vector<ToolDefinition>& tool_registry()
         append_module_analysis_tools(tools);
         append_database_settings_tools(tools);
         append_provider_ui_tools(tools);
+        append_library_script_tools(tools);
         std::sort(tools.begin(), tools.end(), [](const ToolDefinition& left, const ToolDefinition& right) { return left.name < right.name; });
         return tools;
     }();
