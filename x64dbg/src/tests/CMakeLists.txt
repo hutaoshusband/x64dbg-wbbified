@@ -176,6 +176,20 @@ foreach(test_name IN LISTS X64DBG_STANDARD_TESTS)
     x64dbg_add_test(NAME "${test_name}")
 endforeach()
 
+if(MSVC)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(commandline_startup_symbols _tls_used CommandLineStartupCallback)
+    else()
+        set(commandline_startup_symbols __tls_used _CommandLineStartupCallback)
+    endif()
+    foreach(test_name IN ITEMS cmdline_init cmdline_setcommandline)
+        set_property(TARGET test_${test_name}_target PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        foreach(startup_symbol IN LISTS commandline_startup_symbols)
+            target_link_options(test_${test_name}_target PRIVATE "LINKER:/INCLUDE:${startup_symbol}")
+        endforeach()
+    endforeach()
+endif()
+
 x64dbg_add_test(
     NAME attach_pause
     TARGET_LINK_LIBRARIES user32

@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <wchar.h>
 
+#include "../commandline_startup.h"
+
 extern "C"
 {
     __declspec(dllexport) volatile LONG ObservedReady = 0;

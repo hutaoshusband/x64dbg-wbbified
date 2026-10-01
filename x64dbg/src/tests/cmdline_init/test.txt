@@ -1,8 +1,32 @@
 settingset Events, EntryBreakpoint, 0
+settingset Events, TlsCallbacks, 1
+settingset Events, TlsCallbacksSystem, 0
 init tests/cmdline_init.exe, "\"alpha\" \"beta\""
+testassert dword:[cmdline_init:ObservedReady] == 0, "arguments must be unobserved at startup"
+testassert dword:[cmdline_init:ObservedStartupCallback] == 0, "launch must pause before the target TLS callback"
+mov launch_stops, 0
+await_alpha:
+cmp dword:[cmdline_init:ObservedReady], 1
+je alpha_observed
+inc launch_stops
+testassert launch_stops <= .64, "argument observation stop limit"
 run
+jmp await_alpha
+alpha_observed:
+testassert dword:[cmdline_init:ObservedStartupCallback] == 1, "target TLS callback must execute before argument observation"
 cmdlineassert
 dbsave
 init tests/cmdline_init.exe, "\"gamma\" \"delta\""
+testassert dword:[cmdline_init:ObservedReady] == 0, "restarted arguments must be unobserved"
+testassert dword:[cmdline_init:ObservedStartupCallback] == 0, "restart must pause before the target TLS callback"
+mov launch_stops, 0
+await_gamma:
+cmp dword:[cmdline_init:ObservedReady], 1
+je gamma_observed
+inc launch_stops
+testassert launch_stops <= .64, "restarted argument observation stop limit"
 run
+jmp await_gamma
+gamma_observed:
+testassert dword:[cmdline_init:ObservedStartupCallback] == 1, "restarted target TLS callback must execute"
 cmdlinedboverrideassert

@@ -108,6 +108,8 @@ The x64 external plugin is the available behavioral baseline. The shipped x32 pl
 
 Build phases use new out-of-tree CMake directories. Existing local Qt SDKs may supply the configured Qt package, while build output remains in the debugger's ignored `bin/<arch>` directory. No obsolete cached source directory is reused. Build receipts retain actual commands, source inputs and artifact hashes.
 
+The native `cmdline_init` and `cmdline_setcommandline` fixtures have a target TLS callback and use the static MSVC runtime. Their startup assertions require a pause before that callback executes. This makes `SetCmdline` occur before the target runtime captures and parses its command line; a dynamic runtime can already have cached it in DLL initialization. Their scripts advance through at most 64 stops until the target sets `ObservedReady`, then check the exact CRT arguments, Windows arguments and command-line text. Additional DLL TLS stops cannot stand in for the target observation. The launch fixture also restarts with different explicit arguments after saving its database. Settings apply only to the isolated test profile.
+
 Evidence includes requests without authentication headers, catalog contracts, target markers, compiler output, fixture hashes, process modules and verification summaries. Failed and unexecuted requested cases remain visible. A contracts or inventory pass verifies capture/reconciliation; it does not claim that the external tool's behavior or a native replacement is correct.
 
 ## Native log compatibility

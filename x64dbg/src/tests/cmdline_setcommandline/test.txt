@@ -1,5 +1,18 @@
 settingset Events, EntryBreakpoint, 0
+settingset Events, TlsCallbacks, 1
+settingset Events, TlsCallbacksSystem, 0
 init tests/cmdline_setcommandline.exe, original
+testassert dword:[cmdline_setcommandline:ObservedReady] == 0, "arguments must be unobserved before SetCmdline"
+testassert dword:[cmdline_setcommandline:ObservedStartupCallback] == 0, "SetCmdline must precede the target TLS callback"
 cmdlinesetup
+mov launch_stops, 0
+await_replacement:
+cmp dword:[cmdline_setcommandline:ObservedReady], 1
+je replacement_observed
+inc launch_stops
+testassert launch_stops <= .64, "rewritten argument observation stop limit"
 run
+jmp await_replacement
+replacement_observed:
+testassert dword:[cmdline_setcommandline:ObservedStartupCallback] == 1, "target TLS callback must execute after SetCmdline"
 cmdlineassert
