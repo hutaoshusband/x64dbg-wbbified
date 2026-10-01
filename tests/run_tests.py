@@ -114,6 +114,32 @@ def run_fixture_oracles(environment, results):
     print(f"[VERIFIED] Five normal {environment.architecture} fixture outcomes", flush=True)
 
 
+def run_native_memory_oracles(environment, results):
+    binary, binary_identity, machine = native_fixture_identity(environment, "membp")
+    expected_exits = {1: 255, 2: 510, 3: 90, 4: 345, 5: 51, 6: 102, 7: 188, 8: 100, 9: 255, 10: 510,
+                      11: 102, 12: 180, 16: 510, 17: 102, 18: 180, 19: 255, 20: 90, 21: 100, 22: 165, 48: 104}
+    observations = []
+    modes = [(str(mode), code, True) for mode, code in expected_exits.items()]
+    modes.extend((value, 238, True) for value in (None, "15", "not-a-mode", "9" * 40))
+    modes.append(("1", 0, False))
+    for mode, expected_exit, normal in modes:
+        child_environment = dict(os.environ)
+        child_environment.pop("WININSPECT_TEST_NORMAL", None)
+        child_environment.pop("WININSPECT_TEST_MEMORY_MODE", None)
+        if normal:
+            child_environment["WININSPECT_TEST_NORMAL"] = "1"
+        if mode is not None:
+            child_environment["WININSPECT_TEST_MEMORY_MODE"] = mode
+        receipt = run_owned_native_command([str(binary)], child_environment, 10)
+        assert receipt["exitCode"] == expected_exit and not receipt["timedOut"], f"Normal memory mode {mode!r} differs: {receipt}"
+        assert not receipt["stdout"], f"Memory fixture unexpectedly emitted output: {receipt['stdout']}"
+        observations.append({"mode": mode, "normalSelected": normal, "expectedExitCode": expected_exit, "receipt": receipt})
+    assert file_identity(binary) == binary_identity
+    results.append({"name": "test_native_memory_oracles", "status": "verified", "oracle": {
+        "binary": binary_identity, "machine": machine, "observations": observations, "debuggerUsed": False}})
+    print(f"[VERIFIED] Twenty-five normal native {environment.architecture} memory exit references", flush=True)
+
+
 def run_case(function, debugger, results):
     started = time.monotonic()
     result = {"name": function.__name__, "status": "verified"}
@@ -307,7 +333,7 @@ def main():
     if native_surface:
         names = ["test_native_runtime_surface_inventory"]
     if arguments.phase == "fixtures":
-        names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles"]
+        names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles", "test_native_memory_oracles"]
     if arguments.phase == "runner":
         names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
@@ -391,6 +417,8 @@ def main():
                     run_native_argument_oracles(environment, architecture_results)
                 if "test_native_guard_page_oracles" in selected_names:
                     run_native_guard_page_oracles(environment, architecture_results)
+                if "test_native_memory_oracles" in selected_names:
+                    run_native_memory_oracles(environment, architecture_results)
             functional = [function for function in functions if function.__name__ in selected_names]
             if functional:
                 run_functional(environment, functional, architecture_results, arguments.timeout)

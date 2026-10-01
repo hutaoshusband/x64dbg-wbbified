@@ -230,8 +230,33 @@ extern "C"
         LargeRangeSequence();
     }
 
+    void SetNormalStartMode()
+    {
+        wchar_t normalFlag[2];
+        if(GetEnvironmentVariableW(L"WININSPECT_TEST_NORMAL", normalFlag, 2) != 1 || normalFlag[0] != L'1')
+            return;
+        constexpr DWORD ModeBufferLength = 12;
+        wchar_t modeText[ModeBufferLength];
+        const auto length = GetEnvironmentVariableW(L"WININSPECT_TEST_MEMORY_MODE", modeText, ModeBufferLength);
+        if(length == 0 || length >= ModeBufferLength)
+            ExitProcess(0xEE);
+        DWORD mode = 0;
+        for(DWORD index = 0; index < length; ++index)
+        {
+            if(modeText[index] < L'0' || modeText[index] > L'9')
+                ExitProcess(0xEE);
+            mode = mode * 10 + static_cast<DWORD>(modeText[index] - L'0');
+            if(mode > 0x30)
+                ExitProcess(0xEE);
+        }
+        if(!((mode >= 1 && mode <= 12) || (mode >= 0x10 && mode <= 0x16) || mode == 0x30))
+            ExitProcess(0xEE);
+        StartMode = mode;
+    }
+
     __declspec(noinline) void start()
     {
+        SetNormalStartMode();
         switch(StartMode)
         {
         case 1:
