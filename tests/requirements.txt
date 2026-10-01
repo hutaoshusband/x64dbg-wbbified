@@ -1,1 +1,2 @@
 jsonschema==4.25.1
+pefile==2024.8.26

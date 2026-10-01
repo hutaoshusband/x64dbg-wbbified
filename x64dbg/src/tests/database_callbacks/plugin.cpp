@@ -394,6 +394,41 @@ namespace
         return _plugin_testassert(!gDbLoadCommentSetPending, "database-load callback was not triggered") &&
                _plugin_testassert(gDbLoadCommentSetSeen, "regular database operation was not emitted as CB_DBOPERATION");
     }
+
+    bool cbAssertSnapshot(int argc, char** argv)
+    {
+        if(argc != 6)
+            return false;
+
+        const duint address = evalExpr(argv[1]);
+        const duint expectedEnd = evalExpr(argv[2]);
+        const unsigned int expectedColor = static_cast<unsigned int>(evalExpr(argv[5]));
+        if(!_plugin_testassert(address != 0 && expectedEnd >= address, "invalid annotation snapshot range"))
+            return false;
+
+        char label[MAX_LABEL_SIZE] = {};
+        char comment[MAX_COMMENT_SIZE] = {};
+        if(!_plugin_testassert(DbgGetLabelAt(address, SEG_DEFAULT, label), "snapshot label is missing") ||
+                !_plugin_testassert(strcmp(label, argv[3]) == 0, "snapshot label differs") ||
+                !_plugin_testassert(DbgGetCommentAt(address, comment), "snapshot comment is missing") ||
+                !_plugin_testassert(strcmp(comment, argv[4]) == 0, "snapshot comment differs") ||
+                !_plugin_testassert(DbgGetBookmarkAt(address), "snapshot bookmark is missing"))
+            return false;
+
+        duint start = 0;
+        duint end = 0;
+        if(!_plugin_testassert(DbgFunctionGet(address, &start, &end), "snapshot function is missing") ||
+                !_plugin_testassert(start == address && end == expectedEnd, "snapshot function range differs") ||
+                !_plugin_testassert(DbgArgumentGet(address, &start, &end), "snapshot argument is missing") ||
+                !_plugin_testassert(start == address && end == expectedEnd, "snapshot argument range differs") ||
+                !_plugin_testassert(DbgLoopGet(0, address, &start, &end), "snapshot loop is missing") ||
+                !_plugin_testassert(start == address && end == expectedEnd, "snapshot loop range differs"))
+            return false;
+
+        unsigned int color = 0;
+        return _plugin_testassert(DbgGetAddressColorAt(address, &color), "snapshot address color is missing") &&
+               _plugin_testassert(color == expectedColor, "snapshot address color differs");
+    }
 }
 
 extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* initStruct)
@@ -410,6 +445,7 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* initStruct)
     _plugin_registercommand(gPluginHandle, "dbreentrantcommentset", cbReentrantCommentSet, false);
     _plugin_registercommand(gPluginHandle, "dbloadcommentset", cbDbLoadCommentSet, false);
     _plugin_registercommand(gPluginHandle, "assertdbloadcommentset", cbAssertDbLoadCommentSet, false);
+    _plugin_registercommand(gPluginHandle, "dbassertsnapshot", cbAssertSnapshot, false);
     _plugin_registercommand(gPluginHandle, "assertlastop", cbAssertLastOperation, false);
     _plugin_registercommand(gPluginHandle, "assertopsize", cbAssertOperationsSize, false);
     _plugin_registercommand(gPluginHandle, "assertaddresscolor", cbAssertAddressColor, false);

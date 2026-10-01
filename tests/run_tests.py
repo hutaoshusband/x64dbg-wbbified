@@ -14,7 +14,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
 import cases
-from wi_driver import CREATE_SUSPENDED, McpError, OwnedJob, ROOT, SuiteEnvironment, WinInspect, build_debugger, build_targets, file_identity, process_identity, read_kv, resume_suspended_process, write_json
+from wi_driver import CREATE_SUSPENDED, McpError, OwnedJob, ROOT, SuiteEnvironment, WinInspect, build_debugger, build_targets, file_identity, loaded_modules, process_identity, read_kv, resume_suspended_process, write_json
 
 
 def native_fixture_identity(environment, name):
@@ -266,9 +266,12 @@ def parse_arguments():
     return arguments
 
 
-def run_owned_native_command(command, environment, timeout):
+def run_owned_native_command(command, environment, timeout, required_modules=()):
     timed_out = False
     process = None
+    modules = []
+    deadline = time.monotonic() + timeout
+    expected_modules = {str(Path(path).resolve()).lower() for path in required_modules}
     with OwnedJob() as ownership:
         try:
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -278,7 +281,18 @@ def run_owned_native_command(command, environment, timeout):
             ownership.assign(process)
             startup_thread = resume_suspended_process(process)
             try:
-                stdout, _ = process.communicate(timeout=timeout)
+                while expected_modules and not modules and process.poll() is None:
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    try:
+                        observed_modules = loaded_modules(process)
+                        if expected_modules <= {item["path"].lower() for item in observed_modules}:
+                            modules = observed_modules
+                    except OSError:
+                        pass
+                    if not modules:
+                        time.sleep(0.02)
+                stdout, _ = process.communicate(timeout=max(0.01, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 timed_out = True
                 ownership.close()
@@ -290,8 +304,11 @@ def run_owned_native_command(command, environment, timeout):
                 ownership.close()
                 process.kill()
                 process.communicate()
-    return {"command": command, "processIdentity": identity, "startupThread": startup_thread, "exitCode": process.returncode,
-            "stdout": stdout, "timedOut": timed_out, "terminalObserved": process.poll() is not None, "jobClosed": True}
+    receipt = {"command": command, "processIdentity": identity, "startupThread": startup_thread, "exitCode": process.returncode,
+               "stdout": stdout, "timedOut": timed_out, "terminalObserved": process.poll() is not None, "jobClosed": True}
+    if expected_modules:
+        receipt["loadedModules"] = modules
+    return receipt
 
 
 def run_native_suite(arguments, run_root):
@@ -333,7 +350,8 @@ def main():
     if native_surface:
         names = ["test_native_runtime_surface_inventory"]
     if arguments.phase == "fixtures":
-        names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles", "test_native_memory_oracles"]
+        names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles", "test_native_memory_oracles",
+                 "test_native_database_oracles"]
     if arguments.phase == "runner":
         names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
@@ -419,6 +437,10 @@ def main():
                     run_native_guard_page_oracles(environment, architecture_results)
                 if "test_native_memory_oracles" in selected_names:
                     run_native_memory_oracles(environment, architecture_results)
+                if "test_native_database_oracles" in selected_names:
+                    from database_checks import run_database_oracles
+                    run_database_oracles(environment, architecture_results, arguments.engine, arguments.timeout,
+                                         native_fixture_identity, run_owned_native_command)
             functional = [function for function in functions if function.__name__ in selected_names]
             if functional:
                 run_functional(environment, functional, architecture_results, arguments.timeout)
