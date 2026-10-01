@@ -1,6 +1,16 @@
 settingset Events, EntryBreakpoint, 1
+settingset Events, TlsCallbacks, 0
 init tests/membp.exe
+mov startup_stops, 0
+await_entry:
+cmp cip, membp:entry
+je entry_ready
+inc startup_stops
+testassert startup_stops <= .64, "memory fixture entry stop limit"
 run
+jmp await_entry
+entry_ready:
+testassert cip == membp:entry, "memory fixture must stop at its actual entry point"
 mbreset
 mbsetstartmode 8
 bpmrange membp:CrossPageReadSequence, 1, x
