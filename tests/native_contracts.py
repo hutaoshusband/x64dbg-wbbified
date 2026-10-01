@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import fnmatch
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -8,11 +9,12 @@ import struct
 import subprocess
 import time
 
-from wi_driver import McpError, ROOT, compiler_environment, file_identity, write_json
+from wi_driver import McpError, ROOT, compiler_environment, file_identity, process_identity, write_json
 
 
 CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_context_roundtrip",
-              "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser")
+              "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser",
+              "test_result_contracts", "test_registry_contracts", "test_registry_dispatch")
 
 
 def build_contract_fixture(output, architecture):
@@ -68,13 +70,27 @@ class ContractProbe:
         if argument is not None:
             command.append(argument)
         payload = raw if raw is not None else b"" if value is None else json.dumps(value, ensure_ascii=False).encode("utf-8")
-        process = subprocess.run(command, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 timeout=self.timeout, creationflags=subprocess.CREATE_NO_WINDOW)
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+        timed_out = False
+        try:
+            identity = process_identity(process)
+            stdout, stderr = process.communicate(payload, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            stdout, stderr = process.communicate()
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+            raise
         observation = {"command": command, "inputSha256": hashlib.sha256(payload).hexdigest(), "inputSize": len(payload),
-                       "exitCode": process.returncode, "stderr": process.stderr.decode("utf-8", "replace")}
+                       "processIdentity": identity, "exitCode": process.returncode, "timedOut": timed_out, "stderr": stderr.decode("utf-8", "replace")}
         self.observations.append(observation)
+        assert not timed_out, f"Owned contract fixture timed out: {identity}"
         assert process.returncode == 0, observation
-        response = json.loads(process.stdout)
+        response = json.loads(stdout)
         observation["response"] = response
         return response
 
@@ -129,7 +145,159 @@ def contract_examples():
         "Hex64": [(True, "0x0"), (True, "0xffffffffffffffff"), (False, 18446744073709551615), (False, "0x10000000000000000"), (False, "0x00"), (False, "0xFF")],
         "Decimal64": [(True, "0"), (True, "18446744073709551615"), (False, "18446744073709551616"), (False, "01"), (False, "-1"), (False, 9007199254740993)]
     }
+    recovery = {"capabilityId": "jobs_get", "retry": "after_reconciliation", "reason": "Inspect the operation"}
+    evidence = {"kind": "readback", "source": "native_fixture", "summary": "Observed exact bytes"}
+    examples.update({
+        "LibraryRef": [(True, {"namespaceId": "private-1", "objectId": "script-1", "revision": "rev-2"}), (False, {"namespaceId": "private-1", "objectId": "script-1"})],
+        "JobRef": [(True, {"jobId": "job-1"}), (False, {"jobId": None})],
+        "EventRef": [(True, {"cursor": "opaque:9007199254740993"}), (False, {"cursor": 9007199254740993})],
+        "RecoveryRoute": [(True, recovery), (False, {**recovery, "retry": "automatically"})],
+        "DomainError": [(True, {"code": "timeout_unknown", "message": "Reconcile", "path": "", "recovery": recovery}), (False, {"code": "success", "message": "Incorrect", "path": ""})],
+        "ResultContext": [(True, {"brokerGeneration": "18446744073709551615"}), (True, target), (True, paused), (False, {**target, "brokerGeneration": "1"})],
+        "VerificationEvidence": [(True, evidence), (True, {**evidence, "artifactId": "artifact-1", "sha256": "0" * 64}), (False, {**evidence, "sha256": "0" * 63})],
+        "Verification": [(True, {"status": "verified", "evidence": [evidence]}), (True, {"status": "unverified", "evidence": [], "followUp": recovery}),
+                         (True, {"status": "pending", "evidence": []}), (False, {"status": "verified", "evidence": []}), (False, {"status": "unverified", "evidence": []}), (False, {"status": "passed", "evidence": [evidence]})],
+        "ResultWarning": [(True, {"code": "scan_holes", "message": "Some ranges are unreadable"}), (False, {"code": "", "message": "Missing warning code"})],
+        "ResultTimings": [(True, {"startedUtcMs": "9007199254740993", "elapsedUs": "18446744073709551615", "queueUs": "0"}), (False, {"startedUtcMs": 9007199254740993, "elapsedUs": "1", "queueUs": "0"})],
+        "EffectObservation": [(True, {"stepId": "write-1", "status": "restored", "summary": "Original bytes observed"}), (False, {"stepId": "write-1", "status": "successful", "summary": "Unknown status"})],
+        "ResultPagination": [(True, {"snapshotVersion": "9007199254740993", "complete": True}), (True, {"snapshotVersion": "1", "complete": False, "nextCursor": "next"}),
+                             (False, {"snapshotVersion": "1", "complete": False}), (False, {"snapshotVersion": "1", "complete": True, "nextCursor": "contradiction"}), (False, {"snapshotVersion": "1", "complete": 1})]
+    })
     return examples, mutation
+
+
+def check_results(probe, formats):
+    from jsonschema import Draft202012Validator
+    fixture = probe.call("result-cases")
+    for schema in (fixture["schema"], fixture["unverifiedSchema"]):
+        Draft202012Validator.check_schema(schema)
+    strict = Draft202012Validator(fixture["schema"], format_checker=formats)
+    relaxed = Draft202012Validator(fixture["unverifiedSchema"], format_checker=formats)
+    results = fixture["results"]
+    assert [result["outcome"] for result in results] == ["completed", "accepted", "partial_failure", "failed", "cancelled", "unknown", "completed"]
+    for index, result in enumerate(results):
+        expected = index != 6
+        assert strict.is_valid(result) == expected
+        assert probe.call("result-validate", result)["valid"] == expected
+        assert relaxed.is_valid(result) and probe.call("result-unverified", result)["valid"]
+        assert result["stateVersion"] == "18446744073709551615" and result["context"]["stopEpoch"] == "9007199254740993"
+        assert result["timings"]["elapsedUs"] == "18446744073709551615"
+    mutations = []
+    assert results[0]["jobId"] == "job-fixture" and results[5]["effects"][0]["status"] == "applied" and results[5]["partial"] is True
+    for index, field in ((0, "operationId"), (1, "jobId"), (2, "effects"), (2, "recovery"), (5, "reconciliation"), (5, "effects")):
+        changed = copy.deepcopy(results[index])
+        del changed[field]
+        mutations.append(changed)
+    for index, field, value in ((0, "error", results[3]["error"]), (0, "jobId", ""), (1, "data", {"value": "0x1"}),
+                               (1, "verification", results[0]["verification"]), (2, "effects", []), (2, "partial", False),
+                               (3, "error", results[2]["error"]), (5, "outcome", "completed"), (0, "data", {"value": 9007199254740993}),
+                               (0, "data", {"value": "0x1", "unknown": "reject"}), (0, "warnings", [{"code": "warning", "message": "Bounded"}] * 101),
+                               (0, "page", {"snapshotVersion": "1", "complete": False}), (0, "page", {"snapshotVersion": "1", "complete": True, "nextCursor": "contradiction"})):
+        changed = copy.deepcopy(results[index])
+        changed[field] = value
+        mutations.append(changed)
+    changed = copy.deepcopy(results[0])
+    changed["verification"]["evidence"] = []
+    mutations.append(changed)
+    changed = copy.deepcopy(results[0])
+    changed["timings"]["queueUs"] = "18446744073709551616"
+    mutations.append(changed)
+    changed = copy.deepcopy(results[6])
+    del changed["verification"]["followUp"]
+    assert not relaxed.is_valid(changed) and not probe.call("result-unverified", changed)["valid"]
+    for index, changed in enumerate(mutations):
+        assert not strict.is_valid(changed), f"Independent result validator accepted contradiction {index}"
+        assert not probe.call("result-validate", changed)["valid"], f"Native result validator accepted contradiction {index}"
+    expected_codes = {"debugger_unavailable", "target_required", "target_running", "stale_context", "lease_conflict", "elevation_required", "elevation_denied", "permission_denied", "expected_bytes_mismatch", "file_hash_mismatch", "unsupported_mapping", "partial_failure", "timeout_unknown", "resource_limit", "unsupported_capability", "event_gap", "idempotency_conflict", "invalid_argument", "internal_error"}
+    assert {error["code"] for error in fixture["errors"]} == expected_codes
+    return {"typedOutcomes": 6, "rejectedContradictions": len(mutations) + 1, "typedErrorCodes": sorted(expected_codes)}
+
+
+def registry_validators(registry, formats):
+    from jsonschema import Draft202012Validator
+    validators = {}
+    expected = {"server_info", "server_health", "capabilities_list", "capabilities_describe", "capabilities_search", "client_context_get", "client_context_set", "control_acquire", "control_renew", "control_release"}
+    assert registry["operationalTools"] == [] and {tool["name"] for tool in registry["tools"]} == expected
+    assert [tool["name"] for tool in registry["tools"]] == sorted(expected)
+    for tool in registry["tools"]:
+        assert tool["schemaVersion"] == 1 and tool["operational"] is False
+        assert tool["completionPredicate"] and tool["nativeSource"] and tool["recovery"] and tool["acceptanceIds"]
+        assert tool["annotations"]["readOnlyHint"] == (tool["effects"] == ["inspect"])
+        assert tool["executor"] == "broker" and tool["architectureRequirement"] == "any"
+        for direction in ("input", "output"):
+            schema = tool[f"{direction}Schema"]
+            Draft202012Validator.check_schema(schema)
+            assert schema["$id"] == f"urn:wininspect:mcp:tool:v1:{tool['name']}:{direction}"
+            validators[(tool["name"], direction)] = Draft202012Validator(schema, format_checker=formats)
+    return validators
+
+
+def check_registry_contracts(probe, registry, validators):
+    target = {"instanceId": "instance-1", "targetId": "target-1", "targetGeneration": "18446744073709551615"}
+    examples = {
+        "server_info": {}, "server_health": {}, "capabilities_list": {"limit": 2, "availability": "planned"},
+        "capabilities_describe": {"capabilityId": "server_info"}, "capabilities_search": {"query": "capabilities", "limit": 2},
+        "client_context_get": {}, "client_context_set": {"defaultTarget": target},
+        "control_acquire": {**target, "purpose": "Controlled fixture", "durationMs": 30000, "idempotencyKey": "request-1"},
+        "control_renew": {**target, "leaseId": "lease-1", "durationMs": 60000}, "control_release": {**target, "leaseId": "lease-1"}}
+    comparisons = 0
+    for name, value in examples.items():
+        validator = validators[(name, "input")]
+        assert validator.is_valid(value) and probe.call("tool-input", value, name)["valid"]
+        unknown = {**value, "unregisteredField": "reject"}
+        assert not validator.is_valid(unknown) and not probe.call("tool-input", unknown, name)["valid"]
+        comparisons += 2
+    for name, value in (("control_acquire", {**examples["control_acquire"], "durationMs": 0}),
+                        ("control_renew", {**examples["control_renew"], "durationMs": 60001}),
+                        ("control_release", {**examples["control_release"], "targetGeneration": 9007199254740993}),
+                        ("capabilities_list", {"availability": "ready"}), ("capabilities_search", {"query": "x" * 257}),
+                        ("client_context_set", {"defaultTarget": {**target, "targetGeneration": "18446744073709551616"}})):
+        assert not validators[(name, "input")].is_valid(value) and not probe.call("tool-input", value, name)["valid"]
+        comparisons += 1
+    for tool in registry["tools"]:
+        assert tool["availability"] == ("implemented" if tool["name"] in ("capabilities_list", "capabilities_describe", "capabilities_search") else "planned")
+    return {"declaredTools": len(registry["tools"]), "independentComparisons": comparisons, "operationalTools": 0}
+
+
+def check_registry_dispatch(probe, registry, validators):
+    def call(name, value):
+        response = probe.call("call", value, name)
+        assert response["valid"], response
+        result = response["result"]
+        assert validators[(name, "output")].is_valid(result), f"Independent output rejection for {name}"
+        assert probe.call("tool-output", result, name)["valid"]
+        assert result["outcome"] == "completed" and result["verification"]["status"] == "verified"
+        assert result["context"] == {"brokerGeneration": "9007199254740993"} and result["stateVersion"] == "18446744073709551615"
+        return result["data"]
+    actual = []
+    request = {"limit": 2}
+    cursors = []
+    while True:
+        page = call("capabilities_list", request)
+        assert page["snapshotId"] == registry["buildId"] and len(page["items"]) <= 2
+        actual.extend(page["items"])
+        if page["complete"]:
+            assert "nextCursor" not in page
+            break
+        cursors.append(page["nextCursor"])
+        request = {"limit": 2, "cursor": page["nextCursor"]}
+    assert actual == registry["tools"] and len({item["name"] for item in actual}) == len(actual)
+    assert not probe.call("call", {"limit": 2, "cursor": cursors[0], "domain": "capabilities"}, "capabilities_list")["valid"]
+    assert not probe.call("call", {"cursor": "registry:wrong-build:capabilities_list"}, "capabilities_list")["valid"]
+    implemented = call("capabilities_list", {"availability": "implemented"})
+    assert [item["name"] for item in implemented["items"]] == ["capabilities_describe", "capabilities_list", "capabilities_search"]
+    assert call("capabilities_list", {"provider": "missing.provider"})["items"] == []
+    for tool in actual:
+        assert call("capabilities_describe", {"capabilityId": tool["name"]})["capability"] == tool
+    search = call("capabilities_search", {"query": "CAPABILITIES_LIST", "limit": 1})
+    assert search["items"][0] == {"capabilityId": "capabilities_list", "description": next(item["description"] for item in actual if item["name"] == "capabilities_list"), "score": 3}
+    ranked = call("capabilities_search", {"query": "capabilities"})
+    assert [item["capabilityId"] for item in ranked["items"] if item["score"] == 2] == ["capabilities_describe", "capabilities_list", "capabilities_search"]
+    for name, value in (("server_info", {}), ("control_release", {"instanceId": "instance-1", "targetId": "target-1", "targetGeneration": "1", "leaseId": "lease-1"}),
+                        ("missing_tool", {}), ("capabilities_describe", {"capabilityId": "missing_tool"})):
+        rejected = probe.call("call", value, name)
+        assert not rejected["valid"] and rejected["error"]["code"] == "unsupported_capability"
+    return {"exactDescriptors": len(actual), "paginationPages": len(cursors) + 1, "implementedNativeMetadataHandlers": 3, "publicOperationalTools": 0}
 
 
 def run_contract_checks(binary, output, architecture, selected, timeout):
@@ -137,6 +305,11 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
     catalog = probe.call("catalog")
     write_json(Path(output) / "compiled-contracts.json", catalog)
     validators = independent_validators(catalog)
+    registry = probe.call("registry")
+    write_json(Path(output) / "compiled-registry.json", registry)
+    catalog["tools"] = registry["tools"]
+    formats = validators["Hex64"].format_checker
+    tool_validators = registry_validators(registry, formats)
     examples, mutation = contract_examples()
     results = []
     for name in CASE_NAMES:
@@ -209,6 +382,16 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                     if expected:
                         assert observed["method"] == "POST" and observed["target"] == "/mcp" and observed["body"] == "{}"
                 result["requestCases"] = len(requests)
+            elif name == "test_result_contracts":
+                result.update(check_results(probe, formats))
+                fixture = probe.call("result-cases")
+                assert len(set(result["typedErrorCodes"])) == 19
+                for error in fixture["errors"]:
+                    assert validators["DomainError"].is_valid(error) and probe.call("validate", error, "DomainError")["valid"]
+            elif name == "test_registry_contracts":
+                result.update(check_registry_contracts(probe, registry, tool_validators))
+            elif name == "test_registry_dispatch":
+                result.update(check_registry_dispatch(probe, registry, tool_validators))
         except Exception as error:
             result.update(status="failed", error=str(error))
         result["seconds"] = round(time.monotonic() - started, 3)

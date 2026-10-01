@@ -233,7 +233,7 @@ def main():
             except Exception as error:
                 results.append({"architecture": architecture, "name": "environment", "status": "failed", "error": str(error)})
                 print(f"[FAILED] {architecture}: {error}", flush=True)
-        if len(catalogs) == 2 and catalogs[0]["contracts"] != catalogs[1]["contracts"]:
+        if len(catalogs) == 2 and (catalogs[0]["contracts"] != catalogs[1]["contracts"] or catalogs[0]["tools"] != catalogs[1]["tools"]):
             results.append({"name": "cross_architecture_contracts", "status": "failed", "error": "Compiled schemas differ"})
         write_json(run_root / "summary.json", {"phase": arguments.phase, "results": results})
         return int(any(result["status"] != "verified" for result in results))

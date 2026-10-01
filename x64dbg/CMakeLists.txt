@@ -1191,6 +1191,8 @@ if(X64DBG_BUILD_MCP) # mcp
 		cmake.toml
 		"src/mcp/common/contracts.cpp"
 		"src/mcp/common/contracts.h"
+		"src/mcp/common/registry.cpp"
+		"src/mcp/common/registry.h"
 	)
 
 	add_library(mcp_common STATIC)

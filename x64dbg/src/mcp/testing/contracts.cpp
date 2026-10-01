@@ -1,4 +1,5 @@
 #include "contracts.h"
+#include "registry.h"
 #include <boost/beast/http.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/version.hpp>
@@ -146,6 +147,34 @@ Json normalized_contract(std::string_view name, const Json& input)
     }
     throw std::runtime_error("Unsupported normalization contract");
 }
+
+Json result_examples()
+{
+    const RecoveryRoute recovery{"jobs_get", RetryPolicy::AfterReconciliation, "Inspect the retained operation before another attempt"};
+    const VerificationEvidence evidence{"fixture_observation", "native_contract_fixture", "Typed serialization fixture", {}, {}};
+    ResultHeader header{{"operation-fixture"}, PausedContext{{{"instance-1"}, {"target-1"}, UINT64_MAX}, 9007199254740993ull, 1}, UINT64_MAX,
+        {VerificationStatus::Verified, {evidence}, {}}, {}, {9007199254740993ull, UINT64_MAX, 0}};
+    const Json data = {{"value", "0xffffffffffffffff"}};
+    Json examples = Json::array();
+    header.jobId = JobId{"job-fixture"};
+    examples.push_back(result_json(OperationResult<Json>{header, CompletedResult<Json>{data, false, ResultPagination{UINT64_MAX, true, {}}}}));
+    header.verification = {VerificationStatus::Pending, {}, {}};
+    examples.push_back(result_json(OperationResult<Json>{header, AcceptedResult{{"job-fixture"}}}));
+    header.verification = {VerificationStatus::Failed, {evidence}, {}};
+    examples.push_back(result_json(OperationResult<Json>{header, PartialFailureResult<Json>{data, {DomainErrorCode::PartialFailure, "Observed write could not be completely restored", "/ranges/1", recovery}, {{"range-1", EffectStatus::Applied, "One range remains changed"}}, recovery}}));
+    examples.push_back(result_json(OperationResult<Json>{header, FailedResult{{DomainErrorCode::ExpectedBytesMismatch, "Precondition differs before mutation", "/expected", {}}}}));
+    header.verification = {VerificationStatus::Verified, {evidence}, {}};
+    examples.push_back(result_json(OperationResult<Json>{header, CancelledResult<Json>{{}, {}}}));
+    header.verification = {VerificationStatus::Unknown, {}, {}};
+    examples.push_back(result_json(OperationResult<Json>{header, UnknownResult<Json>{{}, {DomainErrorCode::TimeoutUnknown, "Completion requires reconciliation", "", recovery}, recovery, {{"range-1", EffectStatus::Applied, "One effect is already observed; completion remains unknown"}}}}));
+    header.verification = {VerificationStatus::Unverified, {}, recovery};
+    examples.push_back(result_json(OperationResult<Json>{header, CompletedResult<Json>{data, false, {}}}));
+    Json errors = Json::array();
+    for(std::size_t index = 0; index <= static_cast<std::size_t>(DomainErrorCode::InternalError); ++index)
+        errors.push_back(domain_error_json({static_cast<DomainErrorCode>(index), "Typed error serialization", "", {}}));
+    return {{"results", examples}, {"errors", errors}, {"schema", result_schema(closed_object_schema({{"value", contract_schema("Hex64")}}, {"value"}))},
+            {"unverifiedSchema", result_schema(closed_object_schema({{"value", contract_schema("Hex64")}}, {"value"}), true)}};
+}
 }
 
 int main(int argc, char** argv)
@@ -158,6 +187,10 @@ int main(int argc, char** argv)
         const std::string mode = argc > 1 ? argv[1] : "";
         if(mode == "catalog" && argc == 2)
             reply = compiled_contracts();
+        else if(mode == "registry" && argc == 2)
+            reply = compiled_tool_registry();
+        else if(mode == "result-cases" && argc == 2)
+            reply = result_examples();
         else if(mode == "dependencies" && argc == 2)
             reply = dependency_probe();
         else
@@ -175,7 +208,28 @@ int main(int argc, char** argv)
                 else
                 {
                     const auto& input = std::get<Json>(parsed);
-                    if((mode == "validate" || mode == "normalize") && argc == 3)
+                    if((mode == "result-validate" || mode == "result-unverified") && argc == 2)
+                    {
+                        const auto schema = result_schema(closed_object_schema({{"value", contract_schema("Hex64")}}, {"value"}), mode == "result-unverified");
+                        const auto error = validate_schema(schema, input);
+                        reply = error ? Json{{"valid", false}, {"error", error_json(*error)}} : Json{{"valid", true}};
+                    }
+                    else if((mode == "tool-input" || mode == "tool-output" || mode == "call") && argc == 3)
+                    {
+                        if(mode == "call")
+                        {
+                            const auto result = call_registry_tool(argv[2], input, {{"operation-fixture"}, 9007199254740993ull, UINT64_MAX});
+                            reply = checked_reply(result);
+                            if(const auto* output = std::get_if<Json>(&result))
+                                reply["result"] = *output;
+                        }
+                        else
+                        {
+                            const auto error = mode == "tool-input" ? validate_tool_input(argv[2], input) : validate_tool_output(argv[2], input);
+                            reply = error ? Json{{"valid", false}, {"error", error_json(*error)}} : Json{{"valid", true}};
+                        }
+                    }
+                    else if((mode == "validate" || mode == "normalize") && argc == 3)
                     {
                         const auto error = validate_contract(argv[2], input);
                         reply = error ? Json{{"valid", false}, {"error", error_json(*error)}} : mode == "validate" ? Json{{"valid", true}} : normalized_contract(argv[2], input);
@@ -198,7 +252,7 @@ int main(int argc, char** argv)
                         }
                     }
                     else
-                        throw std::runtime_error("Expected catalog, dependencies, http, validate, normalize or range mode");
+                        throw std::runtime_error("Expected catalog, registry, result-cases, dependencies, http, validate, normalize, range, tool-input, tool-output or call mode");
                 }
             }
         }

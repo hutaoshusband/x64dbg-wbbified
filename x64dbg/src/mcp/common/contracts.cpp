@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 #include <unordered_set>
 
 namespace wininspect::mcp
@@ -135,6 +136,10 @@ std::string child_path(const std::string& path, const std::string& key)
 
 std::optional<ContractError> validate_node(const Json& schema, const Json& input, const std::string& path)
 {
+    if(schema.contains("const") && input != schema.at("const"))
+        return invalid(path, "Value differs from the required constant");
+    if(schema.contains("enum") && std::find(schema.at("enum").begin(), schema.at("enum").end(), input) == schema.at("enum").end())
+        return invalid(path, "Value is not in the allowed enumeration");
     if(schema.contains("oneOf"))
     {
         std::size_t matches = 0;
@@ -142,33 +147,62 @@ std::optional<ContractError> validate_node(const Json& schema, const Json& input
             matches += !validate_node(choice, input, path).has_value();
         if(matches != 1)
             return invalid(path, "Supply exactly one complete reference form");
-        return {};
     }
+    if(!schema.contains("type"))
+        return {};
     const auto type = schema.at("type").get<std::string>();
     if(type == "object")
     {
         if(!input.is_object())
             return invalid(path, "Expected an object");
         const auto& properties = schema.at("properties");
-        for(const auto& required : schema.at("required"))
+        for(const auto& required : schema.value("required", Json::array()))
             if(!input.contains(required.get<std::string>()))
                 return invalid(child_path(path, required.get<std::string>()), "Required field is missing");
         for(auto item = input.begin(); item != input.end(); ++item)
         {
             if(!properties.contains(item.key()))
-                return invalid(child_path(path, item.key()), "Unknown field");
+            {
+                const auto& additional = schema.at("additionalProperties");
+                if(additional == false)
+                    return invalid(child_path(path, item.key()), "Unknown field");
+                if(additional.is_object())
+                    if(auto error = validate_node(additional, item.value(), child_path(path, item.key())))
+                        return error;
+                continue;
+            }
             if(auto error = validate_node(properties.at(item.key()), item.value(), child_path(path, item.key())))
                 return error;
         }
         return {};
     }
+    if(type == "array")
+    {
+        if(!input.is_array() || input.size() < schema.at("minItems").get<std::size_t>() || input.size() > schema.at("maxItems").get<std::size_t>())
+            return invalid(path, "Expected an array within its declared item bounds");
+        for(std::size_t index = 0; index < input.size(); ++index)
+        {
+            if(auto error = validate_node(schema.at("items"), input.at(index), child_path(path, std::to_string(index))))
+                return error;
+            if(schema.value("uniqueItems", false))
+                for(std::size_t previous = 0; previous < index; ++previous)
+                    if(input.at(previous) == input.at(index))
+                        return invalid(child_path(path, std::to_string(index)), "Array items must be unique");
+        }
+        return {};
+    }
+    if(type == "boolean")
+        return input.is_boolean() ? std::optional<ContractError>{} : invalid(path, "Expected a boolean");
+    if(type == "null")
+        return input.is_null() ? std::optional<ContractError>{} : invalid(path, "Expected null");
     if(type == "string")
     {
         if(!input.is_string())
             return invalid(path, "Expected a string");
         const auto& text = input.get_ref<const std::string&>();
         const auto length = unicode_length(text);
-        if(!length || *length < schema.at("minLength").get<std::size_t>() || *length > schema.at("maxLength").get<std::size_t>())
+        if((!length && !text.empty()) || text.size() > MaximumFrameBytes ||
+           length.value_or(0) < schema.at("minLength").get<std::size_t>() || length.value_or(0) > schema.at("maxLength").get<std::size_t>())
             return invalid(path, "String encoding or length is invalid");
         if(!valid_format(schema.at("format").get<std::string>(), text))
             return invalid(path, "String representation is invalid");
@@ -202,6 +236,33 @@ PausedContext paused_from_validated(const Json& input)
 }
 }
 
+Json string_schema(std::string format, std::size_t maximum, std::size_t minimum)
+{
+    auto schema = text_schema(std::move(format), maximum);
+    schema["minLength"] = minimum;
+    return schema;
+}
+
+Json bounded_integer_schema(std::uint32_t minimum, std::uint32_t maximum, std::optional<std::uint32_t> fallback)
+{
+    return integer_schema(minimum, maximum, fallback);
+}
+
+Json closed_object_schema(Json properties, Json required)
+{
+    return object_schema(std::move(properties), std::move(required));
+}
+
+Json enum_schema(Json values)
+{
+    return {{"enum", std::move(values)}};
+}
+
+Json bounded_array_schema(Json items, std::size_t maximum, std::size_t minimum, bool unique)
+{
+    return {{"type", "array"}, {"items", std::move(items)}, {"minItems", minimum}, {"maxItems", maximum}, {"uniqueItems", unique}};
+}
+
 const std::vector<ContractDefinition>& contract_registry()
 {
     static const auto registry = []
@@ -223,6 +284,21 @@ const std::vector<ContractDefinition>& contract_registry()
             object_schema({{"addressHex", hexadecimal}}, {"addressHex"}),
             object_schema({{"moduleId", id}, {"rvaHex", hexadecimal}}, {"moduleId", "rvaHex"}),
             object_schema({{"expression", text_schema("utf8-text", 4096)}}, {"expression"})})}};
+        const auto recovery = closed_object_schema({{"capabilityId", id}, {"retry", enum_schema({"never", "after_refresh", "after_reconciliation"})},
+            {"reason", text_schema("utf8-text", 4096)}}, {"capabilityId", "retry", "reason"});
+        const auto evidence = closed_object_schema({{"kind", id}, {"source", text_schema("utf8-text", 4096)},
+            {"summary", text_schema("utf8-text", 4096)}, {"artifactId", id}, {"sha256", text_schema("sha256", 64)}}, {"kind", "source", "summary"});
+        const auto verification_properties = Json{{"status", enum_schema({"verified", "unverified", "pending", "failed", "unknown"})},
+            {"evidence", bounded_array_schema(evidence, 100)}, {"followUp", recovery}};
+        auto verified = closed_object_schema(verification_properties, {"status", "evidence"});
+        verified["properties"]["status"] = {{"const", "verified"}};
+        verified["properties"]["evidence"]["minItems"] = 1;
+        auto unverified = closed_object_schema(verification_properties, {"status", "evidence", "followUp"});
+        unverified["properties"]["status"] = {{"const", "unverified"}};
+        auto incomplete = closed_object_schema(verification_properties, {"status", "evidence"});
+        incomplete["properties"]["status"] = enum_schema({"pending", "failed", "unknown"});
+        const auto page_complete = closed_object_schema({{"snapshotVersion", decimal}, {"complete", {{"const", true}}}}, {"snapshotVersion", "complete"});
+        const auto page_more = closed_object_schema({{"snapshotVersion", decimal}, {"complete", {{"const", false}}}, {"nextCursor", text_schema("utf8-text", 4096)}}, {"snapshotVersion", "complete", "nextCursor"});
         std::vector<ContractDefinition> entries = {
             {"InstanceRef", "A debugger instance identity resolved against the current broker and worker generation.", object_schema({{"instanceId", id}}, {"instanceId"})},
             {"TargetRef", "An explicit target identity and exact unsigned 64-bit load generation.", target},
@@ -235,7 +311,21 @@ const std::vector<ContractDefinition>& contract_registry()
             {"Page", "A bounded page request with an opaque cursor and a default of 100 rows.", object_schema({{"cursor", text_schema("utf8-text", 4096)}, {"limit", integer_schema(1, MaximumPageLimit, DefaultPageLimit)}}, Json::array())},
             {"Deadline", "A bounded request deadline with a default of 60000 milliseconds.", object_schema({{"timeoutMs", integer_schema(1, MaximumTimeoutMs, DefaultTimeoutMs)}}, Json::array())},
             {"Hex64", "An exact unsigned 64-bit value in canonical lowercase hexadecimal.", hexadecimal},
-            {"Decimal64", "An exact unsigned 64-bit count or sequence in canonical decimal.", decimal}
+            {"Decimal64", "An exact unsigned 64-bit count or sequence in canonical decimal.", decimal},
+            {"LibraryRef", "A namespaced library object bound to an explicit immutable revision.", closed_object_schema({{"namespaceId", id}, {"objectId", id}, {"revision", id}}, {"namespaceId", "objectId", "revision"})},
+            {"JobRef", "A job identity whose owner and grant are checked independently of possession.", closed_object_schema({{"jobId", id}}, {"jobId"})},
+            {"EventRef", "An opaque event cursor; sequence numbers are never inferred from JSON integers.", closed_object_schema({{"cursor", text_schema("utf8-text", 4096)}}, {"cursor"})},
+            {"RecoveryRoute", "An explicit capability and retry policy for refresh or reconciliation.", recovery},
+            {"DomainError", "A bounded machine-readable execution error with optional recovery; protocol errors use their transport envelope.", closed_object_schema({
+                {"code", enum_schema({"debugger_unavailable", "target_required", "target_running", "stale_context", "lease_conflict", "elevation_required", "elevation_denied", "permission_denied", "expected_bytes_mismatch", "file_hash_mismatch", "unsupported_mapping", "partial_failure", "timeout_unknown", "resource_limit", "unsupported_capability", "event_gap", "idempotency_conflict", "invalid_argument", "internal_error"})},
+                {"message", text_schema("utf8-text", 4096)}, {"path", string_schema("utf8-text", 4096, 0)}, {"recovery", recovery}}, {"code", "message", "path"})},
+            {"ResultContext", "A broker, instance, target or paused identity; each complete reference form is exclusive.", {{"oneOf", Json::array({closed_object_schema({{"brokerGeneration", decimal}}, {"brokerGeneration"}), closed_object_schema({{"instanceId", id}}, {"instanceId"}), target, paused})}}},
+            {"VerificationEvidence", "Bounded observed evidence with source and optional hashed artifact.", evidence},
+            {"Verification", "Verified requires evidence; unverified requires an explicit follow-up route.", {{"oneOf", Json::array({verified, unverified, incomplete})}}},
+            {"ResultWarning", "A bounded nonsecret warning that does not replace an execution error.", closed_object_schema({{"code", id}, {"message", text_schema("utf8-text", 4096)}}, {"code", "message"})},
+            {"ResultTimings", "Exact unsigned 64-bit UTC milliseconds and monotonic elapsed/queue microseconds.", closed_object_schema({{"startedUtcMs", decimal}, {"elapsedUs", decimal}, {"queueUs", decimal}}, {"startedUtcMs", "elapsedUs", "queueUs"})},
+            {"EffectObservation", "A per-step observation retained when an operation fails, is cancelled or is uncertain.", closed_object_schema({{"stepId", id}, {"status", enum_schema({"applied", "restored", "failed", "unknown"})}, {"summary", text_schema("utf8-text", 4096)}}, {"stepId", "status", "summary"})},
+            {"ResultPagination", "A stable snapshot version and either complete coverage or an explicit continuation cursor.", {{"oneOf", Json::array({page_complete, page_more})}}}
         };
         for(auto& entry : entries)
         {
@@ -264,6 +354,156 @@ std::optional<ContractError> validate_contract(std::string_view name, const Json
     if(entry == registry.end())
         return ContractError{"unknown_contract", "", "The contract name is not registered"};
     return validate_node(entry->schema, input, "");
+}
+
+Json contract_schema(std::string_view name)
+{
+    const auto& registry = contract_registry();
+    const auto entry = std::find_if(registry.begin(), registry.end(), [&](const auto& definition) { return definition.name == name; });
+    if(entry == registry.end())
+        throw std::invalid_argument("Unknown contract schema");
+    auto schema = entry->schema;
+    schema.erase("$id");
+    return schema;
+}
+
+std::optional<ContractError> validate_schema(const Json& schema, const Json& input)
+{
+    return validate_node(schema, input, "");
+}
+
+Json result_schema(Json data, bool allowUnverified)
+{
+    const auto id = string_schema("opaque-id");
+    const auto verification = contract_schema("Verification").at("oneOf");
+    const auto nullable_data = Json{{"oneOf", Json::array({data, {{"type", "null"}}})}};
+    Json choices = Json::array();
+    for(const auto* outcome : {"completed", "accepted", "partial_failure", "cancelled", "failed", "unknown"})
+    {
+        const std::string name = outcome;
+        Json properties = {{"schemaVersion", {{"const", ContractVersion}}}, {"outcome", {{"const", name}}},
+            {"operationId", id}, {"jobId", id}, {"context", contract_schema("ResultContext")}, {"stateVersion", contract_schema("Decimal64")},
+            {"data", name == "completed" ? data : name == "accepted" || name == "failed" ? Json{{"type", "null"}} : nullable_data},
+            {"warnings", bounded_array_schema(contract_schema("ResultWarning"), 100)}, {"timings", contract_schema("ResultTimings")},
+            {"partial", {{"const", name == "partial_failure"}}}};
+        Json required = {"schemaVersion", "outcome", "operationId", "context", "stateVersion", "data", "verification", "warnings", "timings", "partial"};
+        if(name == "completed" || name == "cancelled")
+        {
+            properties["verification"] = name == "completed" && allowUnverified ? Json{{"oneOf", Json::array({verification.at(0), verification.at(1)})}} : verification.at(0);
+            if(name == "completed")
+            {
+                properties["partial"] = {{"type", "boolean"}};
+                properties["page"] = contract_schema("ResultPagination");
+            }
+        }
+        else
+        {
+            auto status = verification.at(2);
+            status["properties"]["status"] = {{"const", name == "accepted" ? "pending" : name == "unknown" ? "unknown" : "failed"}};
+            properties["verification"] = status;
+        }
+        if(name == "accepted")
+        {
+            properties["jobId"] = id;
+            required.push_back("jobId");
+        }
+        if(name == "failed" || name == "partial_failure" || name == "unknown")
+        {
+            properties["error"] = contract_schema("DomainError");
+            if(name != "failed")
+                properties["error"]["properties"]["code"] = {{"const", name == "unknown" ? "timeout_unknown" : "partial_failure"}};
+            else
+            {
+                auto& codes = properties["error"]["properties"]["code"]["enum"];
+                codes.erase(std::remove(codes.begin(), codes.end(), "partial_failure"), codes.end());
+                codes.erase(std::remove(codes.begin(), codes.end(), "timeout_unknown"), codes.end());
+            }
+            required.push_back("error");
+        }
+        if(name == "partial_failure" || name == "cancelled" || name == "unknown")
+        {
+            properties["effects"] = bounded_array_schema(contract_schema("EffectObservation"), 1000, name == "partial_failure" ? 1 : 0);
+            required.push_back("effects");
+            if(name == "unknown")
+                properties["partial"] = {{"type", "boolean"}};
+        }
+        if(name == "partial_failure" || name == "unknown")
+        {
+            const std::string route = name == "unknown" ? "reconciliation" : "recovery";
+            properties[route] = contract_schema("RecoveryRoute");
+            required.push_back(route);
+        }
+        choices.push_back(closed_object_schema(std::move(properties), std::move(required)));
+    }
+    return {{"$schema", "https://json-schema.org/draft/2020-12/schema"}, {"oneOf", std::move(choices)}};
+}
+
+Json recovery_json(const RecoveryRoute& recovery)
+{
+    constexpr const char* policies[] = {"never", "after_refresh", "after_reconciliation"};
+    return {{"capabilityId", recovery.capabilityId}, {"retry", policies[static_cast<std::size_t>(recovery.retry)]}, {"reason", recovery.reason}};
+}
+
+Json domain_error_json(const DomainError& error)
+{
+    constexpr const char* codes[] = {"debugger_unavailable", "target_required", "target_running", "stale_context", "lease_conflict", "elevation_required", "elevation_denied", "permission_denied", "expected_bytes_mismatch", "file_hash_mismatch", "unsupported_mapping", "partial_failure", "timeout_unknown", "resource_limit", "unsupported_capability", "event_gap", "idempotency_conflict", "invalid_argument", "internal_error"};
+    Json value = {{"code", codes[static_cast<std::size_t>(error.code)]}, {"message", error.message}, {"path", error.path}};
+    if(error.recovery)
+        value["recovery"] = recovery_json(*error.recovery);
+    return value;
+}
+
+Json result_header_json(const ResultHeader& header)
+{
+    constexpr const char* statuses[] = {"verified", "unverified", "pending", "failed", "unknown"};
+    Json context = std::visit([](const auto& reference) -> Json
+    {
+        using Reference = std::decay_t<decltype(reference)>;
+        if constexpr(std::is_same_v<Reference, BrokerContext>)
+            return {{"brokerGeneration", decimal64(reference.brokerGeneration)}};
+        else if constexpr(std::is_same_v<Reference, InstanceId>)
+            return {{"instanceId", reference.value}};
+        else
+        {
+            const TargetRef& target = [&]() -> const TargetRef&
+            {
+                if constexpr(std::is_same_v<Reference, TargetRef>)
+                    return reference;
+                else
+                    return reference.target;
+            }();
+            Json value = {{"instanceId", target.instanceId.value}, {"targetId", target.targetId.value}, {"targetGeneration", decimal64(target.targetGeneration)}};
+            if constexpr(std::is_same_v<Reference, PausedContext>)
+            {
+                value["stopEpoch"] = decimal64(reference.stopEpoch);
+                if(reference.threadId)
+                    value["threadId"] = *reference.threadId;
+            }
+            return value;
+        }
+    }, header.context);
+    Json evidence = Json::array();
+    for(const auto& observation : header.verification.evidence)
+    {
+        Json value = {{"kind", observation.kind}, {"source", observation.source}, {"summary", observation.summary}};
+        if(observation.artifactId)
+            value["artifactId"] = *observation.artifactId;
+        if(observation.sha256)
+            value["sha256"] = *observation.sha256;
+        evidence.push_back(std::move(value));
+    }
+    Json verification = {{"status", statuses[static_cast<std::size_t>(header.verification.status)]}, {"evidence", evidence}};
+    if(header.verification.followUp)
+        verification["followUp"] = recovery_json(*header.verification.followUp);
+    Json warnings = Json::array();
+    for(const auto& warning : header.warnings)
+        warnings.push_back({{"code", warning.code}, {"message", warning.message}});
+    Json value = {{"schemaVersion", ContractVersion}, {"operationId", header.operationId.value}, {"context", context},
+        {"stateVersion", decimal64(header.stateVersion)}, {"verification", verification}, {"warnings", warnings},
+        {"timings", {{"startedUtcMs", decimal64(header.timings.startedUtcMs)}, {"elapsedUs", decimal64(header.timings.elapsedUs)}, {"queueUs", decimal64(header.timings.queueUs)}}}};
+    if(header.jobId)
+        value["jobId"] = header.jobId->value;
+    return value;
 }
 
 Checked<Json> parse_bounded_json(std::string_view input)
