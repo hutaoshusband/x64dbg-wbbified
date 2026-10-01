@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 import fnmatch
 import copy
+import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 from pathlib import Path
@@ -8,13 +10,15 @@ import re
 import struct
 import subprocess
 import time
+from types import SimpleNamespace
 
-from wi_driver import McpError, ROOT, compiler_environment, file_identity, process_identity, write_json
+from wi_driver import KERNEL, McpError, OwnedJob, ROOT, compiler_environment, file_identity, process_identity, write_json
 
 
 CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_context_roundtrip",
               "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser",
-              "test_result_contracts", "test_registry_contracts", "test_registry_dispatch")
+              "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
+              "test_lifecycle_contracts", "test_native_launch_arguments")
 
 
 def build_contract_fixture(output, architecture):
@@ -31,7 +35,7 @@ def build_contract_fixture(output, architecture):
     source_paths = [source / "cmake.toml", source / "CMakeLists.txt", *sorted((source / "src/mcp").rglob("*"))]
     source_inputs = [file_identity(path) for path in source_paths if path.is_file()]
     with (build / "build.log").open("w", encoding="utf-8") as log:
-        for command in (configure, ["cmake", "--build", str(build), "--target", "mcp_contract_fixture", "--parallel", "6"]):
+        for command in (configure, ["cmake", "--build", str(build), "--target", "mcp_contract_fixture", "mcp_launch_reference", "--parallel", "6"]):
             print(f"Building MCP contracts {architecture}: {command[1]}", flush=True)
             process = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
             log.flush()
@@ -40,13 +44,15 @@ def build_contract_fixture(output, architecture):
             if process.returncode:
                 raise McpError(f"Contract fixture build failed: {(build / 'build.log').read_text(encoding='utf-8')[-6000:]}")
     binary = build / "wininspect-mcp-contract-fixture.exe"
-    image = binary.read_bytes()
-    pe_offset = struct.unpack_from("<I", image, 0x3c)[0]
-    assert image[:2] == b"MZ" and image[pe_offset:pe_offset + 4] == b"PE\0\0"
-    assert struct.unpack_from("<H", image, pe_offset + 4)[0] == (0x8664 if architecture == "x64" else 0x14c)
+    for artifact in (binary, build / "wininspect-mcp-launch-reference.exe"):
+        image = artifact.read_bytes()
+        pe_offset = struct.unpack_from("<I", image, 0x3c)[0]
+        assert image[:2] == b"MZ" and image[pe_offset:pe_offset + 4] == b"PE\0\0"
+        assert struct.unpack_from("<H", image, pe_offset + 4)[0] == (0x8664 if architecture == "x64" else 0x14c)
     manifest = {"architecture": architecture, "sourceHead": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                 "sourceStatus": subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True),
                 "sourceInputs": source_inputs, "commands": commands, "binary": file_identity(binary),
+                "launchReference": file_identity(build / "wininspect-mcp-launch-reference.exe"),
                 "buildInputs": file_identity(build / "CMakeCache.txt"),
                 "compiledDependencies": [file_identity(path) for path in sorted(build.glob("mcp_*.lib"))],
                 "compileCommands": json.loads((build / "compile_commands.json").read_text(encoding="utf-8")),
@@ -110,6 +116,8 @@ def independent_validators(catalog):
         "utf8-text": lambda value: "\0" not in value,
         "windows-absolute-path": lambda value: bool(re.fullmatch(r"(?:[A-Za-z]:[\\/].*|\\\\(?!\.\\|\?\\)[^\\]+\\[^\\]+(?:\\.*)?|\\\\\?\\[A-Za-z]:[\\/].*|\\\\\?\\UNC\\[^\\]+\\[^\\]+(?:\\.*)?)", value)) and not any(ord(character) < 32 for character in value)
     }
+    checks["windows-command-line"] = lambda value: "\0" not in value and len(value.encode("utf-16-le")) // 2 <= 32766
+    checks["windows-environment-name"] = lambda value: bool(value) and "=" not in value and "\0" not in value and len(value.encode("utf-16-le")) // 2 <= 32766
     for name, check in checks.items():
         formats.checks(name)(lambda value, check=check: not isinstance(value, str) or check(value))
     validators = {}
@@ -214,17 +222,44 @@ def check_results(probe, formats):
     return {"typedOutcomes": 6, "rejectedContradictions": len(mutations) + 1, "typedErrorCodes": sorted(expected_codes)}
 
 
+def check_schema_references(probe, formats):
+    from jsonschema import Draft202012Validator
+    schema = {"$defs": {"Count": {"type": "integer", "minimum": 1, "maximum": 100},
+                        "Nested": {"type": "object", "properties": {"count": {"$ref": "#/$defs/Count"}}, "required": ["count"], "additionalProperties": False}},
+              "$ref": "#/$defs/Nested"}
+    validator = Draft202012Validator(schema, format_checker=formats)
+    for expected, value in ((True, {"count": 1}), (False, {"count": 0}), (False, {"count": True}), (False, {"count": 1, "other": 2})):
+        assert validator.is_valid(value) == expected
+        assert probe.call("schema-validate", {"schema": schema, "value": value})["valid"] == expected
+    failures = [("invalid_contract", {"$ref": "https://invalid.example/schema"}), ("invalid_contract", {"$ref": "#/$defs/Missing"}),
+                ("resource_limit", {"$defs": {"Loop": {"$ref": "#/$defs/Loop"}}, "$ref": "#/$defs/Loop"}),
+                ("invalid_contract", {"unsupportedKeyword": True}), ("invalid_contract", {"type": "string", "format": "utf8-text", "minLength": 0, "maxLength": 100, "pattern": "^accepted$"})]
+    failures.extend([
+        ("invalid_contract", {"$defs": {"Unused": {"unsupportedKeyword": True}}, "const": "rejected"}),
+        ("invalid_contract", {"properties": {"count": {"const": 1}}}),
+        ("invalid_contract", {"type": "object", "properties": {"unused": {"$ref": "#/$defs/Missing"}}, "required": [], "additionalProperties": False}),
+        ("invalid_contract", {"oneOf": []})])
+    for code, unsupported in failures:
+        response = probe.call("schema-validate", {"schema": unsupported, "value": "rejected"})
+        assert not response["valid"] and response["error"]["code"] == code, response
+    sibling = {"$defs": {"Value": {"enum": [1, 2]}}, "$ref": "#/$defs/Value", "const": 2}
+    for value in (1, 2):
+        assert probe.call("schema-validate", {"schema": sibling, "value": value})["valid"] == (value == 2)
+    return {"independentLocalReferenceCases": 4, "rejectedUnsupportedOrCyclicSchemas": len(failures), "referenceSiblingConstraints": 2}
+
+
 def registry_validators(registry, formats):
     from jsonschema import Draft202012Validator
     validators = {}
     expected = {"server_info", "server_health", "capabilities_list", "capabilities_describe", "capabilities_search", "client_context_get", "client_context_set", "control_acquire", "control_renew", "control_release"}
+    expected.update({"debugger_instances", "debugger_start", "debugger_focus", "debugger_close", "debugger_settings_get", "debugger_settings_set", "processes_list", "target_open", "target_attach", "target_state", "target_snapshot", "target_stop", "target_detach", "target_restart", "target_command_line_get", "target_command_line_set"})
     assert registry["operationalTools"] == [] and {tool["name"] for tool in registry["tools"]} == expected
     assert [tool["name"] for tool in registry["tools"]] == sorted(expected)
     for tool in registry["tools"]:
         assert tool["schemaVersion"] == 1 and tool["operational"] is False
         assert tool["completionPredicate"] and tool["nativeSource"] and tool["recovery"] and tool["acceptanceIds"]
-        assert tool["annotations"]["readOnlyHint"] == (tool["effects"] == ["inspect"])
-        assert tool["executor"] == "broker" and tool["architectureRequirement"] == "any"
+        assert tool["annotations"]["readOnlyHint"] == (tool["effects"] == ["inspect"] and not tool["effectConditions"])
+        assert tool["executor"] in ("broker", "engine", "gui") and tool["architectureRequirement"] == "any"
         for direction in ("input", "output"):
             schema = tool[f"{direction}Schema"]
             Draft202012Validator.check_schema(schema)
@@ -299,6 +334,226 @@ def check_registry_dispatch(probe, registry, validators):
         rejected = probe.call("call", value, name)
         assert not rejected["valid"] and rejected["error"]["code"] == "unsupported_capability"
     return {"exactDescriptors": len(actual), "paginationPages": len(cursors) + 1, "implementedNativeMetadataHandlers": 3, "publicOperationalTools": 0}
+
+
+def check_lifecycle_contracts(probe, validators):
+    target = {"instanceId": "instance-1", "targetId": "target-1", "targetGeneration": "9007199254740993"}
+    instance = {"instanceId": "instance-1"}
+    mutation = {**target, "leaseId": "lease-1"}
+    valid = {
+        "debugger_instances": {"architecture": "x32", "mode": "headless"}, "debugger_start": {"architecture": "x64", "mode": "gui", "privilege": "user"},
+        "debugger_focus": instance, "debugger_close": {**instance, "targetPolicy": "require_none"}, "debugger_settings_get": {**instance, "section": "Engine"},
+        "debugger_settings_set": {**instance, "changes": [{"section": "Engine", "key": "Test", "value": {"kind": "uint64", "value": "18446744073709551615"}}], "expectedVersion": "9007199254740993"},
+        "processes_list": {"name": "controlled.exe", "limit": 1000}, "target_open": {**instance, "path": "C:\\controlled.exe", "argv": ["", "two words", "Hu Tao ❤", "\\\""]},
+        "target_attach": {**instance, "pid": 123, "creationTime": "18446744073709551615", "expectedImage": {"path": "C:\\controlled.exe", "sha256": "0" * 64}},
+        "target_state": target, "target_snapshot": {**target, "parts": ["registers", "modules"], "consistency": "paused"},
+        "target_stop": mutation, "target_detach": {**mutation, "resumePolicy": "resume"}, "target_restart": {**mutation, "launchOverrides": {"argv": []}},
+        "target_command_line_get": target, "target_command_line_set": {**mutation, "argv": [], "expectedVersion": "18446744073709551615"}}
+    cases = [(True, name, value) for name, value in valid.items()]
+    cases.extend((False, name, {**value, "unknown": "reject"}) for name, value in valid.items())
+    cases.extend([
+        (True, "target_open", {**instance, "artifactId": "artifact-1", "rawCommandLine": '"C:\\controlled.exe" raw', "initScript": {"namespaceId": "private-1", "objectId": "script-1", "revision": "rev-1"}}),
+        (False, "target_open", {**valid["target_open"], "rawCommandLine": "reject mixed forms"}),
+        (False, "target_open", {**valid["target_open"], "artifactId": "artifact-1"}),
+        (False, "target_open", {**instance, "path": "relative.exe"}),
+        (False, "target_open", {**instance, "path": "C:\\controlled.exe", "argv": [""] * 1025}),
+        (True, "target_open", {**instance, "path": "C:\\controlled.exe", "rawCommandLine": "x" * 32766}),
+        (False, "target_open", {**instance, "path": "C:\\controlled.exe", "rawCommandLine": "x" * 32767}),
+        (False, "target_open", {**instance, "path": "C:\\controlled.exe", "rawCommandLine": "😀" * 16384}),
+        (False, "target_open", {**valid["target_open"], "environment": {"changes": [{"name": "INVALID=NAME", "value": "no"}]}}),
+        (False, "target_open", {**valid["target_open"], "initScript": {"namespaceId": "private-1", "objectId": "script-1"}}),
+        (False, "target_attach", {**valid["target_attach"], "creationTime": 9007199254740993}),
+        (False, "target_snapshot", {**target, "parts": ["registers", "registers"]}),
+        (False, "target_command_line_set", {**mutation, "expectedVersion": "1"}),
+        (False, "target_restart", {**target, "launchOverrides": {}}),
+        (False, "debugger_start", {**valid["debugger_start"], "privilege": "silent_admin"}),
+        (False, "debugger_settings_set", {**valid["debugger_settings_set"], "changes": [{"section": "Engine", "key": "Test", "value": {"kind": "uint64", "value": 9007199254740993}}]})])
+    for index, (expected, name, value) in enumerate(cases):
+        assert validators[(name, "input")].is_valid(value) == expected, f"Independent lifecycle case {index}"
+        assert probe.call("tool-input", value, name)["valid"] == expected, f"Native lifecycle case {index}"
+    assert probe.call("effects", valid["debugger_start"], "debugger_start") == {"valid": True, "effects": ["execute"]}
+    assert probe.call("effects", {**valid["debugger_start"], "privilege": "admin"}, "debugger_start") == {"valid": True, "effects": ["execute", "elevate"]}
+    for name, value in valid.items():
+        rejected = probe.call("call", value, name)
+        assert not rejected["valid"] and rejected["error"]["code"] == "unsupported_capability"
+    page = {"snapshotVersion": "18446744073709551615", "complete": True}
+    image = {"path": "C:\\controlled.exe", "sha256": "0" * 64}
+    process = {"pid": 123, "creationTime": "9007199254740993", "image": image, "architecture": "x64", "integrity": "medium"}
+    registration = {"instanceId": "instance-1", "workerGeneration": "9007199254740993", "architecture": "x64", "mode": "gui", "state": "ready", "engineReady": True,
+                    "process": process, "buildId": "0" * 64, "installationId": "installation-1", "profileId": "profile-1"}
+    state = {"target": target, "state": "paused", "certainty": "observed", "stopEpoch": "9007199254740993", "stopReason": {"kind": "system_breakpoint"},
+             "ipHex": "0x7ff123456789", "threadId": 1, "pendingJobId": None, "process": process, "allThreadsStopped": True, "exitCode": None}
+    settings = {"instanceId": "instance-1", "version": "18446744073709551615", "settings": [{"section": "Engine", "key": "Test", "value": {"kind": "uint64", "value": "18446744073709551615"},
+                "storage": "both", "requiresRestart": False, "nativeWidth": 64}], "complete": True}
+    command_line = {"target": target, "version": "18446744073709551615", "nextLaunch": {"argv": []}, "actualCommandLine": None, "currentProcessUpdated": False}
+    data = {"debugger_instances": {"items": [registration], "page": page}, "debugger_start": {"instance": registration, "launchJobId": "job-1"},
+            "debugger_focus": {"instanceId": "instance-1", "visible": True, "focused": True},
+            "debugger_close": {"instanceId": "instance-1", "closed": True, "targetDisposition": "none", "brokerListening": True},
+            "debugger_settings_get": settings, "debugger_settings_set": settings, "processes_list": {"items": [{**process, "attachAvailable": True, "limitations": []}], "page": page},
+            "target_snapshot": {"state": state, "consistency": "paused", "capturedParts": ["registers"], "registers": [{"name": "rax", "group": "general", "widthBits": 64,
+                "bytesHex": "ffffffffffffffff", "validity": "valid", "reason": None}], "complete": True},
+            "target_command_line_get": command_line, "target_command_line_set": command_line}
+    data.update({name: state for name in ("target_open", "target_attach", "target_state", "target_stop", "target_detach", "target_restart")})
+    envelope = probe.call("result-cases")["results"][0]
+    output_comparisons = 0
+    for name, value in data.items():
+        for expected, payload in ((True, value), (False, {**value, "unknown": "reject"}), (False, {})):
+            response = {**envelope, "data": payload}
+            assert validators[(name, "output")].is_valid(response) == expected, f"Independent lifecycle result for {name}"
+            assert probe.call("tool-output", response, name)["valid"] == expected, f"Native lifecycle result for {name}"
+            output_comparisons += 1
+    return {"lifecycleTools": len(valid), "independentInputComparisons": len(cases), "independentOutputComparisons": output_comparisons,
+            "conditionalElevationEffects": 2, "plannedHandlersRejected": len(valid)}
+
+
+class StartupInfo(ctypes.Structure):
+    _fields_ = [("cb", wintypes.DWORD), ("reserved", wintypes.LPWSTR), ("desktop", wintypes.LPWSTR), ("title", wintypes.LPWSTR),
+                ("x", wintypes.DWORD), ("y", wintypes.DWORD), ("xSize", wintypes.DWORD), ("ySize", wintypes.DWORD),
+                ("xChars", wintypes.DWORD), ("yChars", wintypes.DWORD), ("fill", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("show", wintypes.WORD), ("reservedSize", wintypes.WORD), ("reservedBytes", ctypes.c_void_p),
+                ("stdin", wintypes.HANDLE), ("stdout", wintypes.HANDLE), ("stderr", wintypes.HANDLE)]
+
+
+class StartupInfoEx(ctypes.Structure):
+    _fields_ = [("startup", StartupInfo), ("attributes", ctypes.c_void_p)]
+
+
+class ProcessInformation(ctypes.Structure):
+    _fields_ = [("process", wintypes.HANDLE), ("thread", wintypes.HANDLE), ("pid", wintypes.DWORD), ("threadId", wintypes.DWORD)]
+
+
+class SecurityAttributes(ctypes.Structure):
+    _fields_ = [("length", wintypes.DWORD), ("descriptor", ctypes.c_void_p), ("inherit", wintypes.BOOL)]
+
+
+def run_launch_reference(plan, binary, output, expected_bits):
+    KERNEL.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(SecurityAttributes), wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    KERNEL.CreateFileW.restype = wintypes.HANDLE
+    KERNEL.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t)]
+    KERNEL.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+    KERNEL.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+    KERNEL.DeleteProcThreadAttributeList.restype = None
+    KERNEL.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(StartupInfoEx), ctypes.POINTER(ProcessInformation)]
+    KERNEL.CreateProcessW.restype = wintypes.BOOL
+    KERNEL.ResumeThread.argtypes = [wintypes.HANDLE]
+    KERNEL.ResumeThread.restype = wintypes.DWORD
+    KERNEL.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    KERNEL.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    KERNEL.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    assert Path(plan["application"]).resolve() == binary.resolve()
+    environment_bytes = bytes.fromhex(plan["environmentHex"])
+    assert len(environment_bytes) == plan["environmentUnits"] * 2 and environment_bytes.endswith(b"\0\0\0\0")
+    assert len(plan["commandLine"].encode("utf-16-le")) // 2 == plan["commandLineUnits"] <= 32766
+    security = SecurityAttributes(ctypes.sizeof(SecurityAttributes), None, True)
+    output_handle = KERNEL.CreateFileW(str(output), 0x40000000, 1, ctypes.byref(security), 1, 0x80, None)
+    input_handle = KERNEL.CreateFileW("NUL", 0x80000000, 1 | 2, ctypes.byref(security), 3, 0x80, None)
+    handles = [output_handle, input_handle]
+    information = ProcessInformation()
+    attribute_buffer = None
+    attributes_initialized = False
+    job = None
+    try:
+        if any(handle == ctypes.c_void_p(-1).value for handle in handles):
+            raise ctypes.WinError(ctypes.get_last_error())
+        job = OwnedJob()
+        needed = ctypes.c_size_t()
+        KERNEL.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(needed))
+        attribute_buffer = ctypes.create_string_buffer(needed.value)
+        if not KERNEL.InitializeProcThreadAttributeList(attribute_buffer, 1, 0, ctypes.byref(needed)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        attributes_initialized = True
+        inherited_handles = (wintypes.HANDLE * 2)(output_handle, input_handle)
+        handle_list_attribute = 0x00020002
+        if not KERNEL.UpdateProcThreadAttribute(attribute_buffer, 0, handle_list_attribute, inherited_handles, ctypes.sizeof(inherited_handles), None, None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        startup = StartupInfoEx()
+        startup.startup.cb = ctypes.sizeof(StartupInfoEx)
+        startup.startup.flags = 0x100
+        startup.startup.stdin = input_handle
+        startup.startup.stdout = startup.startup.stderr = output_handle
+        startup.attributes = ctypes.cast(attribute_buffer, ctypes.c_void_p)
+        command = ctypes.create_unicode_buffer(plan["commandLine"])
+        environment = ctypes.create_string_buffer(environment_bytes)
+        create_suspended = 4
+        extended_startup = 0x00080000
+        create_unicode_environment = 0x400
+        flags = subprocess.CREATE_NO_WINDOW | create_unicode_environment | create_suspended | extended_startup
+        if not KERNEL.CreateProcessW(str(binary), command, None, None, True, flags, environment, plan["cwd"], ctypes.byref(startup), ctypes.byref(information)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        process = SimpleNamespace(pid=information.pid, _handle=information.process)
+        identity = process_identity(process)
+        job.assign(process)
+        if KERNEL.ResumeThread(information.thread) == 0xffffffff:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if KERNEL.WaitForSingleObject(information.process, 10000) != 0:
+            raise McpError(f"Owned launch reference did not finish: {identity}")
+        exit_code = wintypes.DWORD()
+        if not KERNEL.GetExitCodeProcess(information.process, ctypes.byref(exit_code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        assert exit_code.value == 17, f"Reference exit {exit_code.value}: {output.read_bytes()[:500]!r}"
+        observed = json.loads(output.read_bytes())
+        assert observed["pid"] == identity["pid"] and observed["pointerBits"] == expected_bits
+        return {"processIdentity": identity, "exitCode": exit_code.value, "binary": file_identity(binary), "output": file_identity(output), "observed": observed}
+    finally:
+        if job is not None:
+            job.close()
+        if information.process:
+            exit_code = wintypes.DWORD()
+            if KERNEL.GetExitCodeProcess(information.process, ctypes.byref(exit_code)) and exit_code.value == 259:
+                KERNEL.TerminateProcess(information.process, 1)
+            KERNEL.WaitForSingleObject(information.process, 5000)
+            KERNEL.CloseHandle(information.process)
+        if information.thread:
+            KERNEL.CloseHandle(information.thread)
+        if attributes_initialized:
+            KERNEL.DeleteProcThreadAttributeList(attribute_buffer)
+        for handle in handles:
+            if handle and handle != ctypes.c_void_p(-1).value:
+                KERNEL.CloseHandle(handle)
+
+
+def check_native_launch(probe, architecture):
+    import os
+    import shutil
+    directory = probe.output / "Hu Tao ❤ launch"
+    directory.mkdir()
+    binary = directory / "reference with spaces.exe"
+    original = probe.binary.parent / "wininspect-mcp-launch-reference.exe"
+    shutil.copy2(original, binary)
+    assert file_identity(original)["sha256"] == file_identity(binary)["sha256"]
+    inherited = [{"name": "SystemRoot", "value": os.environ["SystemRoot"]}, {"name": "WI_KEEP", "value": "inherited"},
+                 {"name": "WI_DELETE", "value": "remove"}, {"name": "WI_EMPTY", "value": "old"}, {"name": "=C:", "value": "C:\\controlled"}]
+    intended = ["", "two words", 'a"b', "trail\\", "\\\\\"", "comma,value", "{braces}", "Hu Tao ❤ 😀", "\t", "run", " a "]
+    changes = [{"name": "wi_delete", "value": None}, {"name": "WI_EMPTY", "value": ""}, {"name": "WI_UNICODE", "value": "Columbina 💙"}]
+    outputs = []
+    for index, mode in enumerate(("argv", "raw", "replace")):
+        mode_changes = [*changes, {"name": "SystemRoot", "value": os.environ["SystemRoot"]}] if mode == "replace" else changes
+        request = {"instanceId": "instance-fixture", "path": str(binary), "cwd": str(directory), "environment": {"mode": "replace" if mode == "replace" else "inherit", "changes": mode_changes}}
+        expected_arguments = intended if mode != "raw" else ["", 'raw " quote', "trailing\\", "Furina 💙"]
+        if mode == "raw":
+            request["rawCommandLine"] = subprocess.list2cmdline([str(binary), *expected_arguments])
+        else:
+            request["argv"] = expected_arguments
+        plan = probe.call("launch-plan", {"request": request, "resolvedImage": str(binary), "inherited": inherited})
+        assert plan["valid"], plan
+        observed = run_launch_reference(plan, binary, directory / f"launch-{index}.json", 64 if architecture == "x64" else 32)
+        assert observed["observed"]["argv"] == [str(binary), *expected_arguments]
+        assert observed["observed"]["cwd"].casefold() == str(directory).casefold()
+        assert observed["observed"]["environment"] == {"WI_KEEP": None if mode == "replace" else "inherited", "WI_DELETE": None, "WI_EMPTY": "", "WI_UNICODE": "Columbina 💙"}
+        if mode == "raw":
+            assert plan["commandLine"] == request["rawCommandLine"] == observed["observed"]["rawCommandLine"]
+        outputs.append(observed)
+    base = {"request": {"instanceId": "instance-fixture", "path": str(binary)}, "resolvedImage": str(binary), "inherited": inherited}
+    rejected = [
+        {**base, "request": {**base["request"], "argv": ["x" * 32766]}},
+        {**base, "request": {**base["request"], "argv": ["😀" * 16384]}},
+        {**base, "request": {**base["request"], "environment": {"changes": [{"name": "WI_KEEP", "value": "1"}, {"name": "wi_keep", "value": "2"}]}}},
+        {**base, "request": {**base["request"], "environment": {"changes": [{"name": f"WI_{index}", "value": "x" * 32766} for index in range(17)]}}},
+        {**base, "inherited": [*inherited, {"name": "wi_keep", "value": "collision"}]}]
+    for value in rejected:
+        assert not probe.call("launch-plan", value)["valid"]
+    write_json(directory / "native-launch-observations.json", outputs)
+    return {"actualNativeLaunches": outputs, "rejectedPreflightCases": len(rejected), "environmentMutation": "isolated child block only"}
 
 
 def run_contract_checks(binary, output, architecture, selected, timeout):
@@ -393,6 +648,12 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_registry_contracts(probe, registry, tool_validators))
             elif name == "test_registry_dispatch":
                 result.update(check_registry_dispatch(probe, registry, tool_validators))
+            elif name == "test_schema_references":
+                result.update(check_schema_references(probe, formats))
+            elif name == "test_lifecycle_contracts":
+                result.update(check_lifecycle_contracts(probe, tool_validators))
+            elif name == "test_native_launch_arguments":
+                result.update(check_native_launch(probe, architecture))
         except Exception as error:
             result.update(status="failed", error=str(error))
         result["seconds"] = round(time.monotonic() - started, 3)

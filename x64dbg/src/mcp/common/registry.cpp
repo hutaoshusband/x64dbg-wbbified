@@ -17,12 +17,14 @@ Json descriptor_schema()
     return closed_object_schema({{"capabilityId", id}, {"name", id}, {"description", string_schema("utf8-text", 4096)},
         {"domain", id}, {"provider", id}, {"schemaVersion", {{"const", ContractVersion}}}, {"inputSchema", schema_document},
         {"outputSchema", schema_document}, {"effects", bounded_array_schema(enum_schema({"inspect", "execute", "modify", "file_export", "file_replace", "elevate", "configure"}), 7, 1, true)},
+        {"effectConditions", bounded_array_schema(closed_object_schema({{"field", id}, {"equals", string_schema("utf8-text", 128)},
+            {"effects", bounded_array_schema(enum_schema({"inspect", "execute", "modify", "file_export", "file_replace", "elevate", "configure"}), 7, 1, true)}}, {"field", "equals", "effects"}), 16)},
         {"executor", enum_schema({"broker", "engine", "gui", "script_host"})}, {"stateRequirement", enum_schema({"broker", "instance_ready", "target_present", "target_paused"})},
         {"architectureRequirement", enum_schema({"any", "x32", "x64"})}, {"completionPredicate", string_schema("utf8-text", 4096)},
         {"recovery", bounded_array_schema(id, 16)}, {"acceptanceIds", bounded_array_schema(id, 66, 1, true)},
         {"nativeSource", string_schema("utf8-text", 1024)}, {"availability", enum_schema({"planned", "implemented"})},
         {"operational", {{"const", false}}}, {"annotations", annotations}},
-        {"capabilityId", "name", "description", "domain", "provider", "schemaVersion", "inputSchema", "outputSchema", "effects", "executor", "stateRequirement", "architectureRequirement", "completionPredicate", "recovery", "acceptanceIds", "nativeSource", "availability", "operational", "annotations"});
+        {"capabilityId", "name", "description", "domain", "provider", "schemaVersion", "inputSchema", "outputSchema", "effects", "effectConditions", "executor", "stateRequirement", "architectureRequirement", "completionPredicate", "recovery", "acceptanceIds", "nativeSource", "availability", "operational", "annotations"});
 }
 
 Json page_input(Json properties = Json::object(), Json required = Json::array())
@@ -155,6 +157,21 @@ Json page_output(Json item)
 }
 }
 
+ToolDefinition define_tool(std::string name, std::string description, std::string domain, Json input, Json data,
+    std::vector<Effect> effects, Executor executor, StateRequirement state, ArchitectureRequirement architecture,
+    std::string completion, std::vector<std::string> recovery, std::vector<std::string> acceptanceIds,
+    std::string nativeSource, bool idempotent, bool openWorld, RegistryHandler handler, std::vector<EffectCondition> effectConditions)
+{
+    input = with_contract_definitions(std::move(input));
+    input["$schema"] = "https://json-schema.org/draft/2020-12/schema";
+    input["$id"] = "urn:wininspect:mcp:tool:v1:" + name + ":input";
+    auto output = result_schema(std::move(data));
+    output["$id"] = "urn:wininspect:mcp:tool:v1:" + name + ":output";
+    return {std::move(name), std::move(description), std::move(domain), "wininspect.native", std::move(input), std::move(output),
+        std::move(effects), executor, state, architecture, std::move(completion), std::move(recovery), std::move(acceptanceIds),
+        std::move(nativeSource), idempotent, openWorld, handler, std::move(effectConditions)};
+}
+
 const std::vector<ToolDefinition>& tool_registry()
 {
     static const auto registry = []
@@ -198,14 +215,10 @@ const std::vector<ToolDefinition>& tool_registry()
                              StateRequirement state, std::string completion, std::vector<std::string> recovery, bool idempotent, RegistryHandler handler)
         {
             const auto source = handler ? "src/mcp/common/registry.cpp" : "planned:broker";
-            input["$schema"] = "https://json-schema.org/draft/2020-12/schema";
-            input["$id"] = "urn:wininspect:mcp:tool:v1:" + name + ":input";
-            auto result = result_schema(std::move(output));
-            result["$id"] = "urn:wininspect:mcp:tool:v1:" + name + ":output";
             const std::vector<std::string> acceptance = domain == "control" ? std::vector<std::string>{"A-08", "A-09", "A-48", "A-50"} : domain == "client" ? std::vector<std::string>{"A-08", "A-09", "A-50"} : std::vector<std::string>{"A-05", "A-06", "A-07", "A-08", "A-09", "A-64"};
-            tools.push_back({std::move(name), std::move(description), std::move(domain), "wininspect.native", std::move(input), std::move(result),
+            tools.push_back(define_tool(std::move(name), std::move(description), std::move(domain), std::move(input), std::move(output),
                 std::move(effects), Executor::Broker, state, ArchitectureRequirement::Any, std::move(completion), std::move(recovery),
-                acceptance, source, idempotent, false, handler});
+                acceptance, source, idempotent, false, handler));
         };
         add("server_info", "Return the actual broker/build identity, supported protocol profiles, redacted endpoint and enforced limits.", "server", empty, info, {Effect::Inspect}, StateRequirement::Broker,
             "Broker process identity and actual listening profile are observed from the owning process.", {"server_health"}, true, nullptr);
@@ -230,6 +243,7 @@ const std::vector<ToolDefinition>& tool_registry()
         add("control_release", "Release the authenticated client's lease and reconcile pending work before claiming mutation authority is gone.", "control", release,
             closed_object_schema({{"leaseId", id}, {"released", {{"const", true}}}, {"pendingReconciled", {{"const", true}}}}, {"leaseId", "released", "pendingReconciled"}), {Effect::Configure}, StateRequirement::TargetPresent,
             "Released lease cannot authorize new mutations and previously accepted work is reconciled.", {"target_state"}, true, nullptr);
+        append_lifecycle_tools(tools);
         std::sort(tools.begin(), tools.end(), [](const ToolDefinition& left, const ToolDefinition& right) { return left.name < right.name; });
         return tools;
     }();
@@ -252,15 +266,42 @@ Json tool_descriptor(const ToolDefinition& tool)
     Json effect_names = Json::array();
     for(const auto effect : tool.effects)
         effect_names.push_back(effects[static_cast<std::size_t>(effect)]);
-    const auto destructive = std::find(tool.effects.begin(), tool.effects.end(), Effect::Modify) != tool.effects.end() ||
-                             std::find(tool.effects.begin(), tool.effects.end(), Effect::FileReplace) != tool.effects.end();
+    Json conditions = Json::array();
+    for(const auto& condition : tool.effectConditions)
+    {
+        Json required = Json::array();
+        for(const auto effect : condition.effects)
+            required.push_back(effects[static_cast<std::size_t>(effect)]);
+        conditions.push_back({{"field", condition.field}, {"equals", condition.equals}, {"effects", required}});
+    }
+    auto possible_effects = tool.effects;
+    for(const auto& condition : tool.effectConditions)
+        possible_effects.insert(possible_effects.end(), condition.effects.begin(), condition.effects.end());
+    const auto destructive = std::any_of(possible_effects.begin(), possible_effects.end(), [](Effect effect)
+    {
+        return effect == Effect::Modify || effect == Effect::FileReplace || effect == Effect::Execute;
+    });
     return {{"capabilityId", tool.name}, {"name", tool.name}, {"description", tool.description}, {"domain", tool.domain}, {"provider", tool.provider},
-        {"schemaVersion", ContractVersion}, {"inputSchema", tool.inputSchema}, {"outputSchema", tool.outputSchema}, {"effects", effect_names},
+        {"schemaVersion", ContractVersion}, {"inputSchema", tool.inputSchema}, {"outputSchema", tool.outputSchema}, {"effects", effect_names}, {"effectConditions", conditions},
         {"executor", executors[static_cast<std::size_t>(tool.executor)]}, {"stateRequirement", states[static_cast<std::size_t>(tool.state)]},
         {"architectureRequirement", architectures[static_cast<std::size_t>(tool.architecture)]}, {"completionPredicate", tool.completion},
         {"recovery", tool.recovery}, {"acceptanceIds", tool.acceptanceIds}, {"nativeSource", tool.nativeSource},
         {"availability", tool.handler ? "implemented" : "planned"}, {"operational", false},
-        {"annotations", {{"readOnlyHint", tool.effects == std::vector<Effect>{Effect::Inspect}}, {"destructiveHint", destructive}, {"idempotentHint", tool.idempotent}, {"openWorldHint", tool.openWorld}}}};
+        {"annotations", {{"readOnlyHint", tool.effects == std::vector<Effect>{Effect::Inspect} && tool.effectConditions.empty()}, {"destructiveHint", destructive}, {"idempotentHint", tool.idempotent}, {"openWorldHint", tool.openWorld}}}};
+}
+
+Checked<std::vector<Effect>> required_tool_effects(std::string_view name, const Json& input)
+{
+    if(auto error = validate_tool_input(name, input))
+        return *error;
+    const auto* tool = find_tool(name);
+    auto effects = tool->effects;
+    for(const auto& condition : tool->effectConditions)
+        if(input.contains(condition.field) && input.at(condition.field) == condition.equals)
+            for(const auto effect : condition.effects)
+                if(std::find(effects.begin(), effects.end(), effect) == effects.end())
+                    effects.push_back(effect);
+    return effects;
 }
 
 Json compiled_tool_registry()

@@ -308,3 +308,15 @@ msvc.link-options = ["/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess
 [target.mcp_contract_fixture.properties]
 OUTPUT_NAME = "wininspect-mcp-contract-fixture"
 EXCLUDE_FROM_ALL = true
+
+[target.mcp_launch_reference]
+type = "executable"
+condition = "mcp"
+sources = ["src/mcp/testing/launch_reference.cpp"]
+link-libraries = ["mcp_json"]
+compile-features = ["cxx_std_17"]
+msvc.link-options = ["/MANIFEST:EMBED", "/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
+
+[target.mcp_launch_reference.properties]
+OUTPUT_NAME = "wininspect-mcp-launch-reference"
+EXCLUDE_FROM_ALL = true

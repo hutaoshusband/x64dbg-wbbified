@@ -1,5 +1,6 @@
 #include "contracts.h"
 #include "registry.h"
+#include "lifecycle.h"
 #include <boost/beast/http.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/version.hpp>
@@ -175,6 +176,40 @@ Json result_examples()
     return {{"results", examples}, {"errors", errors}, {"schema", result_schema(closed_object_schema({{"value", contract_schema("Hex64")}}, {"value"}))},
             {"unverifiedSchema", result_schema(closed_object_schema({{"value", contract_schema("Hex64")}}, {"value"}), true)}};
 }
+
+Json launch_plan_probe(const Json& input)
+{
+    const auto schema = closed_object_schema({{"request", {{"type", "object"}, {"properties", Json::object()}, {"additionalProperties", true}}},
+        {"resolvedImage", string_schema("windows-absolute-path", 32767)},
+        {"inherited", bounded_array_schema(closed_object_schema({{"name", string_schema("utf8-text", 32766)},
+            {"value", string_schema("utf8-text", 32766, 0)}}, {"name", "value"}), 4096)}}, {"request", "resolvedImage", "inherited"});
+    if(auto error = validate_schema(schema, input))
+        return {{"valid", false}, {"error", error_json(*error)}};
+    const auto request = parse_target_launch(input.at("request"));
+    if(const auto* error = std::get_if<ContractError>(&request))
+        return {{"valid", false}, {"error", error_json(*error)}};
+    std::vector<EnvironmentEntry> inherited;
+    for(const auto& entry : input.at("inherited"))
+        inherited.push_back({std::get<std::wstring>(launch_utf16(entry.at("name").get<std::string>())), std::get<std::wstring>(launch_utf16(entry.at("value").get<std::string>()))});
+    const auto prepared = prepare_windows_launch(std::get<TargetLaunchRequest>(request), input.at("resolvedImage").get<std::string>(), inherited);
+    if(const auto* error = std::get_if<ContractError>(&prepared))
+        return {{"valid", false}, {"error", error_json(*error)}};
+    const auto& plan = std::get<WindowsLaunchPlan>(prepared);
+    constexpr const char* hex = "0123456789abcdef";
+    std::string environment;
+    for(const auto character : plan.environment)
+    {
+        const auto value = static_cast<std::uint16_t>(character);
+        for(const auto byte : {static_cast<unsigned>(value & 0xff), static_cast<unsigned>(value >> 8)})
+        {
+            environment.push_back(hex[byte >> 4]);
+            environment.push_back(hex[byte & 15]);
+        }
+    }
+    return {{"valid", true}, {"application", std::get<std::string>(launch_utf8(plan.application))},
+        {"commandLine", std::get<std::string>(launch_utf8(plan.commandLine))}, {"commandLineUnits", plan.commandLine.size()},
+        {"cwd", plan.cwd ? Json(std::get<std::string>(launch_utf8(*plan.cwd))) : Json(nullptr)}, {"environmentHex", environment}, {"environmentUnits", plan.environment.size()}};
+}
 }
 
 int main(int argc, char** argv)
@@ -208,7 +243,31 @@ int main(int argc, char** argv)
                 else
                 {
                     const auto& input = std::get<Json>(parsed);
-                    if((mode == "result-validate" || mode == "result-unverified") && argc == 2)
+                    if(mode == "launch-plan" && argc == 2)
+                        reply = launch_plan_probe(input);
+                    else if(mode == "effects" && argc == 3)
+                    {
+                        const auto required = required_tool_effects(argv[2], input);
+                        reply = checked_reply(required);
+                        if(const auto* effects = std::get_if<std::vector<Effect>>(&required))
+                        {
+                            constexpr const char* names[] = {"inspect", "execute", "modify", "file_export", "file_replace", "elevate", "configure"};
+                            reply["effects"] = Json::array();
+                            for(const auto effect : *effects)
+                                reply["effects"].push_back(names[static_cast<std::size_t>(effect)]);
+                        }
+                    }
+                    else if(mode == "schema-validate" && argc == 2)
+                    {
+                        if(!input.is_object() || input.size() != 2 || !input.contains("schema") || !input.contains("value"))
+                            reply = {{"valid", false}, {"error", error_json({"invalid_argument", "", "Supply a schema and value to the development fixture"})}};
+                        else
+                        {
+                            const auto error = validate_schema(input.at("schema"), input.at("value"));
+                            reply = error ? Json{{"valid", false}, {"error", error_json(*error)}} : Json{{"valid", true}};
+                        }
+                    }
+                    else if((mode == "result-validate" || mode == "result-unverified") && argc == 2)
                     {
                         const auto schema = result_schema(closed_object_schema({{"value", contract_schema("Hex64")}}, {"value"}), mode == "result-unverified");
                         const auto error = validate_schema(schema, input);

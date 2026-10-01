@@ -1,4 +1,5 @@
 #include "contracts.h"
+#include "lifecycle.h"
 #include "build_identity.h"
 #include <algorithm>
 #include <charconv>
@@ -123,6 +124,13 @@ bool valid_format(std::string_view format, std::string_view value)
         });
     if(format == "windows-absolute-path")
         return absolute_windows_path(value);
+    if(format == "windows-command-line" || format == "windows-environment-name")
+    {
+        const auto converted = launch_utf16(value);
+        const auto* text = std::get_if<std::wstring>(&converted);
+        return text && text->size() <= MaximumWindowsCommandUnits &&
+            (format != "windows-environment-name" || (!text->empty() && text->find(L'=') == std::wstring::npos));
+    }
     return format == "utf8-text";
 }
 
@@ -134,8 +142,106 @@ std::string child_path(const std::string& path, const std::string& key)
     return path + "/" + escaped;
 }
 
-std::optional<ContractError> validate_node(const Json& schema, const Json& input, const std::string& path)
+const std::unordered_set<std::string> schema_keywords = {"$schema", "$id", "$defs", "$ref", "description", "type", "properties", "required", "additionalProperties", "oneOf", "format", "pattern", "minLength", "maxLength", "minimum", "maximum", "default", "enum", "const", "items", "minItems", "maxItems", "uniqueItems"};
+
+std::optional<ContractError> validate_schema_dialect(const Json& schema, const Json& root, std::size_t& visits, std::size_t depth)
 {
+    if(++visits > MaximumValidationVisits || depth > MaximumValidationDepth)
+        return ContractError{"resource_limit", "", "Schema declaration exceeds its traversal bound"};
+    const auto rejected = [] { return ContractError{"invalid_contract", "", "Schema is outside the declared native dialect"}; };
+    if(!schema.is_object())
+        return rejected();
+    for(auto item = schema.begin(); item != schema.end(); ++item)
+        if(!schema_keywords.count(item.key()))
+            return rejected();
+    const auto type = schema.value("type", std::string{});
+    if(!type.empty() && type != "object" && type != "array" && type != "string" && type != "integer" && type != "boolean" && type != "null")
+        return rejected();
+    for(const auto* keyword : {"properties", "required", "additionalProperties"})
+        if(schema.contains(keyword) && type != "object")
+            return rejected();
+    for(const auto* keyword : {"items", "minItems", "maxItems", "uniqueItems"})
+        if(schema.contains(keyword) && type != "array")
+            return rejected();
+    for(const auto* keyword : {"format", "pattern", "minLength", "maxLength"})
+        if(schema.contains(keyword) && type != "string")
+            return rejected();
+    for(const auto* keyword : {"minimum", "maximum"})
+        if(schema.contains(keyword) && type != "integer")
+            return rejected();
+    for(const auto* keyword : {"$schema", "$id", "description"})
+        if(schema.contains(keyword) && !schema.at(keyword).is_string())
+            return rejected();
+    if(schema.contains("enum") && (!schema.at("enum").is_array() || schema.at("enum").empty()))
+        return rejected();
+    if(schema.contains("$ref"))
+    {
+        const auto reference = schema.at("$ref").get<std::string>();
+        const std::string prefix = "#/$defs/";
+        if(reference.compare(0, prefix.size(), prefix) != 0 || reference.find_first_of("/~", prefix.size()) != std::string::npos ||
+           !root.contains("$defs") || !root.at("$defs").contains(reference.substr(prefix.size())))
+            return rejected();
+    }
+    if(type == "string")
+    {
+        static const std::unordered_set<std::string> formats = {"uint64-decimal", "uint64-hex", "opaque-id", "hex-bytes", "sha256", "utf8-text", "windows-absolute-path", "windows-command-line", "windows-environment-name"};
+        const auto format = schema.at("format").get<std::string>();
+        if(!formats.count(format) || (schema.contains("pattern") && text_schema(format).value("pattern", "") != schema.at("pattern")))
+            return rejected();
+    }
+    const auto bounds_valid = [&](const char* minimum, const char* maximum)
+    {
+        return schema.at(minimum).is_number_integer() && schema.at(maximum).is_number_integer() &&
+               schema.at(minimum).get<double>() >= 0 && schema.at(minimum).get<double>() <= schema.at(maximum).get<double>();
+    };
+    if((type == "string" && !bounds_valid("minLength", "maxLength")) || (type == "array" && !bounds_valid("minItems", "maxItems")) ||
+       (type == "integer" && !bounds_valid("minimum", "maximum")))
+        return rejected();
+    if(type == "object")
+    {
+        if(!schema.at("properties").is_object() || (!schema.at("additionalProperties").is_boolean() && !schema.at("additionalProperties").is_object()) ||
+           (schema.contains("required") && !schema.at("required").is_array()))
+            return rejected();
+        for(const auto& field : schema.value("required", Json::array()))
+            if(!field.is_string() || !schema.at("properties").contains(field.get<std::string>()))
+                return rejected();
+    }
+    if(type == "array" && schema.contains("uniqueItems") && !schema.at("uniqueItems").is_boolean())
+        return rejected();
+    for(const auto* keyword : {"$defs", "properties", "oneOf"})
+        if(schema.contains(keyword))
+        {
+            const auto& children = schema.at(keyword);
+            if((std::string_view(keyword) == "oneOf" && (!children.is_array() || children.empty())) ||
+               (std::string_view(keyword) != "oneOf" && !children.is_object()))
+                return rejected();
+            for(const auto& child : children)
+                if(auto error = validate_schema_dialect(child, root, visits, depth + 1))
+                    return error;
+        }
+    if(type == "array")
+        if(auto error = validate_schema_dialect(schema.at("items"), root, visits, depth + 1))
+            return error;
+    if(type == "object" && schema.at("additionalProperties").is_object())
+        return validate_schema_dialect(schema.at("additionalProperties"), root, visits, depth + 1);
+    return {};
+}
+
+std::optional<ContractError> validate_node(const Json& schema, const Json& input, const std::string& path,
+                                         const Json& root, std::size_t& visits, std::size_t depth)
+{
+    if(++visits > MaximumValidationVisits || depth > MaximumValidationDepth)
+        return ContractError{"resource_limit", path, "Schema validation exceeds its traversal bound"};
+    if(schema.contains("$ref"))
+    {
+        const auto reference = schema.at("$ref").get<std::string>();
+        const std::string prefix = "#/$defs/";
+        if(reference.compare(0, prefix.size(), prefix) != 0 || reference.find_first_of("/~", prefix.size()) != std::string::npos ||
+           !root.contains("$defs") || !root.at("$defs").contains(reference.substr(prefix.size())))
+            return ContractError{"invalid_contract", path, "Schema reference is not a declared local definition"};
+        if(auto error = validate_node(root.at("$defs").at(reference.substr(prefix.size())), input, path, root, visits, depth + 1))
+            return error;
+    }
     if(schema.contains("const") && input != schema.at("const"))
         return invalid(path, "Value differs from the required constant");
     if(schema.contains("enum") && std::find(schema.at("enum").begin(), schema.at("enum").end(), input) == schema.at("enum").end())
@@ -144,7 +250,12 @@ std::optional<ContractError> validate_node(const Json& schema, const Json& input
     {
         std::size_t matches = 0;
         for(const auto& choice : schema.at("oneOf"))
-            matches += !validate_node(choice, input, path).has_value();
+        {
+            const auto error = validate_node(choice, input, path, root, visits, depth + 1);
+            if(error && (error->code == "invalid_contract" || error->code == "resource_limit"))
+                return error;
+            matches += !error.has_value();
+        }
         if(matches != 1)
             return invalid(path, "Supply exactly one complete reference form");
     }
@@ -167,11 +278,11 @@ std::optional<ContractError> validate_node(const Json& schema, const Json& input
                 if(additional == false)
                     return invalid(child_path(path, item.key()), "Unknown field");
                 if(additional.is_object())
-                    if(auto error = validate_node(additional, item.value(), child_path(path, item.key())))
+                    if(auto error = validate_node(additional, item.value(), child_path(path, item.key()), root, visits, depth + 1))
                         return error;
                 continue;
             }
-            if(auto error = validate_node(properties.at(item.key()), item.value(), child_path(path, item.key())))
+            if(auto error = validate_node(properties.at(item.key()), item.value(), child_path(path, item.key()), root, visits, depth + 1))
                 return error;
         }
         return {};
@@ -182,12 +293,16 @@ std::optional<ContractError> validate_node(const Json& schema, const Json& input
             return invalid(path, "Expected an array within its declared item bounds");
         for(std::size_t index = 0; index < input.size(); ++index)
         {
-            if(auto error = validate_node(schema.at("items"), input.at(index), child_path(path, std::to_string(index))))
+            if(auto error = validate_node(schema.at("items"), input.at(index), child_path(path, std::to_string(index)), root, visits, depth + 1))
                 return error;
             if(schema.value("uniqueItems", false))
                 for(std::size_t previous = 0; previous < index; ++previous)
+                {
+                    if(++visits > MaximumValidationVisits)
+                        return ContractError{"resource_limit", path, "Array uniqueness check exceeds its traversal bound"};
                     if(input.at(previous) == input.at(index))
                         return invalid(child_path(path, std::to_string(index)), "Array items must be unique");
+                }
         }
         return {};
     }
@@ -200,11 +315,14 @@ std::optional<ContractError> validate_node(const Json& schema, const Json& input
         if(!input.is_string())
             return invalid(path, "Expected a string");
         const auto& text = input.get_ref<const std::string&>();
+        const auto format = schema.at("format").get<std::string>();
+        if(schema.contains("pattern") && text_schema(format).value("pattern", "") != schema.at("pattern"))
+            return ContractError{"invalid_contract", path, "Pattern is outside the declared native format dialect"};
         const auto length = unicode_length(text);
         if((!length && !text.empty()) || text.size() > MaximumFrameBytes ||
            length.value_or(0) < schema.at("minLength").get<std::size_t>() || length.value_or(0) > schema.at("maxLength").get<std::size_t>())
             return invalid(path, "String encoding or length is invalid");
-        if(!valid_format(schema.at("format").get<std::string>(), text))
+        if(!valid_format(format, text))
             return invalid(path, "String representation is invalid");
         return {};
     }
@@ -261,6 +379,59 @@ Json enum_schema(Json values)
 Json bounded_array_schema(Json items, std::size_t maximum, std::size_t minimum, bool unique)
 {
     return {{"type", "array"}, {"items", std::move(items)}, {"minItems", minimum}, {"maxItems", maximum}, {"uniqueItems", unique}};
+}
+
+Json reference_schema(std::string name)
+{
+    return {{"$ref", "#/$defs/" + name}};
+}
+
+Json with_contract_definitions(Json schema)
+{
+    Json definitions = schema.value("$defs", Json::object());
+    for(const auto& contract : contract_registry())
+    {
+        auto definition = contract.schema;
+        definition.erase("$id");
+        definition.erase("$schema");
+        if(definitions.contains(contract.name) && definitions.at(contract.name) != definition)
+            throw std::invalid_argument("Contract definition name conflicts with a schema-local definition");
+        definitions[contract.name] = std::move(definition);
+    }
+    schema.erase("$defs");
+    std::unordered_set<std::string> required;
+    std::vector<std::string> pending;
+    const auto discover = [&](const auto& self, const Json& node) -> void
+    {
+        if(node.contains("$ref"))
+        {
+            const auto reference = node.at("$ref").get<std::string>();
+            const std::string prefix = "#/$defs/";
+            if(reference.compare(0, prefix.size(), prefix) != 0 || !definitions.contains(reference.substr(prefix.size())))
+                throw std::invalid_argument("Schema references an undeclared definition");
+            auto name = reference.substr(prefix.size());
+            if(required.insert(name).second)
+                pending.push_back(std::move(name));
+        }
+        for(const auto& child : node.value("properties", Json::object()))
+            self(self, child);
+        for(const auto& child : node.value("oneOf", Json::array()))
+            self(self, child);
+        if(node.contains("items"))
+            self(self, node.at("items"));
+        if(node.contains("additionalProperties") && node.at("additionalProperties").is_object())
+            self(self, node.at("additionalProperties"));
+    };
+    discover(discover, schema);
+    for(std::size_t index = 0; index < pending.size(); ++index)
+        discover(discover, definitions.at(pending[index]));
+    if(!required.empty())
+    {
+        schema["$defs"] = Json::object();
+        for(const auto& name : required)
+            schema["$defs"][name] = definitions.at(name);
+    }
+    return schema;
 }
 
 const std::vector<ContractDefinition>& contract_registry()
@@ -353,7 +524,7 @@ std::optional<ContractError> validate_contract(std::string_view name, const Json
     const auto entry = std::find_if(registry.begin(), registry.end(), [&](const auto& definition) { return definition.name == name; });
     if(entry == registry.end())
         return ContractError{"unknown_contract", "", "The contract name is not registered"};
-    return validate_node(entry->schema, input, "");
+    return validate_schema(entry->schema, input);
 }
 
 Json contract_schema(std::string_view name)
@@ -369,38 +540,75 @@ Json contract_schema(std::string_view name)
 
 std::optional<ContractError> validate_schema(const Json& schema, const Json& input)
 {
-    return validate_node(schema, input, "");
+    std::size_t visits = 0;
+    try
+    {
+        if(auto error = validate_schema_dialect(schema, schema, visits, 0))
+            return error;
+        return validate_node(schema, input, "", schema, visits, 0);
+    }
+    catch(const Json::exception&)
+    {
+        return ContractError{"invalid_contract", "", "Declared schema structure is invalid"};
+    }
 }
 
 Json result_schema(Json data, bool allowUnverified)
 {
-    const auto id = string_schema("opaque-id");
+    Json definitions = data.value("$defs", Json::object());
+    data.erase("$defs");
+    data.erase("$id");
+    data.erase("$schema");
+    definitions["ResultData"] = std::move(data);
+    definitions["Identifier"] = string_schema("opaque-id");
+    const auto id = reference_schema("Identifier");
     const auto verification = contract_schema("Verification").at("oneOf");
-    const auto nullable_data = Json{{"oneOf", Json::array({data, {{"type", "null"}}})}};
+    definitions["CompletedVerification"] = verification.at(0);
+    definitions["UnverifiedCompletion"] = verification.at(1);
+    for(const auto* status : {"pending", "failed", "unknown"})
+    {
+        auto definition = verification.at(2);
+        definition["properties"]["status"] = {{"const", status}};
+        definitions[std::string(status) + "_verification"] = std::move(definition);
+    }
+    for(const auto* outcome : {"failed", "partial_failure", "unknown"})
+    {
+        auto error = contract_schema("DomainError");
+        if(std::string_view(outcome) != "failed")
+            error["properties"]["code"] = {{"const", std::string_view(outcome) == "unknown" ? "timeout_unknown" : "partial_failure"}};
+        else
+        {
+            auto& codes = error["properties"]["code"]["enum"];
+            codes.erase(std::remove(codes.begin(), codes.end(), "partial_failure"), codes.end());
+            codes.erase(std::remove(codes.begin(), codes.end(), "timeout_unknown"), codes.end());
+        }
+        error.erase("$schema");
+        definitions[std::string(outcome) + "_error"] = std::move(error);
+    }
+    const auto data_reference = reference_schema("ResultData");
+    const auto nullable_data = Json{{"oneOf", Json::array({data_reference, {{"type", "null"}}})}};
     Json choices = Json::array();
     for(const auto* outcome : {"completed", "accepted", "partial_failure", "cancelled", "failed", "unknown"})
     {
         const std::string name = outcome;
         Json properties = {{"schemaVersion", {{"const", ContractVersion}}}, {"outcome", {{"const", name}}},
-            {"operationId", id}, {"jobId", id}, {"context", contract_schema("ResultContext")}, {"stateVersion", contract_schema("Decimal64")},
-            {"data", name == "completed" ? data : name == "accepted" || name == "failed" ? Json{{"type", "null"}} : nullable_data},
-            {"warnings", bounded_array_schema(contract_schema("ResultWarning"), 100)}, {"timings", contract_schema("ResultTimings")},
+            {"operationId", id}, {"jobId", id}, {"context", reference_schema("ResultContext")}, {"stateVersion", reference_schema("Decimal64")},
+            {"data", name == "completed" ? data_reference : name == "accepted" || name == "failed" ? Json{{"type", "null"}} : nullable_data},
+            {"warnings", bounded_array_schema(reference_schema("ResultWarning"), 100)}, {"timings", reference_schema("ResultTimings")},
             {"partial", {{"const", name == "partial_failure"}}}};
         Json required = {"schemaVersion", "outcome", "operationId", "context", "stateVersion", "data", "verification", "warnings", "timings", "partial"};
         if(name == "completed" || name == "cancelled")
         {
-            properties["verification"] = name == "completed" && allowUnverified ? Json{{"oneOf", Json::array({verification.at(0), verification.at(1)})}} : verification.at(0);
+            properties["verification"] = name == "completed" && allowUnverified ? Json{{"oneOf", Json::array({reference_schema("CompletedVerification"), reference_schema("UnverifiedCompletion")})}} : reference_schema("CompletedVerification");
             if(name == "completed")
             {
                 properties["partial"] = {{"type", "boolean"}};
-                properties["page"] = contract_schema("ResultPagination");
+                properties["page"] = reference_schema("ResultPagination");
             }
         }
         else
         {
-            auto status = verification.at(2);
-            status["properties"]["status"] = {{"const", name == "accepted" ? "pending" : name == "unknown" ? "unknown" : "failed"}};
-            properties["verification"] = status;
+            properties["verification"] = reference_schema(name == "accepted" ? "pending_verification" : name == "unknown" ? "unknown_verification" : "failed_verification");
         }
         if(name == "accepted")
         {
@@ -409,20 +617,12 @@ Json result_schema(Json data, bool allowUnverified)
         }
         if(name == "failed" || name == "partial_failure" || name == "unknown")
         {
-            properties["error"] = contract_schema("DomainError");
-            if(name != "failed")
-                properties["error"]["properties"]["code"] = {{"const", name == "unknown" ? "timeout_unknown" : "partial_failure"}};
-            else
-            {
-                auto& codes = properties["error"]["properties"]["code"]["enum"];
-                codes.erase(std::remove(codes.begin(), codes.end(), "partial_failure"), codes.end());
-                codes.erase(std::remove(codes.begin(), codes.end(), "timeout_unknown"), codes.end());
-            }
+            properties["error"] = reference_schema(name + "_error");
             required.push_back("error");
         }
         if(name == "partial_failure" || name == "cancelled" || name == "unknown")
         {
-            properties["effects"] = bounded_array_schema(contract_schema("EffectObservation"), 1000, name == "partial_failure" ? 1 : 0);
+            properties["effects"] = bounded_array_schema(reference_schema("EffectObservation"), 1000, name == "partial_failure" ? 1 : 0);
             required.push_back("effects");
             if(name == "unknown")
                 properties["partial"] = {{"type", "boolean"}};
@@ -430,12 +630,12 @@ Json result_schema(Json data, bool allowUnverified)
         if(name == "partial_failure" || name == "unknown")
         {
             const std::string route = name == "unknown" ? "reconciliation" : "recovery";
-            properties[route] = contract_schema("RecoveryRoute");
+            properties[route] = reference_schema("RecoveryRoute");
             required.push_back(route);
         }
         choices.push_back(closed_object_schema(std::move(properties), std::move(required)));
     }
-    return {{"$schema", "https://json-schema.org/draft/2020-12/schema"}, {"oneOf", std::move(choices)}};
+    return with_contract_definitions({{"$schema", "https://json-schema.org/draft/2020-12/schema"}, {"$defs", std::move(definitions)}, {"oneOf", std::move(choices)}});
 }
 
 Json recovery_json(const RecoveryRoute& recovery)

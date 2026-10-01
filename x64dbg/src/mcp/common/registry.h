@@ -16,6 +16,13 @@ struct RegistryCallContext
 
 using RegistryHandler = Checked<Json> (*)(const Json& input);
 
+struct EffectCondition
+{
+    std::string field;
+    std::string equals;
+    std::vector<Effect> effects;
+};
+
 struct ToolDefinition
 {
     std::string name;
@@ -35,7 +42,16 @@ struct ToolDefinition
     bool idempotent;
     bool openWorld;
     RegistryHandler handler;
+    std::vector<EffectCondition> effectConditions;
 };
+
+ToolDefinition define_tool(std::string name, std::string description, std::string domain, Json input, Json data,
+    std::vector<Effect> effects, Executor executor, StateRequirement state, ArchitectureRequirement architecture,
+    std::string completion, std::vector<std::string> recovery, std::vector<std::string> acceptanceIds,
+    std::string nativeSource, bool idempotent, bool openWorld, RegistryHandler handler = nullptr,
+    std::vector<EffectCondition> effectConditions = {});
+void append_lifecycle_tools(std::vector<ToolDefinition>& tools);
+Checked<std::vector<Effect>> required_tool_effects(std::string_view name, const Json& input);
 
 const std::vector<ToolDefinition>& tool_registry();
 const ToolDefinition* find_tool(std::string_view name);

@@ -1191,6 +1191,9 @@ if(X64DBG_BUILD_MCP) # mcp
 		cmake.toml
 		"src/mcp/common/contracts.cpp"
 		"src/mcp/common/contracts.h"
+		"src/mcp/common/launch.cpp"
+		"src/mcp/common/lifecycle.cpp"
+		"src/mcp/common/lifecycle.h"
 		"src/mcp/common/registry.cpp"
 		"src/mcp/common/registry.h"
 	)
@@ -1257,6 +1260,46 @@ if(X64DBG_BUILD_MCP) # mcp
 	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
 	if(NOT CMKR_VS_STARTUP_PROJECT)
 		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT mcp_contract_fixture)
+	endif()
+
+endif()
+# Target: mcp_launch_reference
+if(X64DBG_BUILD_MCP) # mcp
+	set(mcp_launch_reference_SOURCES
+		cmake.toml
+		"src/mcp/testing/launch_reference.cpp"
+	)
+
+	add_executable(mcp_launch_reference)
+
+	target_sources(mcp_launch_reference PRIVATE ${mcp_launch_reference_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${mcp_launch_reference_SOURCES})
+
+	target_compile_features(mcp_launch_reference PRIVATE
+		cxx_std_17
+	)
+
+	target_link_libraries(mcp_launch_reference PRIVATE
+		mcp_json
+	)
+
+	if(MSVC) # msvc
+		target_link_options(mcp_launch_reference PRIVATE
+			"/MANIFEST:EMBED"
+			"/MANIFESTUAC:level='asInvoker' uiAccess='false'"
+		)
+	endif()
+
+	set_target_properties(mcp_launch_reference PROPERTIES
+		OUTPUT_NAME
+			wininspect-mcp-launch-reference
+		EXCLUDE_FROM_ALL
+			ON
+	)
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT mcp_launch_reference)
 	endif()
 
 endif()

@@ -25,6 +25,8 @@ constexpr int MaximumJsonDepth = 64;
 constexpr std::size_t MaximumJsonEvents = 100000;
 constexpr std::size_t MaximumHexDigits = 16;
 constexpr std::size_t MaximumDecimalDigits = 20;
+constexpr std::size_t MaximumValidationVisits = 1000000;
+constexpr std::size_t MaximumValidationDepth = 128;
 
 struct InstanceId { std::string value; };
 struct TargetId { std::string value; };
@@ -206,6 +208,8 @@ Json bounded_integer_schema(std::uint32_t minimum, std::uint32_t maximum, std::o
 Json closed_object_schema(Json properties, Json required);
 Json enum_schema(Json values);
 Json bounded_array_schema(Json items, std::size_t maximum, std::size_t minimum = 0, bool unique = false);
+Json reference_schema(std::string name);
+Json with_contract_definitions(Json schema);
 Json result_schema(Json data, bool allowUnverified = false);
 std::optional<ContractError> validate_schema(const Json& schema, const Json& input);
 Json result_header_json(const ResultHeader& header);
