@@ -1,5 +1,38 @@
 settingset Events, EntryBreakpoint, 0
+settingset Events, TlsCallbacks, 0
 init tests/guard_page.exe
+mov guard_stops, 0
+await_first_guard:
+cmp ex.code(), 80000001
+jne advance_first_guard
+cmp ex.firstchance(), 1
+je first_guard
+advance_first_guard:
+inc guard_stops
+testassert guard_stops <= .64, "first guard exception stop limit"
 run
+jmp await_first_guard
+first_guard:
+testassert dword:[guard_page:GuardPageReady] == 1, "guarded code page must be initialized"
+testassert dword:[guard_page:ExecutedValue] == 0, "guarded code must not execute before its fault"
+guardpagestopassert first
+mov guard_stops, 0
+await_second_guard:
+run
+inc guard_stops
+testassert guard_stops <= .64, "second guard exception stop limit"
+cmp ex.code(), 80000001
+jne await_second_guard
+cmp ex.firstchance(), 0
+jne await_second_guard
+guardpagestopassert second
+mov guard_stops, 0
+await_guard_execution:
+run
+inc guard_stops
+testassert guard_stops <= .64, "guarded code completion stop limit"
+cmp dword:[guard_page:GuardPageCompleted], 1
+jne await_guard_execution
+testassert dword:[guard_page:ExecutedValue] == 1, "continued guarded code must execute and return one"
 run
 guardpageassert

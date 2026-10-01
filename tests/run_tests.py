@@ -17,22 +17,27 @@ import cases
 from wi_driver import CREATE_SUSPENDED, McpError, OwnedJob, ROOT, SuiteEnvironment, WinInspect, build_debugger, build_targets, file_identity, process_identity, read_kv, resume_suspended_process, write_json
 
 
+def native_fixture_identity(environment, name):
+    binary = ROOT / "x64dbg" / "bin" / environment.architecture / "tests" / f"{name}.exe"
+    if not binary.is_file():
+        raise McpError("Native fixtures are missing; run --phase build for the selected architecture")
+    binary_identity = file_identity(binary)
+    image = binary.read_bytes()
+    assert len(image) >= 64 and image[:2] == b"MZ", f"Native fixture {name} has no PE header"
+    pe_offset = int.from_bytes(image[0x3c:0x40], "little")
+    assert pe_offset <= len(image) - 6 and image[pe_offset:pe_offset + 4] == b"PE\0\0"
+    machine = int.from_bytes(image[pe_offset + 4:pe_offset + 6], "little")
+    assert machine == (0x8664 if environment.architecture == "x64" else 0x14c), f"Native fixture {name} has the wrong architecture"
+    return binary, binary_identity, machine
+
+
 def run_native_argument_oracles(environment, results):
     intended_arguments = ["Hu Tao \u2764\ufe0f", 'quoted "word"\\']
     observations = []
     normal_environment = {**os.environ, "WININSPECT_TEST_NORMAL": "1"}
     for name in ("cmdline_init", "cmdline_setcommandline"):
-        binary = ROOT / "x64dbg" / "bin" / environment.architecture / "tests" / f"{name}.exe"
-        if not binary.is_file():
-            raise McpError("Native argument fixtures are missing; run --phase build for the selected architecture")
+        binary, binary_identity, machine = native_fixture_identity(environment, name)
         command = [str(binary), *intended_arguments]
-        binary_identity = file_identity(binary)
-        image = binary.read_bytes()
-        assert len(image) >= 64 and image[:2] == b"MZ", f"Native fixture {name} has no PE header"
-        pe_offset = int.from_bytes(image[0x3c:0x40], "little")
-        assert pe_offset <= len(image) - 6 and image[pe_offset:pe_offset + 4] == b"PE\0\0"
-        machine = int.from_bytes(image[pe_offset + 4:pe_offset + 6], "little")
-        assert machine == (0x8664 if environment.architecture == "x64" else 0x14c), f"Native fixture {name} has the wrong architecture"
         ownership = OwnedJob()
         process = None
         try:
@@ -64,6 +69,23 @@ def run_native_argument_oracles(environment, results):
                              "intendedArguments": intended_arguments, "machine": machine, "debuggerUsed": False})
     results.append({"name": "test_native_argument_oracles", "status": "verified", "oracle": observations})
     print(f"[VERIFIED] Two normal native {environment.architecture} argument outcomes", flush=True)
+
+
+def run_native_guard_page_oracles(environment, results):
+    binary, binary_identity, machine = native_fixture_identity(environment, "guard_page")
+    receipt = run_owned_native_command([str(binary)], {**os.environ, "WININSPECT_TEST_NORMAL": "1"}, 10)
+    assert receipt["exitCode"] == 0 and not receipt["timedOut"], "Normal guard-page fixture failed"
+    stdout = environment.root / "guard-page-normal.txt"
+    stdout.write_text(receipt["stdout"], encoding="utf-8", newline="\n")
+    observed = dict(line.split("=", 1) for line in receipt["stdout"].splitlines() if "=" in line)
+    expected = {"ready": "1", "completed": "1", "value": "1", "exceptionCount": "1", "exceptionCode": "80000001",
+                "exceptionAtPage": "1", "protection": "00000040", "pageBytes": "6a0158c3"}
+    assert observed == expected, f"Normal guard-page outcome differs: {observed}"
+    assert file_identity(binary) == binary_identity
+    results.append({"name": "test_native_guard_page_oracles", "status": "verified", "oracle": {
+        "binary": binary_identity, "machine": machine, "receipt": receipt, "stdout": file_identity(stdout),
+        "expected": expected, "observed": observed, "debuggerUsed": False}})
+    print(f"[VERIFIED] Normal native {environment.architecture} guard-page outcome", flush=True)
 
 
 def run_fixture_oracles(environment, results):
@@ -285,7 +307,7 @@ def main():
     if native_surface:
         names = ["test_native_runtime_surface_inventory"]
     if arguments.phase == "fixtures":
-        names = ["test_fixture_oracles", "test_native_argument_oracles"]
+        names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles"]
     if arguments.phase == "runner":
         names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
@@ -367,6 +389,8 @@ def main():
                     run_fixture_oracles(environment, architecture_results)
                 if "test_native_argument_oracles" in selected_names:
                     run_native_argument_oracles(environment, architecture_results)
+                if "test_native_guard_page_oracles" in selected_names:
+                    run_native_guard_page_oracles(environment, architecture_results)
             functional = [function for function in functions if function.__name__ in selected_names]
             if functional:
                 run_functional(environment, functional, architecture_results, arguments.timeout)
