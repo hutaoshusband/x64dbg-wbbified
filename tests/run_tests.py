@@ -14,7 +14,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
 import cases
-from wi_driver import McpError, OwnedJob, ROOT, SuiteEnvironment, WinInspect, build_debugger, build_targets, file_identity, process_identity, read_kv, write_json
+from wi_driver import CREATE_SUSPENDED, McpError, OwnedJob, ROOT, SuiteEnvironment, WinInspect, build_debugger, build_targets, file_identity, process_identity, read_kv, resume_suspended_process, write_json
 
 
 def run_native_argument_oracles(environment, results):
@@ -177,7 +177,7 @@ def run_hide_case(environment, hidden, results, timeout):
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Isolated WinInspect verification suite")
-    parser.add_argument("--phase", choices=("baseline", "functional", "defects", "contracts", "surface", "fixtures", "inventory", "build", "native", "mcp-contracts"), default="baseline")
+    parser.add_argument("--phase", choices=("baseline", "functional", "defects", "contracts", "surface", "fixtures", "inventory", "build", "native", "runner", "mcp-contracts"), default="baseline")
     parser.add_argument("--arch", choices=("x64", "x32", "all"), default="x64")
     parser.add_argument("--case", action="append", default=[], help="Select a case name or glob; repeatable")
     parser.add_argument("--deploy", type=Path, help="Read-only source deployment for one architecture")
@@ -218,26 +218,58 @@ def parse_arguments():
     return arguments
 
 
+def run_owned_native_command(command, environment, timeout):
+    timed_out = False
+    process = None
+    with OwnedJob() as ownership:
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, encoding="utf-8", errors="replace", env=environment,
+                                       creationflags=subprocess.CREATE_NO_WINDOW | CREATE_SUSPENDED)
+            identity = process_identity(process)
+            ownership.assign(process)
+            startup_thread = resume_suspended_process(process)
+            try:
+                stdout, _ = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                ownership.close()
+                process.kill()
+                stdout, _ = process.communicate()
+                stdout += "\n[NATIVE RUNNER TIMEOUT]\n"
+        finally:
+            if process is not None and process.poll() is None:
+                ownership.close()
+                process.kill()
+                process.communicate()
+    return {"command": command, "processIdentity": identity, "startupThread": startup_thread, "exitCode": process.returncode,
+            "stdout": stdout, "timedOut": timed_out, "terminalObserved": process.poll() is not None, "jobClosed": True}
+
+
 def run_native_suite(arguments, run_root):
     architectures = ("x64", "x32") if arguments.arch == "all" else (arguments.arch,)
     engines = ("TitanEngine", "GleeBug", "StaticEngine") if arguments.engine == "all" else (arguments.engine,)
     results = []
+    environment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    environment.pop("WININSPECT_TEST_NORMAL", None)
     for architecture in architectures:
         for engine in engines:
             command = [sys.executable, str(ROOT / "x64dbg" / "src" / "tests" / "run.py"),
                        "--arch", architecture, "--engine", engine, "--timeout", str(int(arguments.timeout)),
                        "--artifacts-dir", str(run_root / architecture / engine)]
-            if arguments.list:
-                command.append("--list")
             command.extend(arguments.case)
-            process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, encoding="utf-8", errors="replace",
-                                     env={**os.environ, "PYTHONIOENCODING": "utf-8"})
-            print(process.stdout, flush=True)
-            results.append({"architecture": architecture, "engine": engine, "exitCode": process.returncode,
-                            "command": command, "stdout": process.stdout})
+            discovery = run_owned_native_command([*command, "--list"], environment, min(arguments.timeout, 30))
+            if discovery["exitCode"] or discovery["timedOut"]:
+                result = {**discovery, "stage": "discovery"}
+            else:
+                selected_cases = discovery["stdout"].splitlines()
+                result = run_owned_native_command(command, environment, arguments.timeout * len(selected_cases) + 30)
+                result.update({"stage": "execution", "selectedCases": selected_cases, "discovery": discovery})
+            print(result["stdout"], flush=True)
+            results.append({"architecture": architecture, "engine": engine, **result})
+            write_json(run_root / "native-summary.json", results)
     write_json(run_root / "native-summary.json", results)
-    return int(any(result["exitCode"] for result in results))
+    return int(any(result["exitCode"] or result["timedOut"] for result in results))
 
 
 def main():
@@ -254,6 +286,8 @@ def main():
         names = ["test_native_runtime_surface_inventory"]
     if arguments.phase == "fixtures":
         names = ["test_fixture_oracles", "test_native_argument_oracles"]
+    if arguments.phase == "runner":
+        names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
         names = ["test_source_inventory"]
     if arguments.phase in ("native", "build"):
@@ -277,6 +311,11 @@ def main():
     private_root.mkdir(parents=True, exist_ok=True)
     run_root = Path(tempfile.mkdtemp(prefix="wp01-" if arguments.phase == "mcp-contracts" else "wp00-", dir=private_root))
     print(f"Private evidence: {run_root}", flush=True)
+    if arguments.phase == "runner":
+        from runner_checks import run_runner_checks
+        results = run_runner_checks(run_owned_native_command, run_root)
+        write_json(run_root / "summary.json", {"phase": arguments.phase, "results": results})
+        return int(any(result["status"] != "verified" for result in results))
     if arguments.phase == "native":
         return run_native_suite(arguments, run_root)
     if arguments.phase == "build":

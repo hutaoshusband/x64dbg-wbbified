@@ -24,6 +24,10 @@ JOB_OBJECT_KILL_ON_CLOSE = 0x2000
 JOB_OBJECT_EXTENDED_LIMITS = 9
 TCP_OWNER_PID_LISTENERS = 3
 WINDOW_CLOSE = 0x10
+CREATE_SUSPENDED = 0x4
+THREAD_SNAPSHOT = 0x4
+THREAD_SUSPEND_RESUME = 0x2
+THREAD_QUERY_INFORMATION = 0x40
 KERNEL.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
 KERNEL.CreateJobObjectW.restype = wintypes.HANDLE
 KERNEL.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
@@ -31,6 +35,14 @@ KERNEL.SetInformationJobObject.restype = wintypes.BOOL
 KERNEL.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
 KERNEL.AssignProcessToJobObject.restype = wintypes.BOOL
 KERNEL.CloseHandle.argtypes = [wintypes.HANDLE]
+KERNEL.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+KERNEL.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+KERNEL.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+KERNEL.OpenThread.restype = wintypes.HANDLE
+KERNEL.GetProcessIdOfThread.argtypes = [wintypes.HANDLE]
+KERNEL.GetProcessIdOfThread.restype = wintypes.DWORD
+KERNEL.ResumeThread.argtypes = [wintypes.HANDLE]
+KERNEL.ResumeThread.restype = wintypes.DWORD
 KERNEL.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
 PSAPI.EnumProcessModulesEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
 PSAPI.GetModuleFileNameExW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
@@ -61,6 +73,57 @@ class ExtendedJobLimits(ctypes.Structure):
                 ("peakJobMemory", ctypes.c_size_t)]
 
 
+class ThreadEntry(ctypes.Structure):
+    _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("threadId", wintypes.DWORD),
+                ("processId", wintypes.DWORD), ("basePriority", wintypes.LONG),
+                ("deltaPriority", wintypes.LONG), ("flags", wintypes.DWORD)]
+
+
+KERNEL.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
+KERNEL.Thread32First.restype = wintypes.BOOL
+KERNEL.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
+KERNEL.Thread32Next.restype = wintypes.BOOL
+
+
+def resume_suspended_process(process):
+    snapshot = KERNEL.CreateToolhelp32Snapshot(THREAD_SNAPSHOT, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    thread_ids = []
+    try:
+        entry = ThreadEntry()
+        entry.size = ctypes.sizeof(entry)
+        found = KERNEL.Thread32First(snapshot, ctypes.byref(entry))
+        while found:
+            if entry.processId == process.pid:
+                thread_ids.append(entry.threadId)
+            entry.size = ctypes.sizeof(entry)
+            found = KERNEL.Thread32Next(snapshot, ctypes.byref(entry))
+        if ctypes.get_last_error() != 18:
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        KERNEL.CloseHandle(snapshot)
+    if len(thread_ids) != 1:
+        raise McpError("Suspended runner does not have exactly one startup thread")
+    thread = KERNEL.OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, False, thread_ids[0])
+    if not thread:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        owner = KERNEL.GetProcessIdOfThread(thread)
+        if not owner:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if owner != process.pid:
+            raise McpError("Suspended runner thread belongs to a different process")
+        count = KERNEL.ResumeThread(thread)
+        if count == 0xffffffff:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if count != 1:
+            raise McpError("Runner startup thread was not suspended exactly once")
+    finally:
+        KERNEL.CloseHandle(thread)
+    return thread_ids[0]
+
+
 class OwnedJob:
     def __init__(self):
         self.handle = KERNEL.CreateJobObjectW(None, None)
@@ -76,6 +139,12 @@ class OwnedJob:
     def assign(self, process):
         if not KERNEL.AssignProcessToJobObject(self.handle, wintypes.HANDLE(int(process._handle))):
             raise ctypes.WinError(ctypes.get_last_error())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, error_type, error, traceback):
+        self.close()
 
     def close(self):
         if self.handle:
