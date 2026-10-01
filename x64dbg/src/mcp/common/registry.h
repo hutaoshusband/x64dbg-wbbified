@@ -51,6 +51,9 @@ ToolDefinition define_tool(std::string name, std::string description, std::strin
     std::string nativeSource, bool idempotent, bool openWorld, RegistryHandler handler = nullptr,
     std::vector<EffectCondition> effectConditions = {});
 void append_lifecycle_tools(std::vector<ToolDefinition>& tools);
+void append_execution_tools(std::vector<ToolDefinition>& tools);
+void append_inspection_tools(std::vector<ToolDefinition>& tools);
+void append_memory_tools(std::vector<ToolDefinition>& tools);
 Checked<std::vector<Effect>> required_tool_effects(std::string_view name, const Json& input);
 
 const std::vector<ToolDefinition>& tool_registry();

@@ -142,7 +142,7 @@ std::string child_path(const std::string& path, const std::string& key)
     return path + "/" + escaped;
 }
 
-const std::unordered_set<std::string> schema_keywords = {"$schema", "$id", "$defs", "$ref", "description", "type", "properties", "required", "additionalProperties", "oneOf", "format", "pattern", "minLength", "maxLength", "minimum", "maximum", "default", "enum", "const", "items", "minItems", "maxItems", "uniqueItems"};
+const std::unordered_set<std::string> schema_keywords = {"$schema", "$id", "$defs", "$ref", "description", "type", "properties", "required", "additionalProperties", "oneOf", "not", "format", "pattern", "minLength", "maxLength", "minimum", "maximum", "default", "enum", "const", "items", "minItems", "maxItems", "uniqueItems"};
 
 std::optional<ContractError> validate_schema_dialect(const Json& schema, const Json& root, std::size_t& visits, std::size_t depth)
 {
@@ -222,6 +222,9 @@ std::optional<ContractError> validate_schema_dialect(const Json& schema, const J
     if(type == "array")
         if(auto error = validate_schema_dialect(schema.at("items"), root, visits, depth + 1))
             return error;
+    if(schema.contains("not"))
+        if(auto error = validate_schema_dialect(schema.at("not"), root, visits, depth + 1))
+            return error;
     if(type == "object" && schema.at("additionalProperties").is_object())
         return validate_schema_dialect(schema.at("additionalProperties"), root, visits, depth + 1);
     return {};
@@ -244,6 +247,14 @@ std::optional<ContractError> validate_node(const Json& schema, const Json& input
     }
     if(schema.contains("const") && input != schema.at("const"))
         return invalid(path, "Value differs from the required constant");
+    if(schema.contains("not"))
+    {
+        const auto error = validate_node(schema.at("not"), input, path, root, visits, depth + 1);
+        if(!error)
+            return invalid(path, "Value matches a prohibited schema");
+        if(error->code == "invalid_contract" || error->code == "resource_limit")
+            return error;
+    }
     if(schema.contains("enum") && std::find(schema.at("enum").begin(), schema.at("enum").end(), input) == schema.at("enum").end())
         return invalid(path, "Value is not in the allowed enumeration");
     if(schema.contains("oneOf"))
@@ -419,6 +430,8 @@ Json with_contract_definitions(Json schema)
             self(self, child);
         if(node.contains("items"))
             self(self, node.at("items"));
+        if(node.contains("not"))
+            self(self, node.at("not"));
         if(node.contains("additionalProperties") && node.at("additionalProperties").is_object())
             self(self, node.at("additionalProperties"));
     };

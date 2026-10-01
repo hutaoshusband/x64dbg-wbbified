@@ -1193,15 +1193,22 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/bootstrap.h"
 		"src/mcp/common/contracts.cpp"
 		"src/mcp/common/contracts.h"
+		"src/mcp/common/execution_tools.cpp"
+		"src/mcp/common/inspection_tools.cpp"
+		"src/mcp/common/inspection_types.cpp"
+		"src/mcp/common/inspection_types.h"
 		"src/mcp/common/ipc.cpp"
 		"src/mcp/common/ipc.h"
 		"src/mcp/common/launch.cpp"
 		"src/mcp/common/lifecycle.cpp"
 		"src/mcp/common/lifecycle.h"
+		"src/mcp/common/memory_tools.cpp"
 		"src/mcp/common/platform.cpp"
 		"src/mcp/common/platform.h"
 		"src/mcp/common/registry.cpp"
 		"src/mcp/common/registry.h"
+		"src/mcp/common/schema_helpers.cpp"
+		"src/mcp/common/schema_helpers.h"
 	)
 
 	add_library(mcp_common STATIC)

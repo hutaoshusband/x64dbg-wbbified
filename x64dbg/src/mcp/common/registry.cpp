@@ -66,6 +66,16 @@ struct SearchMatch
     std::uint32_t score;
 };
 
+std::size_t json_event_bound(const Json& value)
+{
+    if(!value.is_structured())
+        return 1;
+    std::size_t events = 3;
+    for(const auto& child : value)
+        events += json_event_bound(child) + (value.is_object() ? 1 : 0);
+    return events;
+}
+
 Checked<Json> registry_page(const Json& input, bool search)
 {
     const auto& tools = tool_registry();
@@ -114,11 +124,27 @@ Checked<Json> registry_page(const Json& input, bool search)
         offset = static_cast<std::size_t>(after - matches.begin()) + 1;
     }
     const auto limit = input.value("limit", DefaultPageLimit);
-    const auto end = std::min(matches.size(), offset + limit);
+    const auto requested_end = std::min(matches.size(), offset + limit);
+    auto end = offset;
+    std::size_t encoded_bytes = 4096;
+    std::size_t events = 512;
     Json rows = Json::array();
-    for(std::size_t index = offset; index < end; ++index)
-        rows.push_back(search ? Json{{"capabilityId", matches[index].tool->name}, {"description", matches[index].tool->description}, {"score", matches[index].score}}
-                              : tool_descriptor(*matches[index].tool));
+    for(; end < requested_end; ++end)
+    {
+        auto row = search ? Json{{"capabilityId", matches[end].tool->name}, {"description", matches[end].tool->description}, {"score", matches[end].score}}
+                          : tool_descriptor(*matches[end].tool);
+        const auto row_bytes = row.dump().size() + 1;
+        const auto row_events = json_event_bound(row);
+        if(row_bytes > MaximumPayloadBytes - encoded_bytes || row_events > MaximumJsonEvents - events)
+        {
+            if(rows.empty())
+                return ContractError{"resource_limit", "", "A capability descriptor exceeds the bounded catalog page"};
+            break;
+        }
+        encoded_bytes += row_bytes;
+        events += row_events;
+        rows.push_back(std::move(row));
+    }
     Json data = {{"snapshotId", BuildId}, {"items", rows}, {"complete", end == matches.size()}};
     if(end < matches.size())
         data["nextCursor"] = cursor_prefix + matches[end - 1].tool->name;
@@ -244,6 +270,9 @@ const std::vector<ToolDefinition>& tool_registry()
             closed_object_schema({{"leaseId", id}, {"released", {{"const", true}}}, {"pendingReconciled", {{"const", true}}}}, {"leaseId", "released", "pendingReconciled"}), {Effect::Configure}, StateRequirement::TargetPresent,
             "Released lease cannot authorize new mutations and previously accepted work is reconciled.", {"target_state"}, true, nullptr);
         append_lifecycle_tools(tools);
+        append_execution_tools(tools);
+        append_inspection_tools(tools);
+        append_memory_tools(tools);
         std::sort(tools.begin(), tools.end(), [](const ToolDefinition& left, const ToolDefinition& right) { return left.name < right.name; });
         return tools;
     }();
@@ -331,7 +360,7 @@ Checked<Json> call_registry_tool(std::string_view name, const Json& input, const
         return *error;
     if(!tool->handler)
         return ContractError{"unsupported_capability", "", "Declared capability has no implemented native handler"};
-    if(tool->effects != std::vector<Effect>{Effect::Inspect} || tool->executor != Executor::Broker || tool->state != StateRequirement::Broker)
+    if(tool->effects != std::vector<Effect>{Effect::Inspect} || !tool->effectConditions.empty() || tool->executor != Executor::Broker || tool->state != StateRequirement::Broker)
         return ContractError{"unsupported_capability", "", "Registry metadata dispatch only executes broker inspection handlers"};
     const auto started = std::chrono::steady_clock::now();
     const auto utc = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();

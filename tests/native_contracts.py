@@ -18,7 +18,16 @@ from wi_driver import KERNEL, McpError, OwnedJob, ROOT, compiler_environment, fi
 CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_context_roundtrip",
               "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser",
               "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
-              "test_lifecycle_contracts", "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
+              "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
+              "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
+
+EXECUTION_TOOLS = ("execution_resume", "execution_pause", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to",
+                   "execution_skip_instruction", "execution_wait", "threads_list", "threads_select", "threads_suspend", "threads_resume", "threads_context",
+                   "exceptions_state", "exceptions_policy_get", "exceptions_policy_set")
+INSPECTION_TOOLS = ("registers_read", "registers_write", "expression_evaluate", "expressions_evaluate", "watches_list", "watches_set", "watches_delete",
+                    "stack_read", "arguments_read", "pointers_follow", "process_peb", "thread_teb", "seh_chain", "unwind_info", "structures_list", "structures_decode")
+MEMORY_TOOLS = ("memory_map", "memory_read", "memory_read_string", "memory_write", "memory_allocate", "memory_free", "memory_protection_set",
+                "memory_search_pattern", "memory_search_text", "memory_strings", "memory_dump", "memory_dumpable_regions", "modules_dump", "handles_list", "heaps_list")
 
 
 def build_contract_fixture(output, architecture):
@@ -250,14 +259,22 @@ def check_schema_references(probe, formats):
         ("invalid_contract", {"$defs": {"Unused": {"unsupportedKeyword": True}}, "const": "rejected"}),
         ("invalid_contract", {"properties": {"count": {"const": 1}}}),
         ("invalid_contract", {"type": "object", "properties": {"unused": {"$ref": "#/$defs/Missing"}}, "required": [], "additionalProperties": False}),
-        ("invalid_contract", {"oneOf": []})])
+        ("invalid_contract", {"oneOf": []}),
+        ("invalid_contract", {"not": False}),
+        ("invalid_contract", {"not": {"unsupportedKeyword": True}}),
+        ("invalid_contract", {"not": {"$ref": "#/$defs/Missing"}}),
+        ("resource_limit", {"$defs": {"Loop": {"not": {"$ref": "#/$defs/Loop"}}}, "$ref": "#/$defs/Loop"})])
     for code, unsupported in failures:
         response = probe.call("schema-validate", {"schema": unsupported, "value": "rejected"})
         assert not response["valid"] and response["error"]["code"] == code, response
     sibling = {"$defs": {"Value": {"enum": [1, 2]}}, "$ref": "#/$defs/Value", "const": 2}
     for value in (1, 2):
         assert probe.call("schema-validate", {"schema": sibling, "value": value})["valid"] == (value == 2)
-    return {"independentLocalReferenceCases": 4, "rejectedUnsupportedOrCyclicSchemas": len(failures), "referenceSiblingConstraints": 2}
+    forbidden = {"$defs": {"Zero": {"const": "0"}}, "not": {"$ref": "#/$defs/Zero"}}
+    for expected, value in ((False, "0"), (True, "1"), (True, 0), (True, {})):
+        assert Draft202012Validator(forbidden).is_valid(value) == expected
+        assert probe.call("schema-validate", {"schema": forbidden, "value": value})["valid"] == expected
+    return {"independentLocalReferenceCases": 4, "rejectedUnsupportedOrCyclicSchemas": len(failures), "referenceSiblingConstraints": 2, "independentNegationCases": 4}
 
 
 def registry_validators(registry, formats):
@@ -265,13 +282,15 @@ def registry_validators(registry, formats):
     validators = {}
     expected = {"server_info", "server_health", "capabilities_list", "capabilities_describe", "capabilities_search", "client_context_get", "client_context_set", "control_acquire", "control_renew", "control_release"}
     expected.update({"debugger_instances", "debugger_start", "debugger_focus", "debugger_close", "debugger_settings_get", "debugger_settings_set", "processes_list", "target_open", "target_attach", "target_state", "target_snapshot", "target_stop", "target_detach", "target_restart", "target_command_line_get", "target_command_line_set"})
+    expected.update(EXECUTION_TOOLS + INSPECTION_TOOLS + MEMORY_TOOLS)
     assert registry["operationalTools"] == [] and {tool["name"] for tool in registry["tools"]} == expected
     assert [tool["name"] for tool in registry["tools"]] == sorted(expected)
     for tool in registry["tools"]:
         assert tool["schemaVersion"] == 1 and tool["operational"] is False
         assert tool["completionPredicate"] and tool["nativeSource"] and tool["recovery"] and tool["acceptanceIds"]
         assert tool["annotations"]["readOnlyHint"] == (tool["effects"] == ["inspect"] and not tool["effectConditions"])
-        assert tool["executor"] in ("broker", "engine", "gui") and tool["architectureRequirement"] == "any"
+        assert tool["executor"] in ("broker", "engine", "gui")
+        assert tool["architectureRequirement"] == {"seh_chain": "x32", "unwind_info": "x64"}.get(tool["name"], "any")
         for direction in ("input", "output"):
             schema = tool[f"{direction}Schema"]
             Draft202012Validator.check_schema(schema)
@@ -330,6 +349,23 @@ def check_registry_dispatch(probe, registry, validators):
         cursors.append(page["nextCursor"])
         request = {"limit": 2, "cursor": page["nextCursor"]}
     assert actual == registry["tools"] and len({item["name"] for item in actual}) == len(actual)
+    bounded_pages = {}
+    for limit in (None, 1000):
+        request = {} if limit is None else {"limit": limit}
+        collected = []
+        page_count = 0
+        while True:
+            page = call("capabilities_list", request)
+            assert len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) < 1024 * 1024
+            collected.extend(page["items"])
+            page_count += 1
+            if page["complete"]:
+                assert "nextCursor" not in page
+                break
+            assert page["items"] and page["nextCursor"] not in request.values()
+            request = {**request, "cursor": page["nextCursor"]}
+        assert collected == registry["tools"] and page_count > 1
+        bounded_pages[str(limit)] = page_count
     assert not probe.call("call", {"limit": 2, "cursor": cursors[0], "domain": "capabilities"}, "capabilities_list")["valid"]
     assert not probe.call("call", {"cursor": "registry:wrong-build:capabilities_list"}, "capabilities_list")["valid"]
     implemented = call("capabilities_list", {"availability": "implemented"})
@@ -345,7 +381,8 @@ def check_registry_dispatch(probe, registry, validators):
                         ("missing_tool", {}), ("capabilities_describe", {"capabilityId": "missing_tool"})):
         rejected = probe.call("call", value, name)
         assert not rejected["valid"] and rejected["error"]["code"] == "unsupported_capability"
-    return {"exactDescriptors": len(actual), "paginationPages": len(cursors) + 1, "implementedNativeMetadataHandlers": 3, "publicOperationalTools": 0}
+    return {"exactDescriptors": len(actual), "paginationPages": len(cursors) + 1, "boundedDefaultAndMaximumPages": bounded_pages,
+            "implementedNativeMetadataHandlers": 3, "publicOperationalTools": 0}
 
 
 def check_lifecycle_contracts(probe, validators):
@@ -417,6 +454,244 @@ def check_lifecycle_contracts(probe, validators):
             output_comparisons += 1
     return {"lifecycleTools": len(valid), "independentInputComparisons": len(cases), "independentOutputComparisons": output_comparisons,
             "conditionalElevationEffects": 2, "plannedHandlersRejected": len(valid)}
+
+
+def tool_context_examples():
+    target = {"instanceId": "instance-1", "targetId": "target-1", "targetGeneration": "9007199254740993"}
+    paused = {**target, "stopEpoch": "18446744073709551615", "threadId": 123}
+    mutation = {**paused, "leaseId": "lease-1", "idempotencyKey": "request-1"}
+    page = {"snapshotVersion": "9007199254740993", "complete": True}
+    register = {"context": paused, "architecture": "x64", "consistency": "paused", "groups": ["general", "avx512"],
+                "registers": [{"name": "rax", "group": "general", "widthBits": 64, "bytesHex": "ffffffffffffffff", "aliases": ["eax"], "lanes": [], "validity": "valid", "reason": None},
+                              {"name": "zmm31", "group": "avx512", "widthBits": 512, "bytesHex": "42" * 64, "aliases": ["ymm31", "xmm31"],
+                               "lanes": [{"widthBits": 64, "interpretation": "unsigned", "values": ["18446744073709551615"] * 8}], "validity": "valid", "reason": None}],
+                "features": [{"name": "avx512", "available": True, "enabled": True, "source": "xstate"}], "complete": True}
+    frame = {"index": 0, "ipHex": "0x140001000", "spHex": "0x7ff000", "returnHex": "0x140002000", "symbol": "fixture!step", "moduleId": "module-1",
+             "source": "unwind", "certainty": "verified", "bytesHex": "01020304"}
+    structure = {"typeId": "type-1", "addressHex": "0x1000", "size": "8", "fields": [{"name": "value", "typeId": "uint64", "offsetHex": "0x0", "size": "8",
+                 "status": "valid", "value": {"kind": "unsigned", "hex": "0xffffffffffffffff", "decimal": "18446744073709551615", "widthBits": 64}, "children": []}],
+                 "complete": True, "provider": "native-types"}
+    return SimpleNamespace(target=target, paused=paused, mutation=mutation, page=page, register=register, frame=frame, structure=structure)
+
+
+def check_tool_family(probe, registry, validators, names, inputs, outputs, extra_inputs=(), extra_outputs=(), expected_effects=None):
+    assert set(names) == set(inputs) == set(outputs)
+    definitions = {tool["name"]: tool for tool in registry["tools"]}
+    input_cases = []
+    for name, value in inputs.items():
+        input_cases.extend(((True, name, value), (False, name, {**value, "unknown": "reject"}),
+                            (False, name, {key: item for key, item in value.items() if key != "instanceId"})))
+    input_cases.extend(extra_inputs)
+    for expected, name, value in input_cases:
+        assert validators[(name, "input")].is_valid(value) == expected, f"Independent input {name}: expected {expected}"
+        result = probe.call("tool-input", value, name)
+        assert result["valid"] == expected, f"Native input {name}: {result}"
+    envelope = probe.call("result-cases")["results"][0]
+    output_cases = []
+    for name, value in outputs.items():
+        output_cases.extend(((True, name, value), (False, name, {**value, "unknown": "reject"}), (False, name, {})))
+    output_cases.extend(extra_outputs)
+    for expected, name, value in output_cases:
+        result = {**envelope, "data": value}
+        assert validators[(name, "output")].is_valid(result) == expected, f"Independent output {name}: expected {expected}"
+        response = probe.call("tool-output", result, name)
+        assert response["valid"] == expected, f"Native output {name}: {response}"
+    for name, value in inputs.items():
+        definition = definitions[name]
+        assert definition["availability"] == "planned" and definition["executor"] == "engine" and not definition["effectConditions"]
+        rejected = probe.call("call", value, name)
+        assert not rejected["valid"] and rejected["error"]["code"] == "unsupported_capability", rejected
+        effects = probe.call("effects", value, name)
+        assert effects["valid"] and effects["effects"] == expected_effects[name]
+        assert definition["effects"] == expected_effects[name]
+    return {"declaredTools": len(names), "independentInputComparisons": len(input_cases), "independentOutputComparisons": len(output_cases),
+            "plannedHandlersRejected": len(names), "exactEffectDeclarations": len(names)}
+
+
+def check_execution_contracts(probe, registry, validators):
+    c = tool_context_examples()
+    exception = {"active": True, "codeHex": "0xc0000005", "addressHex": "0x140001000", "chance": "first", "handling": "debuggee", "name": "access violation", "information": ["0x1", "0x2000"]}
+    observation = {"target": c.target, "state": "paused", "stopEpoch": "18446744073709551615", "threadId": 123, "ipHex": "0x140001000",
+                   "eventCursor": "event:1:42", "eventSequence": "9007199254740993", "stopReason": "step", "breakpointId": None, "exception": None,
+                   "exitCode": None, "completedSteps": "2", "reachedCondition": True, "allThreadsStopped": True}
+    thread = {"threadId": 123, "creationIdentity": "18446744073709551615", "name": "controlled", "state": "paused", "suspendCount": 1,
+              "selected": True, "ipHex": "0x140001000", "tebHex": "0x7ff000"}
+    suspension = {"target": c.target, "thread": thread, "previousCount": "0", "observedCount": "1", "ownedSuspend": "suspend-1", "ownershipReleased": False}
+    rule = {"range": {"firstHex": "0xc0000005", "lastHex": "0xc0000005"}, "breakOn": "first_chance", "log": True, "handledBy": "debuggee"}
+    policy = {"instanceId": "instance-1", "version": "9007199254740993", "rules": [rule], "complete": True}
+    inputs = {"execution_resume": {**c.mutation, "exceptionMode": "configured", "waitCondition": {"kind": "paused"}, "timeoutMs": 60000},
+              "execution_pause": {**c.target, "leaseId": "lease-1"}, "execution_step_into": {**c.mutation, "count": 2, "exceptionMode": "debuggee"},
+              "execution_step_over": {**c.mutation, "count": 2, "exceptionMode": "skip"},
+              "execution_step_out": {**c.mutation, "returnPolicy": {"thread": "selected", "exceptionMode": "debugger"}},
+              "execution_run_to": {**c.mutation, "moduleId": "module-1", "rvaHex": "0x1000", "condition": "rax == 42"},
+              "execution_skip_instruction": {**c.mutation, "expectedIp": "0x140001000", "count": 1},
+              "execution_wait": {**c.target, "afterCursor": "event:1:41", "condition": {"kind": "exception", "codeHex": "0xc0000005", "chance": "first"}},
+              "threads_list": {**c.target, "limit": 1000}, "threads_select": {**c.mutation, "threadId": 456},
+              "threads_suspend": {**c.target, "leaseId": "lease-1", "threadId": 123, "creationIdentity": "18446744073709551615"},
+              "threads_resume": {**c.target, "leaseId": "lease-1", "threadId": 123, "ownedSuspend": "suspend-1"},
+              "threads_context": {**c.target, "threadId": 123, "consistency": "best_effort"}, "exceptions_state": c.target,
+              "exceptions_policy_get": {"instanceId": "instance-1"}, "exceptions_policy_set": {"instanceId": "instance-1", "rules": [rule], "expectedVersion": "9007199254740993"}}
+    outputs = {name: observation for name in EXECUTION_TOOLS[:8]}
+    outputs.update({"threads_list": {"items": [thread], "page": c.page}, "threads_select": {"context": c.paused, "thread": thread},
+                    "threads_suspend": suspension, "threads_resume": suspension,
+                    "threads_context": {"thread": thread, "registers": c.register, "stack": {"items": [c.frame], "page": c.page}},
+                    "exceptions_state": exception, "exceptions_policy_get": policy, "exceptions_policy_set": policy})
+    extra_inputs = []
+    for name in ("execution_resume", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to", "execution_skip_instruction", "threads_select"):
+        extra_inputs.extend((False, name, {key: value for key, value in inputs[name].items() if key != missing}) for missing in ("stopEpoch", "threadId", "leaseId"))
+    extra_inputs.extend((True, "execution_resume", {**c.mutation, "exceptionMode": mode}) for mode in ("configured", "skip", "debugger", "debuggee"))
+    conditions = [{"kind": "exit"}, {"kind": "breakpoint", "breakpointId": "bp-1"}, {"kind": "address", "address": {"addressHex": "0xffffffffffffffff"}},
+                  {"kind": "thread_exit", "threadId": 123, "creationIdentity": "9007199254740993"}]
+    extra_inputs.extend((True, "execution_wait", {**c.target, "afterCursor": "event:1:41", "condition": condition}) for condition in conditions)
+    extra_inputs.extend([(False, "execution_step_into", {**c.mutation, "count": 0}), (False, "execution_step_over", {**c.mutation, "count": 1000001}),
+                         (False, "execution_resume", {**c.mutation, "exceptionMode": "force"}), (False, "execution_resume", {**c.mutation, "timeoutMs": 60001}),
+                         (False, "execution_skip_instruction", {**c.mutation, "expectedIp": 9007199254740993}),
+                         (False, "execution_run_to", {**inputs["execution_run_to"], "addressHex": "0x1000"}),
+                         (False, "execution_wait", {**c.target, "afterCursor": "event:1:41", "condition": {"kind": "exception", "codeHex": "0x100000000"}}),
+                         (False, "threads_suspend", {**inputs["threads_suspend"], "creationIdentity": "18446744073709551616"}),
+                         (False, "threads_resume", {**inputs["threads_resume"], "threadId": 0}),
+                         (False, "exceptions_policy_set", {**inputs["exceptions_policy_set"], "expectedVersion": 9007199254740993}),
+                         (False, "exceptions_policy_set", {**inputs["exceptions_policy_set"], "rules": [{**rule, "handledBy": "skip"}]}),
+                         (True, "exceptions_policy_set", {**inputs["exceptions_policy_set"], "rules": []})])
+    effects = {name: ["inspect"] for name in EXECUTION_TOOLS}
+    effects.update({name: ["execute"] for name in EXECUTION_TOOLS[:7] if name != "execution_skip_instruction"})
+    effects.update({"execution_skip_instruction": ["modify"], "threads_select": ["configure"], "threads_suspend": ["execute"], "threads_resume": ["execute"], "exceptions_policy_set": ["configure"]})
+    extra_outputs = [(True, "execution_wait", {**observation, "state": "exited", "stopReason": "exit", "exitCode": 17, "threadId": None, "ipHex": None}),
+                     (False, "exceptions_state", {**exception, "codeHex": "0x100000000"}),
+                     (False, "execution_pause", {**observation, "eventSequence": 9007199254740993})]
+    return check_tool_family(probe, registry, validators, EXECUTION_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects)
+
+
+def check_inspection_contracts(probe, registry, validators):
+    c = tool_context_examples()
+    expression = {"expression": "40 + 2", "value": {"kind": "unsigned", "hex": "0x2a", "decimal": "42", "widthBits": 64}, "error": None, "errorOffset": None}
+    watch = {"watchId": "watch-1", "expression": "rax", "type": "unsigned", "display": "hex", "trigger": "none"}
+    observed_watch = {**watch, "revision": "rev-1", "evaluation": expression}
+    inputs = {"registers_read": {**c.target, "groups": ["general", "avx512"], "threadId": 123, "consistency": "paused"},
+              "registers_write": {**c.mutation, "values": [{"name": "rax", "valueHex": "0x2a", "maskHex": "0xffff"}, {"name": "zmm31", "bytesHex": "42" * 64}],
+                                  "expectedValues": [{"name": "rax", "valueHex": "0x1"}]},
+              "expression_evaluate": {"instanceId": "instance-1", "expression": "40 + 2"}, "expressions_evaluate": {**c.target, "expressions": ["40 + 2", "rax"]},
+              "watches_list": c.target, "watches_set": {**c.target, "leaseId": "lease-1", "watch": watch, "expectedRevision": "rev-1"},
+              "watches_delete": {**c.target, "leaseId": "lease-1", "watchId": "watch-1"}, "stack_read": {**c.target, "threadId": 123, "frames": 1000, "includeBytes": True},
+              "arguments_read": {**c.paused, "convention": "win64", "count": 1, "types": ["uint64"]},
+              "pointers_follow": {**c.target, "expression": "rsp", "depth": 64, "pointerWidth": 64}, "process_peb": c.target, "thread_teb": {**c.target, "threadId": 123},
+              "seh_chain": c.paused, "unwind_info": {**c.target, "addressHex": "0x140001000"},
+              "structures_list": {"instanceId": "instance-1", "query": "PEB", "limit": 1000},
+              "structures_decode": {**c.target, "moduleId": "module-1", "rvaHex": "0x1000", "typeId": "type-1", "depth": 16}}
+    outputs = {"registers_read": c.register, "registers_write": c.register, "expression_evaluate": {"context": {"instanceId": "instance-1"}, "items": [expression], "complete": True},
+               "expressions_evaluate": {"context": c.paused, "items": [expression, expression], "complete": True}, "watches_list": {"items": [observed_watch], "page": c.page},
+               "watches_set": observed_watch, "watches_delete": {"watchId": "watch-1", "removed": True}, "stack_read": {"items": [c.frame], "page": c.page},
+               "arguments_read": {"context": c.paused, "convention": "win64", "items": [{"index": 0, "type": "uint64", "location": {"register": "rcx"}, "bytesHex": "2a00000000000000",
+                                  "value": expression["value"], "error": None}], "complete": True},
+               "pointers_follow": {"pointerWidth": 64, "items": [{"level": 0, "addressHex": "0x1000", "bytesHex": "0020000000000000", "valueHex": "0x2000", "region": None, "error": None}], "complete": True},
+               "seh_chain": {"context": c.paused, "items": [{"index": 0, "recordHex": "0x1000", "handlerHex": "0x401000", "nextHex": "0xffffffff", "valid": True}], "termination": "end", "complete": True},
+               "structures_list": {"items": [{"typeId": "type-1", "name": "KnownFixture", "size": "8", "provider": "native-types", "architecture": "x64", "kind": "structure"}], "page": c.page}}
+    outputs.update({name: c.structure for name in ("process_peb", "thread_teb", "unwind_info", "structures_decode")})
+    extra_inputs = [(True, "expression_evaluate", {**c.target, "expression": "rax", "threadId": 123, "expectedEpoch": "18446744073709551615"}),
+                    (True, "expressions_evaluate", {"instanceId": "instance-1", "expressions": ["40+2"]}), (True, "structures_list", {**c.target, "query": "Known"}),
+                    (False, "expression_evaluate", {"instanceId": "instance-1", "targetId": "target-1", "expression": "40+2"}),
+                    (False, "expression_evaluate", {**c.target, "expression": "rax", "expectedEpoch": 9007199254740993}),
+                    (False, "expressions_evaluate", {**c.target, "expressions": []}),
+                    (False, "registers_read", {**inputs["registers_read"], "groups": ["sse", "sse"]}),
+                    (False, "registers_read", {**inputs["registers_read"], "groups": ["imaginary"]}),
+                    (False, "registers_write", {**c.mutation, "values": []}),
+                    (False, "registers_write", {**c.mutation, "values": [{"name": "rax", "valueHex": "0x2a", "bytesHex": "2a"}]}),
+                    (False, "registers_write", {**c.mutation, "values": [{"name": "zmm31", "bytesHex": "42" * 65}]}),
+                    (False, "registers_write", {**c.mutation, "values": [{"name": "rax", "valueHex": "0x10000000000000000"}]}),
+                    (False, "watches_set", {**inputs["watches_set"], "watch": {**watch, "trigger": "execute"}}),
+                    (False, "stack_read", {**c.target, "frames": 1001}), (False, "arguments_read", {**c.paused, "count": 257}),
+                    (False, "pointers_follow", {**c.target, "addressHex": "0x1000", "depth": 65}),
+                    (False, "pointers_follow", {**c.target, "addressHex": "0x1000", "depth": 1, "pointerWidth": 16}),
+                    (False, "structures_decode", {**c.target, "addressHex": "0x1000", "typeId": "type-1", "depth": 17})]
+    for name in ("registers_write", "arguments_read", "seh_chain"):
+        extra_inputs.extend((False, name, {key: value for key, value in inputs[name].items() if key != missing}) for missing in ("stopEpoch", "threadId"))
+    wide = copy.deepcopy(c.register)
+    wide["registers"][1]["bytesHex"] = "42" * 65
+    nested = copy.deepcopy(c.structure)
+    nested["fields"][0]["children"] = [copy.deepcopy(c.structure["fields"][0])]
+    nested_invalid = copy.deepcopy(nested)
+    nested_invalid["fields"][0]["children"][0]["value"]["decimal"] = "18446744073709551616"
+    running_register = {**c.register, "context": c.target, "consistency": "best_effort"}
+    extra_outputs = [(False, "registers_read", wide), (True, "registers_read", running_register), (True, "structures_decode", nested), (False, "structures_decode", nested_invalid),
+                     (False, "stack_read", {"items": [{**c.frame, "certainty": "guess"}], "page": c.page})]
+    effects = {name: ["inspect"] for name in INSPECTION_TOOLS}
+    effects.update({"registers_write": ["modify"], "watches_set": ["configure"], "watches_delete": ["configure"]})
+    result = check_tool_family(probe, registry, validators, INSPECTION_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects)
+    result["recursiveStructureFieldValidation"] = 2
+    result["explicitArchitectureRoutes"] = {"seh_chain": "x32", "unwind_info": "x64"}
+    return result
+
+
+def check_memory_contracts(probe, registry, validators):
+    c = tool_context_examples()
+    address_range = {"address": {"addressHex": "0x1000"}, "size": 4}
+    region = {"baseHex": "0x1000", "size": "4096", "allocationBaseHex": "0x1000", "state": "committed", "protectionHex": "0x4",
+              "type": "private", "moduleId": None, "mappedPath": None, "readable": True}
+    coverage = {"requestedBytes": "4", "capturedBytes": "4", "spans": [{"addressHex": "0x1000", "size": "4", "protectionHex": "0x4", "status": "read", "error": None}], "complete": True}
+    string = {"addressHex": "0x1000", "encoding": "utf8", "text": "Hu Tao ❤", "byteSize": "10", "terminated": True, "truncated": False, "decoding": "valid"}
+    artifact = {"artifactId": "artifact-1", "namespaceId": "private-1", "revision": "rev-1", "sha256": "0" * 64, "size": "4", "mediaType": "application/octet-stream",
+                "source": "target:target-1", "coverage": coverage, "consistency": "paused"}
+    inputs = {"memory_map": {**c.target, "filter": {"state": "committed", "readable": True}},
+              "memory_read": {**c.target, **address_range, "encoding": "hex", "consistency": "paused"},
+              "memory_read_string": {**c.target, "expression": "rsp", "encoding": "utf16le", "maxBytes": 4096},
+              "memory_write": {**c.mutation, "addressHex": "0x1000", "bytes": "01020304", "expectedBytes": {"bytesHex": "00000000"}},
+              "memory_allocate": {**c.mutation, "size": "4096", "protection": "0x40", "preferredAddress": {"moduleId": "module-1", "rvaHex": "0x2000"}},
+              "memory_free": {**c.mutation, "allocationId": "allocation-1"},
+              "memory_protection_set": {**c.mutation, **address_range, "protection": "0x2", "expectedProtection": "0x4"},
+              "memory_search_pattern": {**c.target, "ranges": [address_range], "pattern": "01 ?? ?3 04", "limit": 1000},
+              "memory_search_text": {**c.target, "ranges": [address_range], "text": "Hu Tao", "encoding": "utf8", "caseSensitive": True},
+              "memory_strings": {**c.target, "ranges": [address_range], "encodings": ["utf8", "utf16le"], "minLength": 4},
+              "memory_dump": {**c.target, **address_range, "namespaceId": "private-1", "name": "fixture.bin"},
+              "memory_dumpable_regions": {**c.target, "moduleId": "module-1"},
+              "modules_dump": {**c.target, "moduleId": "module-1", "format": "mapped", "namespaceId": "private-1"},
+              "handles_list": {**c.target, "type": "File"}, "heaps_list": c.target}
+    match = {"addressHex": "0x1000", "size": "4", "bytesHex": "01020304"}
+    outputs = {"memory_map": {"items": [region], "page": c.page},
+               "memory_read": {"addressHex": "0x1000", "requestedSize": 4, "encoding": "hex", "encodedBytes": "01020304", "coverage": coverage, "consistency": "paused", "partial": False},
+               "memory_read_string": {**string, "coverage": coverage},
+               "memory_write": {"addressHex": "0x1000", "requestedBytes": "4", "writtenBytes": "4", "observedBytesHex": "01020304", "coverage": coverage, "restoration": "not_needed"},
+               "memory_allocate": {"allocationId": "allocation-1", "target": c.target, "addressHex": "0x1000", "size": "4096", "protection": "0x40", "owned": True, "region": region},
+               "memory_free": {"allocationId": "allocation-1", "addressHex": "0x1000", "released": True, "ownershipReleased": True, "regionAfter": {**region, "state": "free", "allocationBaseHex": None, "protectionHex": None, "readable": False}},
+               "memory_protection_set": {"pages": [{"addressHex": "0x1000", "size": "4096", "oldProtection": "0x4", "newProtection": "0x2", "status": "changed"}], "complete": True},
+               "memory_search_pattern": {"items": [match], "page": c.page, "coverage": coverage}, "memory_search_text": {"items": [match], "page": c.page, "coverage": coverage},
+               "memory_strings": {"items": [string], "page": c.page, "coverage": coverage}, "memory_dump": artifact,
+               "memory_dumpable_regions": {"items": [{**region, "constraints": ["native read limit"]}], "page": c.page},
+               "modules_dump": {**artifact, "moduleId": "module-1", "validity": {"format": "mapped", "layout": "valid", "imports": "unknown", "relocations": "unknown", "runnable": "unverified", "limitations": ["Independent execution pending"]}},
+               "handles_list": {"items": [{"valueHex": "0x1234", "type": "File", "name": "C:\\controlled.bin", "accessHex": "0x120089", "provider": "native-handles", "limitations": []}], "page": c.page},
+               "heaps_list": {"items": [{"heapId": "heap-1", "baseHex": "0x1000", "size": "4096", "flagsHex": "0x2", "provider": "native-heaps", "regions": [region], "complete": True, "limitations": []}], "page": c.page}}
+    extra_inputs = [(True, "memory_allocate", {**c.mutation, "size": "18446744073709551615", "protection": "0x40"}),
+                    (True, "memory_write", {**c.mutation, "moduleId": "module-1", "rvaHex": "0x1000", "bytes": "01020304", "expectedBytes": {"address": {"addressHex": "0x1000"}, "size": 4, "sha256": "0" * 64}}),
+                    (False, "memory_write", {**inputs["memory_write"], "bytes": "abc"}),
+                    (False, "memory_write", {**inputs["memory_write"], "expectedBytes": {}}),
+                    (False, "memory_write", {**inputs["memory_write"], "expectedBytes": {"bytesHex": "00", "sha256": "0" * 64}}),
+                    (False, "memory_write", {**inputs["memory_write"], "expression": "rax"}),
+                    (False, "memory_allocate", {**inputs["memory_allocate"], "size": "0"}),
+                    (False, "memory_allocate", {**inputs["memory_allocate"], "size": "18446744073709551616"}),
+                    (False, "memory_allocate", {**inputs["memory_allocate"], "size": 9007199254740993}),
+                    (False, "memory_allocate", {**inputs["memory_allocate"], "protection": "0x100000000"}),
+                    (False, "memory_free", {**c.mutation, "addressHex": "0x1000"}),
+                    (False, "memory_read", {**c.target, "address": {"addressHex": "0x1000"}, "size": 1048577}),
+                    (False, "memory_read", {**inputs["memory_read"], "address": {"addressHex": "0x1000", "expression": "rax"}}),
+                    (False, "memory_read_string", {**inputs["memory_read_string"], "maxBytes": 0}),
+                    (False, "memory_read_string", {**inputs["memory_read_string"], "encoding": "utf32"}),
+                    (False, "memory_search_pattern", {**inputs["memory_search_pattern"], "ranges": []}),
+                    (False, "memory_strings", {**inputs["memory_strings"], "encodings": ["utf8", "utf8"]}),
+                    (False, "memory_dump", {key: value for key, value in inputs["memory_dump"].items() if key != "namespaceId"}),
+                    (False, "modules_dump", {**inputs["modules_dump"], "format": "guessed"})]
+    for name in ("memory_write", "memory_allocate", "memory_free", "memory_protection_set"):
+        extra_inputs.extend((False, name, {key: value for key, value in inputs[name].items() if key != missing}) for missing in ("stopEpoch", "leaseId"))
+    effects = {name: ["inspect"] for name in MEMORY_TOOLS}
+    effects.update({name: ["modify"] for name in ("memory_write", "memory_allocate", "memory_free", "memory_protection_set")})
+    effects.update({"memory_dump": ["inspect", "file_export"], "modules_dump": ["inspect", "file_export"]})
+    partial_coverage = {"requestedBytes": "4", "capturedBytes": "2", "spans": [{"addressHex": "0x1000", "size": "2", "protectionHex": "0x4", "status": "read", "error": None},
+                        {"addressHex": "0x1002", "size": "2", "protectionHex": None, "status": "unreadable", "error": None}], "complete": False}
+    extra_outputs = [(True, "memory_read", {**outputs["memory_read"], "encodedBytes": "0102", "coverage": partial_coverage, "partial": True}),
+                     (False, "memory_map", {"items": [{**region, "size": "0"}], "page": c.page}),
+                     (False, "memory_map", {"items": [{**region, "protectionHex": "0x100000000"}], "page": c.page}),
+                     (False, "memory_allocate", {**outputs["memory_allocate"], "size": 4096}),
+                     (False, "memory_protection_set", {"pages": [{**outputs["memory_protection_set"]["pages"][0], "newProtection": "0x100000000"}], "complete": True}),
+                     (False, "memory_dump", {**artifact, "sha256": "0" * 63})]
+    return check_tool_family(probe, registry, validators, MEMORY_TOOLS, inputs, outputs, extra_inputs, extra_outputs, effects)
 
 
 class StartupInfo(ctypes.Structure):
@@ -659,7 +934,7 @@ def check_native_components(probe, architecture, validators, catalog):
     def verify(information, identity, binary, component):
         assert set(information) == {"schemaVersion", "component", "buildId", "wireVersion", "process", "declaredToolCount", "implementedTransports", "operationalTools"}
         assert information["schemaVersion"] == information["wireVersion"] == 1 and information["component"] == component
-        assert information["buildId"] == catalog["buildId"] and information["declaredToolCount"] == 26
+        assert information["buildId"] == catalog["buildId"] and information["declaredToolCount"] == len(catalog["tools"])
         assert information["implementedTransports"] == information["operationalTools"] == []
         process = information["process"]
         assert validators["NativeProcessIdentity"].is_valid(process)
@@ -819,6 +1094,12 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_schema_references(probe, formats))
             elif name == "test_lifecycle_contracts":
                 result.update(check_lifecycle_contracts(probe, tool_validators))
+            elif name == "test_execution_contracts":
+                result.update(check_execution_contracts(probe, registry, tool_validators))
+            elif name == "test_inspection_contracts":
+                result.update(check_inspection_contracts(probe, registry, tool_validators))
+            elif name == "test_memory_contracts":
+                result.update(check_memory_contracts(probe, registry, tool_validators))
             elif name == "test_native_launch_arguments":
                 result.update(check_native_launch(probe, architecture))
             elif name == "test_native_component_builds":
