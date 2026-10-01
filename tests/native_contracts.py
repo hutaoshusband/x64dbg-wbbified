@@ -53,11 +53,11 @@ JOB_EVENT_ARTIFACT_TOOLS = ("jobs_list", "job_get", "job_wait", "job_cancel", "o
 JOB_NATIVE_EFFECT_TOOLS = ("job_cancel",)
 
 
-def build_contract_fixture(output, architecture, cmake=None):
+def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None):
     build = Path(output) / f"build-{architecture}"
     build.mkdir()
     source = ROOT / "x64dbg"
-    environment = compiler_environment(architecture)
+    environment = compiler_environment(architecture, msvc_toolset)
     executable_path = next(value for key, value in environment.items() if key.lower() == "path")
     cmake_path = shutil.which(str(cmake) if cmake else "cmake", path=executable_path)
     compiler_path = shutil.which("cl.exe", path=executable_path)
@@ -68,7 +68,9 @@ def build_contract_fixture(output, architecture, cmake=None):
     version = subprocess.run([str(cmake_path), "--version"], env=environment, capture_output=True, text=True, timeout=10,
                              creationflags=subprocess.CREATE_NO_WINDOW)
     toolchain = {"cmake": file_identity(cmake_path), "compiler": file_identity(compiler_path),
-                 "cmakeVersion": version.stdout.strip(), "versionExitCode": version.returncode, "versionStderr": version.stderr}
+                 "cmakeVersion": version.stdout.strip(), "versionExitCode": version.returncode, "versionStderr": version.stderr,
+                 "requestedMsvcToolset": msvc_toolset,
+                 "msvcToolset": next((value.rstrip("\\/") for key, value in environment.items() if key.lower() == "vctoolsversion"), None)}
     write_json(build / "toolchain.json", toolchain)
     if version.returncode or not version.stdout.startswith("cmake version "):
         raise McpError("Selected CMake executable did not report a successful version")

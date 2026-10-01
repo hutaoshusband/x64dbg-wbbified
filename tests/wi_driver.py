@@ -143,7 +143,9 @@ def listener_pid(port):
     return None
 
 
-def compiler_environment(architecture):
+def compiler_environment(architecture, toolset=None):
+    if toolset is not None and not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", toolset):
+        raise McpError("MSVC toolset must be an exact numeric version")
     program_files = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
     locator = program_files / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
     if not locator.is_file():
@@ -155,12 +157,17 @@ def compiler_environment(architecture):
     if not development_command.is_file() or any(value in str(development_command) for value in '&|<>^%!\r\n'):
         raise McpError("Visual Studio development environment path is invalid")
     target = "x86" if architecture == "x32" else "x64"
-    command = f'call "{development_command}" -arch={target} -host_arch=x64 >nul && set'
+    selection = f" -vcvars_ver={toolset}" if toolset else ""
+    command = f'call "{development_command}" -arch={target} -host_arch=x64{selection} >nul && set'
     result = subprocess.run(f'cmd.exe /d /s /c "{command}"', capture_output=True, text=True,
                             creationflags=subprocess.CREATE_NO_WINDOW)
     if result.returncode:
         raise McpError(f"Visual Studio environment failed: {result.stdout} {result.stderr}")
-    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line and not line.startswith("="))
+    environment = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line and not line.startswith("="))
+    selected = next((value.rstrip("\\/") for key, value in environment.items() if key.lower() == "vctoolsversion"), None)
+    if toolset and selected != toolset:
+        raise McpError("Visual Studio selected a different toolset than requested")
+    return environment
 
 
 def build_targets(environment):

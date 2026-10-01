@@ -5,7 +5,21 @@
     "x64",
     "x32"
   ],
-  "runtimeProof": "Exact source-built fixture on the current Windows host; older OS and minimum compiler remain unverified until exercised",
+  "runtimeProof": "Exact source-built x64 and x32 development artifacts on the Windows 10.0.19044 x64 host; product behavior, other OS builds and native x86/ARM hosts require their own runtime acceptance",
+  "supportedBuild": {
+    "cmakeMinimum": "3.22.6",
+    "compiler": "MSVC",
+    "compilerMinimum": "19.44.35228.0",
+    "minimumToolsetFixture": "14.44.35207",
+    "languages": ["C11", "C++17", "C++23 for the inherited GleeBug target"],
+    "runtimeVendorMinimum": "Windows 10 or Windows Server 2016 for the default Visual Studio 2026 toolchain; appropriate v14 runtime must match or exceed the selected build tools",
+    "runtimeVendorReference": "https://learn.microsoft.com/en-us/cpp/overview/supported-platforms-visual-cpp?view=msvc-170",
+    "redistributableReference": "https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170",
+    "verifiedHost": {"version": "10.0.19044", "architecture": "x64"},
+    "verifiedTargetArchitectures": ["x64", "x32"],
+    "unverifiedRuntimeMatrix": ["Other Windows 10 builds", "Windows 11", "Windows Server", "Native x86 OS", "ARM64 OS"],
+    "unsupportedBuildMatrix": ["CMake before 3.22.6", "MSVC before 19.44.35228.0", "Other compilers"]
+  },
   "licenseCompatibilitySource": "https://www.gnu.org/licenses/license-list.html.html",
   "ownedCodeLicense": "Root LICENSE scopes MIT to owned contributions; original debugger license remains unchanged",
   "dependencies": [

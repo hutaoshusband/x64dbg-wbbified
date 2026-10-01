@@ -1,6 +1,10 @@
 include_guard(GLOBAL)
 include(FetchContent)
 
+if(NOT MSVC OR CMAKE_CXX_COMPILER_VERSION VERSION_LESS "19.44.35228.0")
+    message(FATAL_ERROR "Native MCP requires MSVC 19.44.35228.0 or later; other toolchains are unverified")
+endif()
+
 if(POLICY CMP0169)
     cmake_policy(SET CMP0169 OLD)
 endif()

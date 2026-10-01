@@ -1,5 +1,5 @@
 [cmake]
-version = "3.15"
+version = "3.22.6"
 cmkr-include = "cmake/cmkr.cmake"
 
 [options]
