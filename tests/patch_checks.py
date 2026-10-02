@@ -51,9 +51,10 @@ def patch_image_facts(binary, machine):
             image.close()
 
 
-def check_patch_output(receipt, facts, mode):
+def check_patch_output(receipt, facts, mode, value=7):
+    assert value in (7, 42) and (mode == 2 or value == 7), "Unknown independently requested patch outcome"
     count = 3 if mode == 1 else 1
-    assert receipt["exitCode"] == count * 7 and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"], "Normal patch reference did not complete with its actual executed sum"
+    assert receipt["exitCode"] == count * value and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"], "Normal patch reference did not complete with its actual executed sum"
     lines = receipt["stdout"].splitlines()
     assert len(lines) == 9 + count * 2 and all(line.count("=") == 1 for line in lines), "Patch summary fields are malformed"
     observed = dict(line.split("=", 1) for line in lines)
@@ -61,15 +62,16 @@ def check_patch_output(receipt, facts, mode):
     base = int(observed["imageBase"], 16)
     assert base > 0 and base % 0x10000 == 0 and base + facts["size"] < 1 << (64 if facts["machine"] == 0x8664 else 32), "Patch target has an invalid actual image base"
     expected = {"mode": str(mode), "mutation": "0", "phase": "4", "pid": str(receipt["processIdentity"]["pid"]),
-                "thread": str(receipt["startupThread"]), "imageBase": f"{base:x}", "completed": str(count), "verified": "1", "sum": str(count * 7)}
+                "thread": str(receipt["startupThread"]), "imageBase": f"{base:x}", "completed": str(count), "verified": "1", "sum": str(count * value)}
     for index in range(count):
-        expected.update({f"value{index}": "7", f"marker{index}": "original"})
+        expected.update({f"value{index}": str(value), f"marker{index}": "original" if value == 7 else "patched"})
     assert observed == expected, f"Actual normal patch outcomes differ: {observed}"
     return observed
 
 
-def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine"):
+def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine", file_exports=False):
     assert kind in ("software", "hardware", "memory") and engine in ("TitanEngine", "GleeBug"), "Unknown patch reference variant"
+    assert not file_exports or kind == "software", "File reference requires its declared software breakpoint"
     output = receipt["stdout"]
     finals = re.findall(r"\[wi-test\] FINAL status=(pass|fail) asserts=(\d+)(?: reason=(\w+))?", output)
     assert len(finals) == 1 and finals[0][0] == "pass" and 150 <= int(finals[0][1]) < 1000 and receipt["exitCode"] == 0 and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"], "Native patch reference did not complete"
@@ -80,13 +82,16 @@ def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine")
     assert 0 < int(pid) < 1 << 32 and 0 < int(thread) < 1 << 32 and int(pid) != receipt["processIdentity"]["pid"] and 0 < int(creation) < 1 << 64, "Patch reference has an invalid target OS identity"
     assert base > 0 and base % 0x10000 == 0 and base + facts["size"] < 1 << (64 if facts["machine"] == 0x8664 else 32) and address == base + facts["exports"]["PatchValue"], "Patch origin differs from its source PE function"
     snapshots = re.findall(r"PATCH_BYTES patched=([01]) trapped=([01]) address=([0-9a-f]+) logical=([0-9a-f]+) raw=([0-9a-f]+)", output)
-    assert [entry[0] for entry in snapshots] == list("0000001100" if kind == "memory" else "000001100"), "Patch bytes omit or reorder pure encoding, failed writes, apply or restoration"
+    expected_snapshots = "0" * 5 + "1" * 20 + "00" if file_exports else "0000001100" if kind == "memory" else "000001100"
+    assert [entry[0] for entry in snapshots] == list(expected_snapshots), "Patch bytes omit or reorder pure encoding, failed writes, apply or restoration"
     for patched, trapped, location, logical, raw in snapshots:
         expected = facts["patched"] if patched == "1" else facts["original"]
         assert trapped == ("1" if kind == "software" else "0") and int(location, 16) == address and logical == expected and raw == ("cc" + expected[2:] if kind == "software" else expected), "Logical original, selected trap or actual installed opcode differs"
     breakpoint_type = {"software": 1, "hardware": 2, "memory": 4}[kind]
     breakpoints = re.findall(r"PATCH_BREAKPOINT type=(\d+) address=([0-9a-f]+) typeEx=(\d+) enabled=([01]) active=([01]) singleshoot=([01]) hits=(\d+) protection=([0-9a-f]+) originalProtection=([0-9a-f]+)", output)
     expected_hits = [0, 1, 1, 1, 1, 1, 2, 2, 3] if kind != "memory" else [0, 1, 1, 1, 1, 1, 1, 2, 2, 3]
+    if file_exports:
+        expected_hits = [0] + [1] * 23 + [2, 2, 3]
     assert len(breakpoints) == len(snapshots) and [int(item[6]) for item in breakpoints] == expected_hits, "Breakpoint metadata omits its exact stop sequence"
     protection = 2 if kind == "memory" else 0x20
     for observed_type, location, extended, enabled, active, singleshoot, _, actual, original in breakpoints:
@@ -125,7 +130,7 @@ def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine")
     records = re.findall(r"PATCH_RECORD address=([0-9a-f]+) old=([0-9a-f]{2}) new=([0-9a-f]{2}) module=(\S+)", output)
     original, patched = bytes.fromhex(facts["original"]), bytes.fromhex(facts["patched"])
     expected_records = [(address + offset, original[offset], patched[offset], "patch_canary.exe") for offset in facts["changedOffsets"]]
-    assert [(int(location, 16), int(old, 16), int(new, 16), module) for location, old, new, module in records] == expected_records * 2, "Patch lookup loses the original bytes, changed bytes or exact tracked span"
+    assert [(int(location, 16), int(old, 16), int(new, 16), module) for location, old, new, module in records] == expected_records * (20 if file_exports else 2), "Patch lookup loses the original bytes, changed bytes or exact tracked span"
     hits = re.findall(r"PATCH_HIT index=(\d+) address=([0-9a-f]+) pid=(\d+) thread=(\d+) type=(\d+)", output)
     assert hits == [(str(index), f"{address:x}", pid, thread, str(breakpoint_type)) for index in range(3)], "Actual selected breakpoint callbacks differ from the three source-bound calls"
     results = re.findall(r"PATCH_RESULT values=(\d+)/(\d+)/(\d+) markers=(\w+)/(\w+)/(\w+) completed=(\d+) verified=(\d+)", output)
@@ -139,7 +144,7 @@ def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine")
             "oversizedNativeErrorPresent": assembly[0][1] == "1"}
 
 
-def check_patch_negative_controls(receipt, facts, kind="software", engine="TitanEngine"):
+def check_patch_negative_controls(receipt, facts, kind="software", engine="TitanEngine", file_exports=False):
     output = receipt["stdout"]
     changes = [("wrong_executed_value", "values=7/42/7", "values=7/43/7"), ("wrong_marker", "markers=original/patched/original", "markers=original/original/original"),
                ("wrong_original_byte", "old=b8 new=66", "old=90 new=66"), ("wrong_raw_opcode", "raw=cc07000000c3" if kind == "software" else "raw=b807000000c3", "raw=9007000000c3"),
@@ -162,7 +167,7 @@ def check_patch_negative_controls(receipt, facts, kind="software", engine="Titan
     observed = []
     for name, candidate in controls:
         try:
-            check_patch_reference(candidate, facts, kind, engine)
+            check_patch_reference(candidate, facts, kind, engine, file_exports)
         except (AssertionError, ValueError, KeyError) as error:
             observed.append({"name": name, "status": "rejected", "error": str(error), "targetExecuted": False})
         else:

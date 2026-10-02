@@ -194,7 +194,7 @@ else()
     target_sources(test_patch_canary_target PRIVATE "patch_canary/patch32.asm")
     target_link_options(test_scriptcmd_call_threads_target PRIVATE "LINKER:/EXPORT:ThreadReferenceWorker=_ThreadReferenceWorker@4")
 endif()
-target_link_options(test_patch_canary_target PRIVATE "LINKER:/EXPORT:PatchCall" "LINKER:/EXPORT:PatchAfterCall" "LINKER:/EXPORT:PatchValue" "LINKER:/EXPORT:PatchValueEnd")
+target_link_options(test_patch_canary_target PRIVATE "LINKER:/EXPORT:PatchCall" "LINKER:/EXPORT:PatchAfterCall" "LINKER:/EXPORT:PatchValue" "LINKER:/EXPORT:PatchValueEnd" "LINKER:/EXPORT:PatchRelocation" "LINKER:/EXPORT:PatchVirtualTail")
 target_link_options(test_issue3803_target PRIVATE "LINKER:/EXPORT:RegisterProbe" "LINKER:/EXPORT:RegisterStop")
 target_link_options(test_scriptcmd_call_threads_target PRIVATE "LINKER:/EXPORT:ThreadProbe0" "LINKER:/EXPORT:ThreadProbe1" "LINKER:/EXPORT:ThreadStop0" "LINKER:/EXPORT:ThreadStop1")
 target_link_options(test_trace_cmd_condition_target PRIVATE

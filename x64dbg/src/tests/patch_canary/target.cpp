@@ -31,6 +31,9 @@ extern "C"
     __declspec(dllexport) DWORD gPatchVerified = 0;
     __declspec(dllexport) uintptr_t gPatchWriteFailureRegion = 0;
     DWORD PatchCall();
+    DWORD PatchValue();
+    extern uintptr_t PatchRelocation;
+    extern unsigned char PatchVirtualTail[8192];
 }
 extern "C" __declspec(dllexport) __declspec(noinline) void PatchReady()
 {
@@ -52,6 +55,10 @@ int main()
     }
     if((gPatchMode != 1 && gPatchMode != 2) || gPatchMutation > 1)
         return normal ? 238 : 239;
+    if(PatchRelocation != reinterpret_cast<uintptr_t>(&PatchValue))
+        return 114;
+    for(const unsigned char byte : PatchVirtualTail)
+        if(byte != 0) return 115;
     gPatchPid = GetCurrentProcessId();
     gPatchThread = GetCurrentThreadId();
     gPatchImageBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));

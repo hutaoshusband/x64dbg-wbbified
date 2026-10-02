@@ -39,6 +39,30 @@ namespace
         ScopedThread& operator=(const ScopedThread&) = delete;
         ~ScopedThread() { if(value) CloseHandle(value); }
     };
+    struct ScopedFile
+    {
+        HANDLE value;
+        ScopedFile(const wchar_t* path, DWORD access, DWORD sharing, DWORD disposition) : value(path && path[0] ? CreateFileW(path, access, sharing, nullptr, disposition, FILE_ATTRIBUTE_NORMAL, nullptr) : INVALID_HANDLE_VALUE) {}
+        ScopedFile(const ScopedFile&) = delete;
+        ScopedFile& operator=(const ScopedFile&) = delete;
+        ~ScopedFile() { if(value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    };
+    std::wstring DecodePath(const char* text)
+    {
+        const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, nullptr, 0);
+        if(count < 2) return {};
+        std::vector<wchar_t> value(count);
+        if(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, value.data(), count) != count) return {};
+        return std::wstring(value.data(), count - 1);
+    }
+    std::string EncodePath(const std::wstring& text)
+    {
+        const int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if(count < 2) return {};
+        std::vector<char> value(count);
+        if(WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.c_str(), -1, value.data(), count, nullptr, nullptr) != count) return {};
+        return std::string(value.data(), count - 1);
+    }
     duint FieldAddress(const char* name)
     {
         return DbgValFromString((std::string("patch_canary:") + name).c_str());
@@ -341,6 +365,102 @@ namespace
                           static_cast<unsigned long long>(gFailureWritten), region.Protect, logical[0x10], actual[0x10]);
         return true;
     }
+    bool cbExport(int argc, char** argv)
+    {
+        if(!_plugin_testassert(argc == 3 && strlen(argv[2]) == 1 && argv[2][0] >= '0' && argv[2][0] <= '8', "file reference declares destination and exact patch selection")) return false;
+        if(!CheckPhase(2, {7, 0, 0}) || !CheckBytes(true, true) || !CheckTracking(true)) return false;
+        const unsigned kind = argv[2][0] - '0';
+        std::vector<DBGPATCHINFO> patches;
+        if(kind == 0 || kind >= 4)
+        {
+            size_t size = 0;
+            if(!_plugin_testassert(DbgFunctions()->PatchEnum(nullptr, &size) && size == 4 * sizeof(DBGPATCHINFO), "export selects exactly the declared tracked patch bytes")) return false;
+            patches.resize(size / sizeof(DBGPATCHINFO));
+            if(!_plugin_testassert(DbgFunctions()->PatchEnum(patches.data(), &size) && size == patches.size() * sizeof(DBGPATCHINFO), "export captures all actual patch records")) return false;
+        }
+        else
+        {
+            const duint address = kind == 1 ? FieldAddress("PatchVirtualTail") : kind == 2 ? DbgModBaseFromName("patch_canary.exe") + 0x1c : FieldAddress("PatchRelocation");
+            const unsigned size = kind == 3 ? sizeof(duint) : 1;
+            std::array<unsigned char, sizeof(duint)> original{}, replacement{};
+            if(!_plugin_testassert(address && DbgMemRead(address, original.data(), size), "layout reference reads its actual live exported or header bytes")) return false;
+            if(kind == 3)
+            {
+                duint pointer = 0;
+                memcpy(&pointer, original.data(), sizeof(pointer));
+                if(!_plugin_testassert(pointer == FieldAddress("PatchValue"), "actual loader relocation points to the exact function")) return false;
+                memcpy(replacement.data(), &pointer, sizeof(pointer));
+            }
+            else
+            {
+                if(!_plugin_testassert(original[0] == 0, "virtual zero-tail or reserved header byte has its known actual value")) return false;
+                replacement[0] = 0x5b;
+            }
+            for(unsigned index = 0; index < size; ++index)
+            {
+                DBGPATCHINFO entry{};
+                strcpy_s(entry.mod, "patch_canary.exe");
+                entry.addr = address + index;
+                entry.oldbyte = original[index];
+                entry.newbyte = replacement[index];
+                patches.push_back(entry);
+                _plugin_logprintf("FILE_SELECTION kind=%u address=%llx old=%02x new=%02x\n", kind, static_cast<unsigned long long>(entry.addr), entry.oldbyte, entry.newbyte);
+            }
+        }
+        if(kind == 5) strcpy_s(patches[1].mod, "different_module.dll");
+        if(kind == 6) patches.clear();
+        const auto path = DecodePath(argv[1]);
+        if(!_plugin_testassert(!path.empty(), "export destination has an exact UTF-8 to UTF-16 representation")) return false;
+        const ScopedFile locked(kind == 4 ? path.c_str() : L"", GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
+        if(!_plugin_testassert(kind != 4 || locked.value != INVALID_HANDLE_VALUE, "locked-destination control owns its real write-denying OS file handle")) return false;
+        char error[MAX_ERROR_SIZE]{};
+        const int written = DbgFunctions()->PatchFile(patches.data(), static_cast<int>(patches.size()), argv[1], error);
+        _plugin_logprintf("FILE_EXPORT kind=%u requested=%u written=%d errorPresent=%u\n", kind, static_cast<unsigned>(patches.size()), written, error[0] ? 1 : 0);
+        if(!_plugin_testassert(written == (kind >= 4 ? -1 : kind == 1 ? 0 : static_cast<int>(patches.size())) && bool(error[0]) == (kind >= 4), "native file export count preserves the actual legacy mapping boundary")) return false;
+        return CheckBytes(true, true) && CheckTracking(true);
+    }
+    bool cbFileExports(int argc, char** argv)
+    {
+        if(!_plugin_testassert(argc == 1 || argc == 2, "file reference accepts one explicit private output directory")) return false;
+        const auto directory = argc == 2 ? DecodePath(argv[1]) : std::wstring(BridgeUserDirectory()) + L"\\patch-files-" + std::to_wstring(GetCurrentProcessId());
+        if(!_plugin_testassert(!directory.empty() && CreateDirectoryW(directory.c_str(), nullptr), "file reference creates a new private directory without replacing existing files")) return false;
+        const char digits[] = "0123456789abcdef";
+        std::string encoded;
+        for(const wchar_t character : directory)
+            for(unsigned byte : {unsigned(character & 255), unsigned(character >> 8)})
+            {
+                encoded.push_back(digits[byte >> 4]);
+                encoded.push_back(digits[byte & 15]);
+            }
+        _plugin_logprintf("FILE_DIRECTORY utf16=%s\n", encoded.c_str());
+        const auto relocation = FieldAddress("PatchRelocation"), tail = FieldAddress("PatchVirtualTail");
+        duint pointer = 0;
+        std::array<unsigned char, 8192> zeros{};
+        if(!_plugin_testassert(relocation && tail && DbgMemRead(relocation, &pointer, sizeof(pointer)) && pointer == FieldAddress("PatchValue")
+                              && DbgMemRead(tail, zeros.data(), zeros.size()) && zeros == std::array<unsigned char, 8192>{},
+                              "actual OS loader supplies the source-bound relocated pointer and complete zero virtual tail")) return false;
+        _plugin_logprintf("FILE_LAYOUT relocation=%llx pointer=%llx virtual=%llx zeros=%u\n", static_cast<unsigned long long>(relocation),
+                          static_cast<unsigned long long>(pointer), static_cast<unsigned long long>(tail), static_cast<unsigned>(zeros.size()));
+        for(unsigned kind = 0; kind < 9; ++kind)
+        {
+            const auto path = directory + (kind == 7 ? L"\\missing\\" : L"\\") + L"file-" + std::to_wstring(kind) + L".exe";
+            if(kind == 4 || kind == 8)
+            {
+                const ScopedFile file(path.c_str(), GENERIC_WRITE, 0, CREATE_NEW);
+                const std::array<unsigned char, 16> sentinel{'W', 'B', 'B', '_', 'F', 'I', 'L', 'E', '_', 'G', 'U', 'A', 'R', 'D', 0, 0x5a};
+                DWORD written = 0;
+                if(!_plugin_testassert(file.value != INVALID_HANDLE_VALUE && WriteFile(file.value, sentinel.data(), DWORD(sentinel.size()), &written, nullptr)
+                                      && written == sentinel.size() && FlushFileBuffers(file.value), "guard control creates its exact private destination before the native export")) return false;
+            }
+            if(kind == 8 && !_plugin_testassert(SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_READONLY), "read-only control sets its actual OS protection")) return false;
+            auto utf8 = EncodePath(path);
+            auto selection = std::to_string(kind);
+            char command[] = "patchexport";
+            char* arguments[]{command, utf8.data(), selection.data()};
+            if(!cbExport(3, arguments)) return false;
+        }
+        return true;
+    }
     bool cbUndo(int, char**)
     {
         if(!CheckPhase(3, {7, 42, 0}) || !CheckBytes(true, true) || !CheckTracking(true)) return false;
@@ -423,6 +543,8 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* init)
            && _plugin_registercommand(gPluginHandle, "patchapply", cbApply, true)
            && _plugin_registercommand(gPluginHandle, "patchwritefailure", cbWriteFailure, true)
            && _plugin_registercommand(gPluginHandle, "patchfailurefinish", cbFailureFinish, true)
+           && _plugin_registercommand(gPluginHandle, "patchfileexports", cbFileExports, true)
+           && _plugin_registercommand(gPluginHandle, "patchexport", cbExport, true)
            && _plugin_registercommand(gPluginHandle, "patchundo", cbUndo, true)
            && _plugin_registercommand(gPluginHandle, "patchhit", cbHit, true)
            && _plugin_registercommand(gPluginHandle, "patchfinish", cbFinish, true)
