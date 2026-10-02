@@ -183,14 +183,20 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_sources(test_issue3803_target PRIVATE "issue3803/register_context64.asm")
     target_sources(test_exceptions_unwind_target PRIVATE "exceptions_unwind/fault64.asm")
     target_sources(test_scriptcmd_call_threads_target PRIVATE "scriptcmd_call_threads/thread64.asm")
+    target_sources(test_trace_cmd_condition_target PRIVATE "trace_cmd_condition/trace64.asm")
 else()
     target_sources(test_issue3803_target PRIVATE "issue3803/register_context32.asm")
     target_sources(test_exceptions_unwind_target PRIVATE "exceptions_unwind/fault32.asm")
     target_sources(test_scriptcmd_call_threads_target PRIVATE "scriptcmd_call_threads/thread32.asm")
+    target_sources(test_trace_cmd_condition_target PRIVATE "trace_cmd_condition/trace32.asm")
     target_link_options(test_scriptcmd_call_threads_target PRIVATE "LINKER:/EXPORT:ThreadReferenceWorker=_ThreadReferenceWorker@4")
 endif()
 target_link_options(test_issue3803_target PRIVATE "LINKER:/EXPORT:RegisterProbe" "LINKER:/EXPORT:RegisterStop")
 target_link_options(test_scriptcmd_call_threads_target PRIVATE "LINKER:/EXPORT:ThreadProbe0" "LINKER:/EXPORT:ThreadProbe1" "LINKER:/EXPORT:ThreadStop0" "LINKER:/EXPORT:ThreadStop1")
+target_link_options(test_trace_cmd_condition_target PRIVATE
+    "LINKER:/EXPORT:TraceRun" "LINKER:/EXPORT:TraceBody" "LINKER:/EXPORT:TraceLoop" "LINKER:/EXPORT:TraceCall"
+    "LINKER:/EXPORT:TraceAfterCall" "LINKER:/EXPORT:TraceAfterLoop" "LINKER:/EXPORT:TraceDone" "LINKER:/EXPORT:TraceLeaf" "LINKER:/EXPORT:TraceOdd")
+
 target_link_options(test_exceptions_unwind_target PRIVATE
     "LINKER:/EXPORT:ExceptionRun" "LINKER:/EXPORT:ExceptionProbe" "LINKER:/EXPORT:ExceptionFault"
     "LINKER:/EXPORT:ExceptionAfterFault" "LINKER:/EXPORT:ExceptionAfterHandled")

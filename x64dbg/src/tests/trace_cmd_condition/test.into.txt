@@ -1,0 +1,28 @@
+settingset Engine, HideDebugger, 0
+settingset Events, TlsCallbacks, 0
+settingset Events, SystemBreakpoint, 1
+settingset Events, EntryBreakpoint, 1
+init tests/trace_cmd_condition.exe
+mov startup_stops, 0
+await_entry:
+cmp cip, trace_cmd_condition:entry
+je entry_ready
+inc startup_stops
+testassert startup_stops <= .64, "trace fixture entry stop limit"
+run
+jmp await_entry
+entry_ready:
+testassert cip == trace_cmd_condition:entry, "trace fixture reached its actual entry"
+mov dword:[trace_cmd_condition:gTraceMode], 1
+testassert dword:[trace_cmd_condition:gTraceMode] == 1, "trace mode write readback"
+bp trace_cmd_condition:TraceBody
+run
+testassert cip == trace_cmd_condition:TraceBody, "trace fixture reached its actual body"
+bpd trace_cmd_condition:TraceBody
+traceprepare 0
+TraceIntoConditional "cip==trace_cmd_condition:TraceDone", .128
+traceinspect
+run
+traceexit
+testfinalize
+ret
