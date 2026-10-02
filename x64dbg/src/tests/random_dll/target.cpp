@@ -182,7 +182,7 @@ public:
                 return false;
             if(!DeleteFileW(unique))
                 return false;
-            if(wcslen(unique) + 8 >= MAX_PATH || swprintf_s(gModuleDirectory, MAX_PATH, L"%s-\x6a21\x5757-\x03b1", unique) < 0)
+            if(wcslen(unique) + 17 >= MAX_PATH || swprintf_s(gModuleDirectory, MAX_PATH, L"%s-%lu-\x6a21\x5757-\x03b1", unique, GetCurrentProcessId()) < 0)
                 return false;
             if(!CreateDirectoryW(gModuleDirectory, nullptr))
                 return false;
@@ -298,8 +298,10 @@ int wmain()
         return RunOriginalRandomDll();
     if(gModuleMode != 1)
         return 104;
+    wchar_t ownedMode[2] = {};
+    const bool ownedDirectory = normal && GetEnvironmentVariableW(L"WININSPECT_TEST_MODULE_OWNED", ownedMode, 2) == 1 && ownedMode[0] == L'1';
     ModuleDirectory directory;
-    if(!directory.Initialize(normal))
+    if(!directory.Initialize(normal && !ownedDirectory))
         return 105;
     ModuleReady();
     if(!RunModule(0) || !RunModule(1))

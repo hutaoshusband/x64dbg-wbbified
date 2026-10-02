@@ -1,5 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import re
 import shutil
 
 from wi_driver import McpError, file_identity, write_json
@@ -40,7 +42,7 @@ def module_image_facts(path, machine):
     return identity, facts
 
 
-def check_module_output(receipt, binary, library, directory, facts):
+def check_module_output(receipt, binary, library, directory, facts, owned=False):
     assert receipt["exitCode"] == 43 and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"], "Normal module target failed"
     lines = receipt["stdout"].splitlines()
     summaries = [line for line in lines if "=" in line]
@@ -51,7 +53,7 @@ def check_module_output(receipt, binary, library, directory, facts):
     assert len(messages) == 4 and messages[0].startswith("Random DLL loaded! Instance: 0x") and messages[2].startswith("Random DLL loaded! Instance: 0x")
     assert messages[1] == messages[3] == "Random DLL unloaded!", "DLL did not execute both detach paths"
     process_id = str(receipt["processIdentity"]["pid"])
-    expected = {"phase": "3", "loads": "2", "unloads": "2", "referenceReleased": "1", "referenceAlive": "1", "cleanup": "2",
+    expected = {"phase": "3", "loads": "2", "unloads": "2", "referenceReleased": "1", "referenceAlive": "1", "cleanup": "1" if owned else "2",
                 "result": "43", "processId": process_id, "source": str(library), "directory": str(directory)}
     for index in range(2):
         prefix = f"module{index}."
@@ -79,13 +81,32 @@ def run_module_oracles(environment, results, fixture_identity, run_owned):
         shutil.copyfile(library, path)
         assert path.read_bytes() == library.read_bytes(), "Prepared module copy differs from its source"
     before = [file_identity(path) for path in copies]
-    child = {**os.environ, "WININSPECT_TEST_NORMAL": "1", "WININSPECT_TEST_MODULE_DIRECTORY": str(directory)}
+    child = {**os.environ, "WININSPECT_TEST_NORMAL": "1", "WININSPECT_TEST_MODULE_OWNED": "0", "WININSPECT_TEST_MODULE_DIRECTORY": str(directory)}
     receipt = run_owned([str(binary)], child, 15)
     write_json(environment.root / "module-normal.json", receipt)
     observed, expected = check_module_output(receipt, binary, library, directory, facts)
     assert file_identity(binary) == binary_identity and file_identity(library) == library_identity, "Module fixture artifacts changed"
     assert [file_identity(path) for path in copies] == before, "Loaded module copy changed"
+    temporary = environment.root / "module-temp"
+    temporary.mkdir()
+    owned_environment = {**child, "WININSPECT_TEST_MODULE_OWNED": "1", "TEMP": str(temporary), "TMP": str(temporary)}
+    owned = []
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        receipts = list(executor.map(lambda index: run_owned([str(binary)], owned_environment, 30), range(16)))
+    for index, owned_receipt in enumerate(receipts):
+        write_json(environment.root / f"module-owned-{index}.json", owned_receipt)
+        paths = re.findall(r"^directory=(.+)$", owned_receipt["stdout"], re.MULTILINE)
+        assert len(paths) == 1, "Owned module directory observation is missing or repeated"
+        actual_directory = Path(paths[0])
+        pid = owned_receipt["processIdentity"]["pid"]
+        assert actual_directory.parent == temporary and re.fullmatch(rf"xmd[0-9a-fA-F]{{4}}\.tmp-{pid}-\u6a21\u5757-\u03b1", actual_directory.name), "Module directory does not belong to its actual process and private temporary root"
+        owned_observed, owned_expected = check_module_output(owned_receipt, binary, library, actual_directory, facts, owned=True)
+        assert not actual_directory.exists(), "Target did not remove its actual owned directory"
+        owned.append({"receipt": owned_receipt, "observed": owned_observed, "expected": owned_expected, "directory": str(actual_directory)})
+    assert len({entry["directory"] for entry in owned}) == len(owned), "Concurrent module targets shared an owned directory"
+    assert not any(temporary.iterdir()), "Owned module targets left temporary files"
+    assert file_identity(binary) == binary_identity and file_identity(library) == library_identity and [file_identity(path) for path in copies] == before, "Concurrent module references changed borrowed artifacts"
     results.append({"name": "test_native_module_oracles", "status": "verified", "oracle": {
         "binary": binary_identity, "library": library_identity, "copies": before, "sourcePeFacts": facts, "receipt": receipt,
-        "observed": observed, "expected": expected, "debuggerUsed": False}})
-    print(f"[VERIFIED] Normal native {environment.architecture} DLL load, reference, function and detach outcomes", flush=True)
+        "observed": observed, "expected": expected, "ownedReferences": owned, "debuggerUsed": False}})
+    print(f"[VERIFIED] Normal native {environment.architecture} DLL load/reference/detach and sixteen concurrent owned directory outcomes", flush=True)
