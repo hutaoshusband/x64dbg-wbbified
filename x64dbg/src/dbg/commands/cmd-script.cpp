@@ -47,7 +47,7 @@ bool cbScriptCmd(int argc, char* argv[])
 bool cbScriptRun(int argc, char* argv[])
 {
     duint destline = 0;
-    if(argc > 2 && !valfromstring(argv[1], &destline, false))
+    if(argc > 1 && !valfromstring(argv[1], &destline, false))
         return false;
     return ScriptRunAwait((int)destline, false);
 }

@@ -1,0 +1,5 @@
+varnew $workflow_counter, 0
+inc $workflow_counter
+inc $workflow_counter
+inc $workflow_counter
+ret
