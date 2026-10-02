@@ -21,6 +21,38 @@ namespace
             DbgScriptRun(3);
             result = DbgScriptCmdExec("nop");
         }
+        else if(strcmp(command, "runapi 0") == 0)
+        {
+            DbgScriptRun(0);
+            result = DbgScriptCmdExec("nop");
+        }
+        else if(strcmp(command, "stepapi") == 0)
+        {
+            DbgScriptStep();
+            result = DbgScriptCmdExec("nop");
+        }
+        else if(strcmp(command, "setipapi .4") == 0)
+        {
+            DbgScriptSetIp(4);
+            result = DbgScriptCmdExec("nop");
+        }
+        else if(strcmp(command, "bptoggleapi .3") == 0)
+            result = DbgScriptBpToggle(3);
+        else if(strcmp(command, "bpgetapi .3") == 0)
+            result = DbgScriptBpGet(3);
+        else if(strcmp(command, "branchapi .5") == 0)
+        {
+            SCRIPTBRANCH branch{};
+            result = DbgScriptGetBranchInfo(5, &branch);
+            char metadata[512]{};
+            sprintf_s(metadata, "SCRIPT_BRANCH result=%u type=%u destination=%d label=%s\n", result ? 1 : 0, unsigned(branch.type), branch.dest, branch.branchlabel);
+            GuiAddLogMessage(metadata);
+        }
+        else if(strcmp(command, "unloadapi") == 0)
+        {
+            DbgScriptUnload();
+            result = DbgScriptGetLineType(1) == lineempty;
+        }
         else
             result = DbgScriptCmdExec(command);
         char output[512]{};

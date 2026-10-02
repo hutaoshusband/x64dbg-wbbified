@@ -1,0 +1,6 @@
+varnew $workflow_counter, 0
+loop:
+inc $workflow_counter
+cmp $workflow_counter, .3
+jne loop
+ret

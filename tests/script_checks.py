@@ -10,6 +10,7 @@ from wi_driver import CREATE_SUSPENDED, McpError, OwnedJob, ROOT, file_identity,
 
 
 CONTROL_SCRIPT = "varnew $workflow_counter, 0\ninc $workflow_counter\ninc $workflow_counter\ninc $workflow_counter\nret\n"
+BRANCH_SCRIPT = "varnew $workflow_counter, 0\nloop:\ninc $workflow_counter\ncmp $workflow_counter, .3\njne loop\nret\n"
 
 
 def run_script_session(command, operations, child, timeout, required):
@@ -101,7 +102,7 @@ def run_script_session(command, operations, child, timeout, required):
             "error": failure, "outputTruncated": capture["truncated"], "languageId": language, "requestedCommands": operations}
 
 
-def check_script_session(receipt, operations, expected):
+def check_script_session(receipt, operations, expected, branches=()):
     assert receipt["exitCode"] == 0 and receipt["terminalObserved"] and receipt["jobClosed"] and not receipt["timedOut"] and not receipt["error"] and not receipt["outputTruncated"], "Native script session did not terminate with complete observations"
     output = receipt["stdout"]
     providers = re.findall(r"^SCRIPT_PROVIDER id=(\d+) thread=(\d+)$", output, re.MULTILINE)
@@ -110,19 +111,26 @@ def check_script_session(receipt, operations, expected):
     observed = re.findall(r"^SCRIPT_OBSERVE command=(.+) result=([01]) counter=(\d+) thread=(\d+)$", output, re.MULTILINE)
     assert observed == [(operation, str(result), str(counter), str(receipt["startupThread"])) for operation, (result, counter) in zip(operations, expected)], "Native script effects, actual stop/resume or invalid-input nonmutation differs"
     assert len(operations) == len(expected) == len(observed), "Script observations omit or repeat a command"
+    metadata = re.findall(r"^SCRIPT_BRANCH result=([01]) type=(\d+) destination=(\d+) label=(\S*)$", output, re.MULTILINE)
+    assert metadata == [(str(result), str(kind), str(destination), label) for result, kind, destination, label in branches], "Native script branch metadata differs from its source label, type or executable destination"
     assert receipt["loadedModules"] and not any("mcp-server" in item["path"].lower() or "agent smithers" in item["path"].lower() for item in receipt["loadedModules"]), "Script reference loaded an external MCP dependency"
     return [{"command": operation, "providerResult": bool(result), "actualCounter": counter} for operation, (result, counter) in zip(operations, expected)]
 
 
-def script_negative_controls(receipt, operations, expected):
+def script_negative_controls(receipt, operations, expected, branches=()):
     observed = []
-    for name, changed in (("wrong_counter", {"stdout": receipt["stdout"].replace("counter=0", "counter=99", 1)}),
-                          ("missing_provider", {"stdout": receipt["stdout"].replace("SCRIPT_PROVIDER ", "IGNORED_PROVIDER ", 1)}),
-                          ("missing_command", {"stdout": receipt["stdout"].replace("SCRIPT_OBSERVE ", "IGNORED_COMMAND ", 1)}),
-                          ("wrong_owner_thread", {"startupThread": receipt["startupThread"] + 1}),
-                          ("missing_terminal", {"terminalObserved": False}), ("truncated_capture", {"outputTruncated": True})):
+    candidates = [("wrong_counter", {"stdout": receipt["stdout"].replace("counter=0", "counter=99", 1)}),
+                  ("missing_provider", {"stdout": receipt["stdout"].replace("SCRIPT_PROVIDER ", "IGNORED_PROVIDER ", 1)}),
+                  ("missing_command", {"stdout": receipt["stdout"].replace("SCRIPT_OBSERVE ", "IGNORED_COMMAND ", 1)}),
+                  ("wrong_owner_thread", {"startupThread": receipt["startupThread"] + 1}),
+                  ("missing_terminal", {"terminalObserved": False}), ("truncated_capture", {"outputTruncated": True})]
+    if branches:
+        candidates.extend((("wrong_branch_type", {"stdout": receipt["stdout"].replace("type=2 destination=3", "type=1 destination=3", 1)}),
+                           ("wrong_branch_destination", {"stdout": receipt["stdout"].replace("destination=3 label=loop", "destination=2 label=loop", 1)}),
+                           ("wrong_branch_label", {"stdout": receipt["stdout"].replace("label=loop", "label=wrong", 1)})))
+    for name, changed in candidates:
         try:
-            check_script_session({**receipt, **changed}, operations, expected)
+            check_script_session({**receipt, **changed}, operations, expected, branches)
         except (AssertionError, ValueError, KeyError) as error:
             observed.append({"name": name, "status": "rejected", "error": str(error), "scriptExecuted": False})
         else:
@@ -138,7 +146,8 @@ def run_script_oracles(environment, results, selected_engine, timeout, fixture_i
     runtime = binary.parent.parent
     plugin = runtime / "tests/script_run_exit" / ("script_run_exit.dp64" if machine == 0x8664 else "script_run_exit.dp32")
     source = ROOT / "x64dbg/src/tests/script_run_exit/control.txt"
-    assert source.read_text(encoding="utf-8") == CONTROL_SCRIPT and plugin.is_file(), "Native script control fixture is missing or differs"
+    branch_source = source.with_name("branch.txt")
+    assert source.read_text(encoding="utf-8") == CONTROL_SCRIPT and branch_source.read_text(encoding="utf-8") == BRANCH_SCRIPT and plugin.is_file(), "Native script control fixture is missing or differs"
     child = dict(os.environ)
     child.pop("WININSPECT_TEST_NORMAL", None)
     normal = run_owned([str(binary)], {**child, "WININSPECT_TEST_NORMAL": "1"}, timeout)
@@ -148,7 +157,12 @@ def run_script_oracles(environment, results, selected_engine, timeout, fixture_i
              ("legacy_extra_argument", ["scriptrun .3, 0", "scriptrun"], [(0, 1), (1, 3)]),
              ("direct_bridge_destination", ["runapi .3", "scriptrun"], [(1, 1), (1, 3)]),
              ("complete_script", ["scriptrun"], [(1, 3)]),
-             ("invalid_destination", ["scriptrun unknown_limit_value", "scriptrun"], [(0, 0), (1, 3)])]
+             ("invalid_destination", ["scriptrun unknown_limit_value", "scriptrun"], [(0, 0), (1, 3)]),
+             ("step_and_set_ip", ["stepapi", "stepapi", "setipapi .4", "stepapi", "runapi 0", "unloadapi"],
+              [(1, 0), (1, 1), (1, 1), (1, 2), (1, 2), (1, 2)]),
+             ("script_breakpoint", ["bptoggleapi .3", "bpgetapi .3", "runapi 0", "bptoggleapi .3", "bpgetapi .3", "runapi 0", "unloadapi"],
+              [(1, 0), (1, 0), (1, 1), (1, 1), (0, 1), (1, 3), (1, 3)]),
+             ("script_branch", ["branchapi .5", "runapi 0", "unloadapi"], [(1, 0), (1, 3), (1, 3)])]
     observations = []
     for engine in engines:
         for name, commands, outcomes in cases:
@@ -158,14 +172,16 @@ def run_script_oracles(environment, results, selected_engine, timeout, fixture_i
             engine_id = 0 if engine == "TitanEngine" else 1
             (profile / "headless.ini").write_text(f"[Engine]\nDebugEngine={engine_id}\nNoConsoleWindow=1\n", encoding="utf-8")
             script = scope / "\u63a7\u5236.txt"
-            script.write_text(CONTROL_SCRIPT, encoding="utf-8", newline="\n")
+            selected_source = branch_source if name == "script_branch" else source
+            script.write_text(selected_source.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
             operations, expected = ["load " + str(script), *commands], [(1, 0), *outcomes]
+            branches = [(1, 2, 3, "loop")] if name == "script_branch" else []
             receipt = run_script_session([str(runtime / "headless.exe"), "-userdir", str(profile), "-plugin", str(plugin)], operations, child, timeout,
                                          [plugin, runtime / "wininspect.dll", runtime / "winbridge.dll"])
             write_json(scope / "receipt.json", receipt)
-            reference = check_script_session(receipt, operations, expected)
-            controls = script_negative_controls(receipt, operations, expected)
-            observations.append({"engine": engine, "name": name, "script": file_identity(script), "operations": operations,
+            reference = check_script_session(receipt, operations, expected, branches)
+            controls = script_negative_controls(receipt, operations, expected, branches)
+            observations.append({"engine": engine, "name": name, "script": file_identity(script), "sourceScript": file_identity(selected_source), "operations": operations, "expectedBranches": branches,
                                  "expected": expected, "receipt": receipt, "reference": reference, "negativeControls": controls})
         scope = environment.root / "script" / engine / "owned_timeout"
         profile = scope / "userdir"
@@ -188,8 +204,8 @@ def run_script_oracles(environment, results, selected_engine, timeout, fixture_i
             raise AssertionError("An actually timed-out script was admitted")
         observations.append({"engine": engine, "name": "owned_timeout", "script": file_identity(script), "operations": operations,
                              "receipt": receipt, "negativeControls": [timeout_control]})
-        print(f"[VERIFIED] Native {environment.architecture} {engine} optional script destination, Bridge control, exact resume and invalid-input nonmutation", flush=True)
+        print(f"[VERIFIED] Native {environment.architecture} {engine} script destinations, steps/IP, breakpoint, branch metadata/execution, unload and owned deadline", flush=True)
     assert file_identity(binary) == identity, "Script runtime reference changed the existing target"
     results.append({"name": "test_native_script_oracles", "status": "verified", "oracle": {
-        "binary": identity, "plugin": file_identity(plugin), "sourceScript": file_identity(source), "normal": normal, "observations": observations,
-        "openGates": ["target workflow and artifact", "script step/branch/breakpoint/IP", "abort/unload/reentrancy/ownership", "library workflow and JavaScript", "platform matrix"]}})
+        "binary": identity, "plugin": file_identity(plugin), "sourceScript": file_identity(source), "branchSourceScript": file_identity(branch_source), "normal": normal, "observations": observations,
+        "openGates": ["target workflow and artifact", "abort/reentrant/multi-session ownership", "unload while active or yielded", "library workflow and JavaScript", "platform matrix"]}})
