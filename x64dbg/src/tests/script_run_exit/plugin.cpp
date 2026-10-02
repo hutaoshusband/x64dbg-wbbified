@@ -7,6 +7,7 @@
 #include "_plugins.h"
 #include "bridgemain.h"
 #include "gui_control.h"
+#include "yield_control.h"
 
 namespace
 {
@@ -166,7 +167,8 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* init)
 {
     if(!_plugin_registercommand(init->pluginHandle, "scriptqueueblock", BlockWorker, false)
             || !_plugin_registercommand(init->pluginHandle, "scriptunloadprobe", UnloadWorker, false)
-            || !ScriptGuiControl::Register(init->pluginHandle))
+            || !ScriptGuiControl::Register(init->pluginHandle)
+            || !ScriptYieldControl::Register(init->pluginHandle))
         return false;
     init->pluginVersion = 1;
     init->sdkVersion = PLUG_SDKVERSION;

@@ -11,6 +11,7 @@ import time
 import uuid
 
 from wi_driver import CREATE_SUSPENDED, KERNEL, McpError, OwnedJob, ROOT, file_identity, loaded_modules, process_identity, resume_suspended_process, write_json
+from script_yield_checks import check_script_yield, observe_script_yield, read_script_observations, yield_negative_controls, yield_script, yield_target_model
 
 
 CONTROL_SCRIPT = "varnew $workflow_counter, 0\ninc $workflow_counter\ninc $workflow_counter\ninc $workflow_counter\nret\n"
@@ -206,7 +207,7 @@ def interruption_negative_controls(receipt, operations, kind):
 
 
 def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scenario="unload"):
-    assert scenario in ("unload", "reload"), "Unknown Qt script scenario"
+    assert scenario in ("unload", "reload", "yield"), "Unknown Qt script scenario"
     KERNEL.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
     KERNEL.CreateEventW.restype = wintypes.HANDLE
     KERNEL.SetEvent.argtypes = [wintypes.HANDLE]
@@ -223,8 +224,17 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scena
     queued.write_text(QUEUED_SCRIPT, encoding="utf-8", newline="\n")
     finite.write_text(CONTROL_SCRIPT, encoding="utf-8", newline="\n")
     child.update(WI_REENTRY_OUTPUT=str(output_path), WI_REENTRY_EVENT=event_name, WI_REENTRY_QUEUED=str(queued), WI_REENTRY_FINITE=str(finite))
+    yielded_events, yielded_capture, yielded_model, yielded_source = [], {}, None, None
+    if scenario == "yield":
+        target = runtime / "tests/patch_canary.exe"
+        yielded_model = yield_target_model(target)
+        yielded_source = scope / "yielded.txt"
+        yielded_source.write_text(yield_script(target), encoding="utf-8", newline="\n")
+        child["WI_YIELD_SOURCE"] = str(yielded_source)
+        for name in ("WI_YIELD_BEFORE", "WI_YIELD_AFTER"):
+            child[name] = "Local\\WininspectScriptYield-" + str(uuid.uuid4())
     command = [str(runtime / "wininspect.exe"), "-userdir", str(profile), "-plugin", str(plugin), "-c",
-               "scriptguireentryreload" if scenario == "reload" else "scriptguireentry"]
+               {"unload": "scriptguireentry", "reload": "scriptguireentryreload", "yield": "scriptyieldunload"}[scenario]]
     engine_path = runtime / ("TitanEngine.dll" if engine == "TitanEngine" else "GleeBug/TitanEngine.dll")
     required = [file_identity(runtime / name) for name in ("wininspect.exe", "wingui.dll", "wininspect.dll", "winbridge.dll", "Qt5Widgets.dll")]
     required.extend((file_identity(plugin), file_identity(engine_path)))
@@ -238,6 +248,13 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scena
             event = KERNEL.CreateEventW(None, True, False, event_name)
             if not event or ctypes.get_last_error() == 183:
                 raise McpError("GUI reference could not own a fresh capture gate")
+            if scenario == "yield":
+                for name in ("WI_YIELD_BEFORE", "WI_YIELD_AFTER"):
+                    gate = KERNEL.CreateEventW(None, True, False, child[name])
+                    if gate:
+                        yielded_events.append(gate)
+                    if not gate or ctypes.get_last_error() == 183:
+                        raise McpError("Yield reference could not own a fresh target observation gate")
             startup_info = subprocess.STARTUPINFO()
             startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startup_info.wShowWindow = 0
@@ -261,18 +278,16 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scena
             reader = threading.Thread(target=read_output)
             reader.start()
             while time.monotonic() < deadline and process.poll() is None:
-                if output_path.is_file():
-                    if output_path.stat().st_size > 65536:
-                        observation_truncated = True
-                        raise McpError("GUI script observations exceeded their bound")
-                    if "phase=ready " in output_path.read_text(encoding="utf-8"):
-                        break
+                if "phase=ready " in read_script_observations(output_path):
+                    break
                 time.sleep(0.02)
             else:
                 raise TimeoutError("Owned Qt GUI did not reach its capture gate")
             modules = loaded_modules(process)
             assert all(item in modules for item in required), "Qt GUI reference loaded different source-built artifacts"
             assert KERNEL.SetEvent(event), "GUI capture gate could not resume its owned probe"
+            if scenario == "yield":
+                observe_script_yield(output_path, process, yielded_events, yielded_model, deadline, yielded_capture)
             process.wait(timeout=max(0.01, deadline - time.monotonic()))
         except (TimeoutError, subprocess.TimeoutExpired) as error:
             timed_out = True
@@ -280,6 +295,8 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scena
         except (AssertionError, OSError, UnicodeError, McpError) as error:
             failure = str(error)
         finally:
+            for gate in yielded_events:
+                KERNEL.CloseHandle(gate)
             if event:
                 KERNEL.CloseHandle(event)
             if process is not None and process.poll() is None:
@@ -305,6 +322,8 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scena
             "outputTruncated": capture["truncated"], "observationTruncated": observation_truncated,
             "observed": observed, "loadedModules": modules, "requiredModules": required,
             "queuedScript": file_identity(queued), "finiteScript": file_identity(finite),
+            "yieldCapture": yielded_capture, "yieldTargetModel": yielded_model,
+            "yieldSource": file_identity(yielded_source) if yielded_source else None,
             "observationFile": file_identity(output_path) if output_path.is_file() else None}
 
 
@@ -376,16 +395,19 @@ def run_gui_script_oracles(environment, runtime, plugin, engines, timeout):
         if (runtime / name).is_dir():
             shutil.copytree(runtime / name, stage / name)
     (stage / "plugins").mkdir()
+    (stage / "tests").mkdir()
+    shutil.copy2(runtime / "tests/patch_canary.exe", stage / "tests/patch_canary.exe")
     references = []
     for engine in engines:
-        for scenario in ("unload", "reload"):
+        for scenario in ("unload", "reload", "yield"):
             scope = environment.root / "script-gui" / engine / scenario
             receipt = run_gui_script_session(stage, plugin, scope, os.environ, timeout, engine, scenario)
             write_json(scope / "receipt.json", receipt)
-            reference = check_gui_script_session(receipt)
-            controls = gui_script_negative_controls(receipt)
+            reference = check_script_yield(receipt) if scenario == "yield" else check_gui_script_session(receipt)
+            controls = yield_negative_controls(receipt) if scenario == "yield" else gui_script_negative_controls(receipt)
             references.append({"engine": engine, "name": "gui_reentrant_" + scenario, "receipt": receipt, "reference": reference, "negativeControls": controls})
-            print(f"[VERIFIED] Native {environment.architecture} {engine} actual Qt GUI nested {scenario}, canceled pending step, finite reuse and exit 0", flush=True)
+            outcome = "yielded target retained unchanged before/after unload, explicit target exit 7" if scenario == "yield" else "nested " + scenario + ", canceled pending step"
+            print(f"[VERIFIED] Native {environment.architecture} {engine} actual Qt GUI {outcome}, finite reuse and exit 0", flush=True)
     return references
 
 
