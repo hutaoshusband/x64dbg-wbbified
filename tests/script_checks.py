@@ -1,12 +1,16 @@
+import ctypes
+from ctypes import wintypes
 import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
+import uuid
 
-from wi_driver import CREATE_SUSPENDED, McpError, OwnedJob, ROOT, file_identity, loaded_modules, process_identity, resume_suspended_process, write_json
+from wi_driver import CREATE_SUSPENDED, KERNEL, McpError, OwnedJob, ROOT, file_identity, loaded_modules, process_identity, resume_suspended_process, write_json
 
 
 CONTROL_SCRIPT = "varnew $workflow_counter, 0\ninc $workflow_counter\ninc $workflow_counter\ninc $workflow_counter\nret\n"
@@ -192,6 +196,176 @@ def interruption_negative_controls(receipt, operations, kind):
     return rejected
 
 
+def run_gui_script_session(runtime, plugin, scope, child, timeout, engine):
+    KERNEL.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    KERNEL.CreateEventW.restype = wintypes.HANDLE
+    KERNEL.SetEvent.argtypes = [wintypes.HANDLE]
+    KERNEL.SetEvent.restype = wintypes.BOOL
+    profile = scope / "userdir"
+    profile.mkdir(parents=True)
+    (profile / "wininspect.ini").write_text(f"[Engine]\nDebugEngine={0 if engine == 'TitanEngine' else 1}\nNoConsoleWindow=1\nNoScriptTimeout=1\n[Misc]\nLoadLastSession=0\n", encoding="utf-8")
+    output_path = scope / "observed.txt"
+    event_name = "Local\\WininspectGuiReentry-" + str(uuid.uuid4())
+    child = dict(child)
+    for name in ("QTDIR", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QML_IMPORT_PATH", "QML2_IMPORT_PATH", "WININSPECT_TEST_NORMAL"):
+        child.pop(name, None)
+    queued, finite = scope / "\u6392\u961f.txt", scope / "\u590d\u7528.txt"
+    queued.write_text(QUEUED_SCRIPT, encoding="utf-8", newline="\n")
+    finite.write_text(CONTROL_SCRIPT, encoding="utf-8", newline="\n")
+    child.update(WI_REENTRY_OUTPUT=str(output_path), WI_REENTRY_EVENT=event_name, WI_REENTRY_QUEUED=str(queued), WI_REENTRY_FINITE=str(finite))
+    command = [str(runtime / "wininspect.exe"), "-userdir", str(profile), "-plugin", str(plugin), "-c", "scriptguireentry"]
+    engine_path = runtime / ("TitanEngine.dll" if engine == "TitanEngine" else "GleeBug/TitanEngine.dll")
+    required = [file_identity(runtime / name) for name in ("wininspect.exe", "wingui.dll", "wininspect.dll", "winbridge.dll", "Qt5Widgets.dll")]
+    required.extend((file_identity(plugin), file_identity(engine_path)))
+    process, reader, identity, startup, event = None, None, None, None, None
+    modules, output = [], []
+    capture = {"bytes": 0, "truncated": False, "readerError": None}
+    deadline = time.monotonic() + timeout
+    failure, timed_out, observation_truncated = None, False, False
+    with OwnedJob() as ownership:
+        try:
+            event = KERNEL.CreateEventW(None, True, False, event_name)
+            if not event or ctypes.get_last_error() == 183:
+                raise McpError("GUI reference could not own a fresh capture gate")
+            startup_info = subprocess.STARTUPINFO()
+            startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startup_info.wShowWindow = 0
+            process = subprocess.Popen(command, cwd=scope, env=child, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       startupinfo=startup_info, creationflags=subprocess.CREATE_NO_WINDOW | CREATE_SUSPENDED)
+            identity = process_identity(process)
+            ownership.assign(process)
+            startup = resume_suspended_process(process)
+
+            def read_output():
+                try:
+                    for data in iter(lambda: process.stdout.read(16384), b""):
+                        capture["bytes"] += len(data)
+                        if capture["bytes"] <= 2 * 1024 * 1024:
+                            output.append(data)
+                        else:
+                            capture["truncated"] = True
+                except (OSError, ValueError) as error:
+                    capture["readerError"] = str(error)
+
+            reader = threading.Thread(target=read_output)
+            reader.start()
+            while time.monotonic() < deadline and process.poll() is None:
+                if output_path.is_file():
+                    if output_path.stat().st_size > 65536:
+                        observation_truncated = True
+                        raise McpError("GUI script observations exceeded their bound")
+                    if "phase=ready " in output_path.read_text(encoding="utf-8"):
+                        break
+                time.sleep(0.02)
+            else:
+                raise TimeoutError("Owned Qt GUI did not reach its capture gate")
+            modules = loaded_modules(process)
+            assert all(item in modules for item in required), "Qt GUI reference loaded different source-built artifacts"
+            assert KERNEL.SetEvent(event), "GUI capture gate could not resume its owned probe"
+            process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except (TimeoutError, subprocess.TimeoutExpired) as error:
+            timed_out = True
+            failure = str(error)
+        except (AssertionError, OSError, UnicodeError, McpError) as error:
+            failure = str(error)
+        finally:
+            if event:
+                KERNEL.CloseHandle(event)
+            if process is not None and process.poll() is None:
+                ownership.close()
+                process.kill()
+                process.wait(timeout=5)
+            if reader is not None:
+                reader.join(timeout=5)
+                if reader.is_alive():
+                    failure = "GUI output reader did not terminate"
+            if process is not None and process.stdout is not None and (reader is None or not reader.is_alive()):
+                process.stdout.close()
+            if capture["readerError"]:
+                failure = capture["readerError"]
+    observed = ""
+    if output_path.is_file():
+        observation_truncated |= output_path.stat().st_size > 65536
+        with output_path.open("rb") as stream:
+            observed = stream.read(65536).decode("utf-8", errors="replace")
+    return {"command": command, "processIdentity": identity, "startupThread": startup,
+            "exitCode": process.returncode if process is not None else None, "terminalObserved": process is not None and process.poll() is not None,
+            "jobClosed": True, "timedOut": timed_out, "error": failure, "stdout": b"".join(output).decode("utf-8", errors="replace"),
+            "outputTruncated": capture["truncated"], "observationTruncated": observation_truncated,
+            "observed": observed, "loadedModules": modules, "requiredModules": required,
+            "queuedScript": file_identity(queued), "finiteScript": file_identity(finite),
+            "observationFile": file_identity(output_path) if output_path.is_file() else None}
+
+
+def check_gui_script_session(receipt):
+    assert receipt["exitCode"] == 0 and receipt["terminalObserved"] and receipt["jobClosed"] and not receipt["timedOut"] and not receipt["error"] and not receipt["outputTruncated"] and not receipt["observationTruncated"], "Qt script reference did not terminate with complete observations"
+    assert receipt["requiredModules"] and all(item in receipt["loadedModules"] for item in receipt["requiredModules"]), "Qt script source/loaded-module identities differ"
+    assert not any("mcp-server" in item["path"].lower() or "agent smithers" in item["path"].lower() for item in receipt["loadedModules"]), "Qt script reference loaded an external MCP dependency"
+    rows = re.findall(r"^GUI_REENTRY phase=(\w+) pid=(\d+) thread=(\d+) owner=(\d+) worker=(\d+) nestedThread=(\d+) nestedCount=(\d+) outer=([01]) counter=(\d+) line=(\d+) completed=([01])$", receipt["observed"], re.MULTILINE)
+    phases = ["ready", "queued", "outer_enter", "nested_enter", "nested_leave", "outer_leave", "wrapper_canceled", "reset", "reloaded", "reused", "finished"]
+    assert [row[0] for row in rows] == phases and len(receipt["observed"].splitlines()) == len(phases), "Qt script omitted, repeated or changed an actual event"
+    pid, owner = receipt["processIdentity"]["pid"], receipt["startupThread"]
+    assert all(int(row[1]) == pid and int(row[2]) == owner and row[2] == row[3] for row in rows), "Qt script event belongs to a different PID or GUI owner"
+    worker = int(rows[1][4])
+    assert worker > 0 and worker != owner and rows[0][4] == "0" and all(int(row[4]) == worker for row in rows[1:]), "Qt script worker was missing, replaced or confused with the GUI owner"
+    expected = [(0, 0, 0, 0, 4, 0), (0, 0, 0, 0, 0, 0), (0, 0, 1, 0, 0, 0),
+                (owner, 1, 1, 0, 0, 0), (owner, 1, 1, 0, 4, 1), (owner, 1, 1, 0, 4, 1),
+                (owner, 1, 0, 0, 4, 1), (owner, 1, 0, 0, 4, 1), (owner, 1, 0, 0, 0, 1),
+                (owner, 1, 0, 3, 0, 1), (owner, 1, 0, 3, 4, 1)]
+    assert [tuple(int(value) for value in row[5:]) for row in rows] == expected, "Qt nested unload, pending nonmutation, callback completion or finite reuse differs"
+    return [{"phase": row[0], "counter": int(row[8]), "lineType": int(row[9]), "guiThread": int(row[2]), "workerThread": int(row[4]), "nestedCount": int(row[6])} for row in rows]
+
+
+def gui_script_negative_controls(receipt):
+    output = receipt["observed"]
+    candidates = [("missing_terminal", {"terminalObserved": False}), ("truncated_stdout", {"outputTruncated": True}),
+                  ("truncated_observations", {"observationTruncated": True}), ("wrong_owner", {"startupThread": receipt["startupThread"] + 1}),
+                  ("wrong_process", {"processIdentity": {**receipt["processIdentity"], "pid": receipt["processIdentity"]["pid"] + 1}}),
+                  ("missing_nested_call", {"observed": output.replace("phase=nested_enter", "phase=omitted", 1)}),
+                  ("repeated_event", {"observed": output + output.splitlines()[0] + "\n"}),
+                  ("wrong_worker", {"observed": re.sub(r"worker=[1-9]\d*", "worker=" + str(receipt["startupThread"]), output)}),
+                  ("wrong_nested_owner", {"observed": re.sub(r"nestedThread=[1-9]\d*", "nestedThread=0", output)}),
+                  ("missing_outer_wait", {"observed": output.replace("outer=1", "outer=0", 1)}),
+                  ("pending_code_executed", {"observed": output.replace("counter=0 line=0", "counter=99 line=0", 1)}),
+                  ("missing_worker_completion", {"observed": output.replace("completed=1", "completed=0", 1)}),
+                  ("invented_wrapper_success", {"observed": output.replace("phase=wrapper_canceled", "phase=wrapper_success", 1)}),
+                  ("wrong_finite_reuse", {"observed": output.replace("counter=3", "counter=4", 1)}),
+                  ("missing_final_clear", {"observed": re.sub(r"(phase=finished .+ line=)4", r"\g<1>0", output)}),
+                  ("missing_gui_artifact", {"loadedModules": [item for item in receipt["loadedModules"] if Path(item["path"]).name.lower() != "wingui.dll"]})]
+    rejected = []
+    for name, changed in candidates:
+        assert any(receipt[key] != value for key, value in changed.items()), f"Qt negative control did not change evidence: {name}"
+        try:
+            check_gui_script_session({**receipt, **changed})
+        except (AssertionError, ValueError, KeyError) as error:
+            rejected.append({"name": name, "status": "rejected", "error": str(error), "scriptExecuted": False})
+        else:
+            raise AssertionError(f"Qt script negative control was admitted: {name}")
+    return rejected
+
+
+def run_gui_script_oracles(environment, runtime, plugin, engines, timeout):
+    stage = environment.root / "script-gui-runtime"
+    stage.mkdir()
+    for source in runtime.iterdir():
+        if source.is_file() and source.suffix.lower() in (".exe", ".dll"):
+            shutil.copy2(source, stage / source.name)
+    for name in ("platforms", "iconengines", "imageformats", "styles", "GleeBug"):
+        if (runtime / name).is_dir():
+            shutil.copytree(runtime / name, stage / name)
+    (stage / "plugins").mkdir()
+    references = []
+    for engine in engines:
+        scope = environment.root / "script-gui" / engine
+        receipt = run_gui_script_session(stage, plugin, scope, os.environ, timeout, engine)
+        write_json(scope / "receipt.json", receipt)
+        reference = check_gui_script_session(receipt)
+        controls = gui_script_negative_controls(receipt)
+        references.append({"engine": engine, "name": "gui_reentrant_unload", "receipt": receipt, "reference": reference, "negativeControls": controls})
+        print(f"[VERIFIED] Native {environment.architecture} {engine} actual Qt GUI nested unload, canceled pending run/step, finite reuse and exit 0", flush=True)
+    return references
+
+
 def script_negative_controls(receipt, operations, expected, branches=()):
     observed = []
     candidates = [("wrong_counter", {"stdout": receipt["stdout"].replace("counter=0", "counter=99", 1)}),
@@ -307,8 +481,9 @@ def run_script_oracles(environment, results, selected_engine, timeout, fixture_i
         observations.append({"engine": engine, "name": "owned_timeout", "script": file_identity(script), "operations": operations,
                              "receipt": receipt, "negativeControls": [timeout_control]})
         print(f"[VERIFIED] Native {environment.architecture} {engine} script controls, active abort/unload, canceled queued run/step, deferred worker unload, finite reuse and owned deadline", flush=True)
+    gui_observations = run_gui_script_oracles(environment, runtime, plugin, engines, timeout)
     assert file_identity(binary) == identity, "Script runtime reference changed the existing target"
     results.append({"name": "test_native_script_oracles", "status": "verified", "oracle": {
         "binary": identity, "plugin": file_identity(plugin), "sourceScript": file_identity(source), "branchSourceScript": file_identity(branch_source),
-        "interruptionSources": {name: file_identity(path) for name, path in interruption_sources.items()}, "normal": normal, "observations": observations,
-        "openGates": ["target workflow and artifact", "reentrant GUI and multi-session ownership", "unload while debug-event yielded", "library workflow and JavaScript", "platform matrix"]}})
+        "interruptionSources": {name: file_identity(path) for name, path in interruption_sources.items()}, "normal": normal, "observations": observations, "guiObservations": gui_observations,
+        "openGates": ["target workflow and artifact", "remaining GUI reentrancy and multi-session ownership", "unload while debug-event yielded", "library workflow and JavaScript", "platform matrix"]}})
