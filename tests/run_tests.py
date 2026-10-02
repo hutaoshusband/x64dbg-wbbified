@@ -392,6 +392,7 @@ def run_native_suite(arguments, run_root):
     environment.pop("WININSPECT_TEST_NORMAL", None)
     environment.pop("WININSPECT_TEST_REGISTER_SSE", None)
     environment.pop("WININSPECT_TEST_TRACE_MODE", None)
+    environment.pop("WININSPECT_TEST_PATCH_MODE", None)
     for architecture in architectures:
         for engine in engines:
             command = [sys.executable, str(ROOT / "x64dbg" / "src" / "tests" / "run.py"),
@@ -427,7 +428,7 @@ def main():
     if arguments.phase == "fixtures":
         names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles", "test_native_memory_oracles",
                  "test_native_database_oracles", "test_native_stale_breakpoint_oracles", "test_native_execution_oracles", "test_native_register_oracles",
-                 "test_native_module_oracles", "test_native_exception_oracles", "test_native_thread_oracles", "test_native_trace_oracles"]
+                 "test_native_module_oracles", "test_native_exception_oracles", "test_native_thread_oracles", "test_native_trace_oracles", "test_native_patch_oracles"]
     if arguments.phase == "runner":
         names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
@@ -531,6 +532,9 @@ def main():
                 if "test_native_trace_oracles" in selected_names:
                     from trace_checks import run_trace_oracles
                     run_trace_oracles(environment, architecture_results, arguments.engine, arguments.timeout, native_fixture_identity, run_owned_native_command)
+                if "test_native_patch_oracles" in selected_names:
+                    from patch_checks import run_patch_oracles
+                    run_patch_oracles(environment, architecture_results, arguments.engine, arguments.timeout, native_fixture_identity, run_owned_native_command)
                 if "test_native_database_oracles" in selected_names:
                     from database_checks import run_database_oracles
                     run_database_oracles(environment, architecture_results, arguments.engine, arguments.timeout,

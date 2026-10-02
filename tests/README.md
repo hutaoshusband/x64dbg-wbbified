@@ -24,6 +24,7 @@ python tests/run_tests.py --phase build --arch all
 python tests/run_tests.py --phase fixtures --arch all
 python tests/run_tests.py --phase fixtures --arch all --case test_fixture_oracles
 python tests/run_tests.py --phase fixtures --arch all --case test_native_argument_oracles
+python tests/run_tests.py --phase fixtures --arch all --engine all --case test_native_patch_oracles
 python tests/run_tests.py --phase native --arch all --case commandparser --case script_run_exit
 python tests/run_tests.py --phase contracts
 python tests/run_tests.py --phase surface
@@ -35,6 +36,8 @@ python tests/run_tests.py --phase mcp-contracts --arch all --msvc-toolset 14.44.
 ```
 
 Install the pinned test-only dependencies in `tests/requirements.txt` in the Python environment used for the suite. `mcp-contracts` uses jsonschema; the database fixture uses pefile to resolve the actual export RVA independently of debugger output. The native contract fixture is declared in the real cmkr input and kept out of default executable builds. New CMake directories fetch HTTP, JSON, SQLite and JavaScript sources by fixed URL and SHA-256; dependency metadata and licenses are retained in the build receipt. `X64DBG_BUILD_MCP=OFF` disables these new development targets for existing debugger-only builds.
+
+The native patch reference executes the same source-checked assembly function normally and under the source-built debugger. A live software breakpoint remains armed while tracked assembly changes the first opcode, actual calls produce 7/42/7, and undo restores both logical original bytes and tracking. Independent OS reads distinguish the INT3 trap from logical bytes. Invalid syntax and overlong assembly text change neither; overlong native text currently supplies no error message. This bounded runtime reference does not close hardware/memory overlap, exact installed-span limits, transactional rollback/conflicts or disk persistence. All checks share this launcher; `patch_checks.py` is an imported checker.
 
 `--cmake` selects an existing CMake executable for this phase; other phases reject it. Without the option, the suite resolves CMake in the configured compiler environment. Every build records the selected CMake version and executable hash, the exact MSVC executable hash and the configure/build commands, including failed build attempts. Explicit forward-slash MSVC paths prevent another installed compiler from being selected. Automatic cmkr generation is disabled during verification so the recorded generated source remains fixed; regenerate CMakeLists.txt from cmake.toml before running the suite after a build-definition change. CMake handles manifest embedding while each executable retains an explicit `asInvoker` UAC setting. Actual build and runtime checks establish support for a selected toolchain; an executable selection does not establish a minimum compiler or older OS claim.
 
