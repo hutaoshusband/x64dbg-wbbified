@@ -1,0 +1,5 @@
+varnew $workflow_counter, 0
+inc $workflow_counter
+scriptunloadprobe
+inc $workflow_counter
+ret

@@ -1,0 +1,4 @@
+varnew $workflow_counter, 0
+loop:
+inc $workflow_counter
+jmp loop

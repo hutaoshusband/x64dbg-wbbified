@@ -11,6 +11,9 @@ from wi_driver import CREATE_SUSPENDED, McpError, OwnedJob, ROOT, file_identity,
 
 CONTROL_SCRIPT = "varnew $workflow_counter, 0\ninc $workflow_counter\ninc $workflow_counter\ninc $workflow_counter\nret\n"
 BRANCH_SCRIPT = "varnew $workflow_counter, 0\nloop:\ninc $workflow_counter\ncmp $workflow_counter, .3\njne loop\nret\n"
+LOOP_SCRIPT = "varnew $workflow_counter, 0\nloop:\ninc $workflow_counter\njmp loop\n"
+QUEUED_SCRIPT = "varnew $workflow_counter, .99\nloop:\ninc $workflow_counter\njmp loop\n"
+WORKER_SCRIPT = "varnew $workflow_counter, 0\ninc $workflow_counter\nscriptunloadprobe\ninc $workflow_counter\nret\n"
 
 
 def run_script_session(command, operations, child, timeout, required):
@@ -102,19 +105,91 @@ def run_script_session(command, operations, child, timeout, required):
             "error": failure, "outputTruncated": capture["truncated"], "languageId": language, "requestedCommands": operations}
 
 
-def check_script_session(receipt, operations, expected, branches=()):
+def script_observations(receipt, operations):
     assert receipt["exitCode"] == 0 and receipt["terminalObserved"] and receipt["jobClosed"] and not receipt["timedOut"] and not receipt["error"] and not receipt["outputTruncated"], "Native script session did not terminate with complete observations"
     output = receipt["stdout"]
     providers = re.findall(r"^SCRIPT_PROVIDER id=(\d+) thread=(\d+)$", output, re.MULTILINE)
     assert providers == [(str(receipt["languageId"]), str(receipt["startupThread"]))], "Script control did not execute in its actual GUI owner"
     assert receipt["requestedCommands"] == operations, "Script request sequence differs from its independent plan"
     observed = re.findall(r"^SCRIPT_OBSERVE command=(.+) result=([01]) counter=(\d+) thread=(\d+)$", output, re.MULTILINE)
+    assert len(observed) == len(operations) and [item[0] for item in observed] == operations and all(int(item[3]) == receipt["startupThread"] for item in observed), "Script observations omit, repeat or misattribute a command"
+    assert receipt["loadedModules"] and not any("mcp-server" in item["path"].lower() or "agent smithers" in item["path"].lower() for item in receipt["loadedModules"]), "Script reference loaded an external MCP dependency"
+    return observed
+
+
+def check_script_session(receipt, operations, expected, branches=()):
+    observed = script_observations(receipt, operations)
     assert observed == [(operation, str(result), str(counter), str(receipt["startupThread"])) for operation, (result, counter) in zip(operations, expected)], "Native script effects, actual stop/resume or invalid-input nonmutation differs"
     assert len(operations) == len(expected) == len(observed), "Script observations omit or repeat a command"
-    metadata = re.findall(r"^SCRIPT_BRANCH result=([01]) type=(\d+) destination=(\d+) label=(\S*)$", output, re.MULTILINE)
+    metadata = re.findall(r"^SCRIPT_BRANCH result=([01]) type=(\d+) destination=(\d+) label=(\S*)$", receipt["stdout"], re.MULTILINE)
     assert metadata == [(str(result), str(kind), str(destination), label) for result, kind, destination, label in branches], "Native script branch metadata differs from its source label, type or executable destination"
-    assert receipt["loadedModules"] and not any("mcp-server" in item["path"].lower() or "agent smithers" in item["path"].lower() for item in receipt["loadedModules"]), "Script reference loaded an external MCP dependency"
     return [{"command": operation, "providerResult": bool(result), "actualCounter": counter} for operation, (result, counter) in zip(operations, expected)]
+
+
+def check_script_interruption(receipt, operations, kind):
+    observed = script_observations(receipt, operations)
+    counters = [int(item[2]) for item in observed]
+    owner = receipt["startupThread"]
+    output = receipt["stdout"]
+    assert all(item[1] == "1" for item in observed) and counters[0] == 0, "Script interruption command or initial nonmutation failed"
+    assert counters[-3:] == [0, 0, 3] and operations[-3] == "vardel $workflow_counter" and operations[-1] == "scriptrun", "Unloaded script runtime did not execute the fresh finite script"
+    active = re.findall(r"^SCRIPT_ACTIVE counter=(\d+) thread=(\d+)$", output, re.MULTILINE)
+    interrupted = re.findall(r"^SCRIPT_(ABORT|UNLOAD) active=(\d+) stopped=(\d+) stable=(\d+) line=(\d+) debugging=([01]) thread=(\d+)$", output, re.MULTILINE)
+    queued = re.findall(r"^SCRIPT_QUEUED worker=(\d+) owner=(\d+) counter=(\d+) released=([01])$", output, re.MULTILINE)
+    drained = re.findall(r"^SCRIPT_QUEUE_DRAIN callback=([01]) wrapper=([01]) line=(\d+) thread=(\d+)$", output, re.MULTILINE)
+    worker = re.findall(r"^SCRIPT_WORKER_UNLOAD before=(\d+) after=(\d+) line=(\d+) thread=(\d+)$", output, re.MULTILINE)
+    assert not re.findall(r"^SCRIPT_BRANCH ", output, re.MULTILINE), "Interruption reference reported unrelated branch observations"
+    if kind in ("abort", "active_unload"):
+        assert len(active) == len(interrupted) == 1 and not queued and not drained and not worker, "Active script interruption observations differ"
+        event, started, stopped, stable, line, debugging, thread = interrupted[0]
+        assert int(active[0][0]) >= 16 and int(active[0][1]) == owner and started == active[0][0], "Infinite script did not actually execute before interruption"
+        assert int(started) <= counters[1] <= int(stopped) and stopped == stable and int(thread) == owner and debugging == "0", "Interrupted script continued to execute or changed owner/session"
+        assert counters[2] == int(stopped), "Observed interruption counter differs from the stable native counter"
+        if kind == "abort":
+            assert event == "ABORT" and line == "0" and counters[3] == int(stopped) and operations[2:4] == ["abortapi", "unloadapi"], "Abort did not retain the script until explicit unload"
+        else:
+            assert event == "UNLOAD" and line == "4" and operations[2] == "activeunloadapi", "Active unload did not clear its line map"
+    elif kind in ("queued_run", "queued_step"):
+        assert not active and not interrupted and not worker and len(queued) == len(drained) == 1, "Queued unload observations differ"
+        thread, gui, counter, released = queued[0]
+        assert int(thread) > 0 and int(thread) != owner and int(gui) == owner and counter == "0" and released == "0", "Script execution was not held on the actual worker before unload"
+        assert drained == [("1", "0", "4", str(owner))], "Worker callback did not finish with canceled command and cleared map"
+        assert counters[1] == 0 and operations[1] == ("queuedrununloadapi" if kind == "queued_run" else "queuedstepunloadapi"), "Pending script execution ran after unload was requested"
+    else:
+        assert kind == "worker" and not active and not interrupted and not queued and not drained and len(worker) == 1, "Worker unload observations differ"
+        before, after, line, thread = worker[0]
+        assert before == after == "1" and line == "0" and int(thread) > 0 and int(thread) != owner, "Worker unload destroyed a borrowed script reference or executed the following increment"
+        assert counters[1] == 1 and operations[1] == "workerunloadapi", "Deferred worker unload did not finish before its queue barriers"
+    return [{"command": item[0], "providerResult": item[1] == "1", "actualCounter": int(item[2])} for item in observed]
+
+
+def interruption_negative_controls(receipt, operations, kind):
+    output = receipt["stdout"]
+    candidates = [("missing_terminal", {"terminalObserved": False}), ("truncated_capture", {"outputTruncated": True}),
+                  ("wrong_owner", {"startupThread": receipt["startupThread"] + 1}),
+                  ("missing_effect", {"stdout": output.replace("SCRIPT_OBSERVE ", "IGNORED_COMMAND ", 1)}),
+                  ("wrong_finite_reuse", {"stdout": output.replace("command=scriptrun result=1 counter=3", "command=scriptrun result=1 counter=4", 1)})]
+    if kind in ("abort", "active_unload"):
+        candidates.extend((("missing_active_execution", {"stdout": output.replace("SCRIPT_ACTIVE ", "IGNORED_ACTIVE ", 1)}),
+                           ("continued_execution", {"stdout": re.sub(r"stable=\d+", "stable=0", output, count=1)}),
+                           ("wrong_line_map", {"stdout": re.sub(r"line=\d+ debugging=", "line=3 debugging=", output, count=1)})))
+    elif kind in ("queued_run", "queued_step"):
+        candidates.extend((("released_worker", {"stdout": output.replace("released=0", "released=1", 1)}),
+                           ("executed_pending_script", {"stdout": output.replace("counter=0 released=0", "counter=99 released=0", 1)}),
+                           ("invented_command_success", {"stdout": output.replace("callback=1 wrapper=0", "callback=1 wrapper=1", 1)})))
+    else:
+        candidates.extend((("early_map_clear", {"stdout": output.replace("after=1 line=0", "after=1 line=4", 1)}),
+                           ("continued_worker_execution", {"stdout": output.replace("before=1 after=1", "before=1 after=2", 1)})))
+    rejected = []
+    for name, changed in candidates:
+        assert any(receipt[key] != value for key, value in changed.items()), f"Interruption negative control did not change evidence: {name}"
+        try:
+            check_script_interruption({**receipt, **changed}, operations, kind)
+        except (AssertionError, ValueError, KeyError) as error:
+            rejected.append({"name": name, "status": "rejected", "error": str(error), "scriptExecuted": False})
+        else:
+            raise AssertionError(f"Script interruption negative control was admitted: {name}")
+    return rejected
 
 
 def script_negative_controls(receipt, operations, expected, branches=()):
@@ -148,6 +223,9 @@ def run_script_oracles(environment, results, selected_engine, timeout, fixture_i
     source = ROOT / "x64dbg/src/tests/script_run_exit/control.txt"
     branch_source = source.with_name("branch.txt")
     assert source.read_text(encoding="utf-8") == CONTROL_SCRIPT and branch_source.read_text(encoding="utf-8") == BRANCH_SCRIPT and plugin.is_file(), "Native script control fixture is missing or differs"
+    interruption_sources = {"loop": source.with_name("loop.txt"), "queued": source.with_name("queued.txt"), "worker": source.with_name("worker.txt")}
+    for name, text in (("loop", LOOP_SCRIPT), ("queued", QUEUED_SCRIPT), ("worker", WORKER_SCRIPT)):
+        assert interruption_sources[name].read_text(encoding="utf-8") == text, "Native script interruption source differs"
     child = dict(os.environ)
     child.pop("WININSPECT_TEST_NORMAL", None)
     normal = run_owned([str(binary)], {**child, "WININSPECT_TEST_NORMAL": "1"}, timeout)
@@ -183,13 +261,37 @@ def run_script_oracles(environment, results, selected_engine, timeout, fixture_i
             controls = script_negative_controls(receipt, operations, expected, branches)
             observations.append({"engine": engine, "name": name, "script": file_identity(script), "sourceScript": file_identity(selected_source), "operations": operations, "expectedBranches": branches,
                                  "expected": expected, "receipt": receipt, "reference": reference, "negativeControls": controls})
+        interruptions = [("abort", "loop", ["startloopapi", "abortapi", "unloadapi"]),
+                         ("active_unload", "loop", ["startloopapi", "activeunloadapi"]),
+                         ("queued_run", "queued", ["queuedrununloadapi"]),
+                         ("queued_step", "queued", ["queuedstepunloadapi"]),
+                         ("worker", "worker", ["workerunloadapi"])]
+        for kind, source_name, commands in interruptions:
+            scope = environment.root / "script" / engine / kind
+            profile = scope / "userdir"
+            profile.mkdir(parents=True)
+            engine_id = 0 if engine == "TitanEngine" else 1
+            (profile / "headless.ini").write_text(f"[Engine]\nDebugEngine={engine_id}\nNoConsoleWindow=1\nNoScriptTimeout=1\n", encoding="utf-8")
+            script = scope / "\u63a7\u5236.txt"
+            finite = scope / "\u590d\u7528.txt"
+            selected_source = interruption_sources[source_name]
+            script.write_text(selected_source.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
+            finite.write_text(source.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
+            operations = ["load " + str(script), *commands, "vardel $workflow_counter", "load " + str(finite), "scriptrun"]
+            receipt = run_script_session([str(runtime / "headless.exe"), "-userdir", str(profile), "-plugin", str(plugin)], operations, child, timeout,
+                                         [plugin, runtime / "wininspect.dll", runtime / "winbridge.dll"])
+            write_json(scope / "receipt.json", receipt)
+            reference = check_script_interruption(receipt, operations, kind)
+            controls = interruption_negative_controls(receipt, operations, kind)
+            observations.append({"engine": engine, "name": kind, "script": file_identity(script), "sourceScript": file_identity(selected_source),
+                                 "finiteScript": file_identity(finite), "operations": operations, "receipt": receipt, "reference": reference, "negativeControls": controls})
         scope = environment.root / "script" / engine / "owned_timeout"
         profile = scope / "userdir"
         profile.mkdir(parents=True)
         engine_id = 0 if engine == "TitanEngine" else 1
         (profile / "headless.ini").write_text(f"[Engine]\nDebugEngine={engine_id}\nNoConsoleWindow=1\n", encoding="utf-8")
         script = scope / "bounded-control.txt"
-        script.write_text("varnew $workflow_counter, 0\nloop:\ninc $workflow_counter\njmp loop\n", encoding="utf-8", newline="\n")
+        script.write_text(LOOP_SCRIPT, encoding="utf-8", newline="\n")
         operations = ["load " + str(script), "scriptrun"]
         receipt = run_script_session([str(runtime / "headless.exe"), "-userdir", str(profile), "-plugin", str(plugin)], operations, child, min(timeout, 3),
                                      [plugin, runtime / "wininspect.dll", runtime / "winbridge.dll"])
@@ -204,8 +306,9 @@ def run_script_oracles(environment, results, selected_engine, timeout, fixture_i
             raise AssertionError("An actually timed-out script was admitted")
         observations.append({"engine": engine, "name": "owned_timeout", "script": file_identity(script), "operations": operations,
                              "receipt": receipt, "negativeControls": [timeout_control]})
-        print(f"[VERIFIED] Native {environment.architecture} {engine} script destinations, steps/IP, breakpoint, branch metadata/execution, unload and owned deadline", flush=True)
+        print(f"[VERIFIED] Native {environment.architecture} {engine} script controls, active abort/unload, canceled queued run/step, deferred worker unload, finite reuse and owned deadline", flush=True)
     assert file_identity(binary) == identity, "Script runtime reference changed the existing target"
     results.append({"name": "test_native_script_oracles", "status": "verified", "oracle": {
-        "binary": identity, "plugin": file_identity(plugin), "sourceScript": file_identity(source), "branchSourceScript": file_identity(branch_source), "normal": normal, "observations": observations,
-        "openGates": ["target workflow and artifact", "abort/reentrant/multi-session ownership", "unload while active or yielded", "library workflow and JavaScript", "platform matrix"]}})
+        "binary": identity, "plugin": file_identity(plugin), "sourceScript": file_identity(source), "branchSourceScript": file_identity(branch_source),
+        "interruptionSources": {name: file_identity(path) for name, path in interruption_sources.items()}, "normal": normal, "observations": observations,
+        "openGates": ["target workflow and artifact", "reentrant GUI and multi-session ownership", "unload while debug-event yielded", "library workflow and JavaScript", "platform matrix"]}})

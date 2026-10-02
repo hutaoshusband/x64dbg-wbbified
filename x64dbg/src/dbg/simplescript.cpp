@@ -12,6 +12,7 @@
 #include "jobqueue.h"
 #include "threading.h"
 #include <atomic>
+#include <memory>
 
 static JobQueue scriptQueue;
 
@@ -54,6 +55,17 @@ static int scriptIp = 0;
 static int scriptIpOld = 0;
 static std::atomic<SCRIPTSTATE> scriptState;
 static std::atomic<ScriptInterrupt> gScriptInterruptReason{ ScriptInterrupt::None };
+static std::atomic<unsigned> gScriptUnloadRequests{ 0 };
+
+class ScriptUnloadRequest
+{
+public:
+    ScriptUnloadRequest() { gScriptUnloadRequests.fetch_add(1); }
+    ~ScriptUnloadRequest() { gScriptUnloadRequests.fetch_sub(1); }
+    ScriptUnloadRequest(const ScriptUnloadRequest&) = delete;
+    ScriptUnloadRequest& operator=(const ScriptUnloadRequest&) = delete;
+};
+
 struct ScriptYieldContext
 {
     std::atomic_bool active{ false };
@@ -119,6 +131,8 @@ static bool scriptHandleInterrupt()
 {
     while(true)
     {
+        if(gScriptUnloadRequests.load())
+            return true;
         auto reason = gScriptInterruptReason.load();
         if(reason == ScriptInterrupt::None)
             return false;
@@ -599,7 +613,8 @@ static bool scriptInternalCmd(bool gui, SCRIPTSTATE state)
             break;
         case STATUS_ERROR:
             scriptIp = scriptIpOld;
-            scriptError(scriptIp, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Error executing command!")), gui);
+            if(!gScriptUnloadRequests.load())
+                scriptError(scriptIp, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Error executing command!")), gui);
             return false;
         case STATUS_EXIT:
             return false;
@@ -623,6 +638,8 @@ static bool scriptInternalCmd(bool gui, SCRIPTSTATE state)
 
 static bool scriptRun(int destline, bool gui)
 {
+    if(gScriptUnloadRequests.load())
+        return false;
     if(bIsDebugging && dbgisrunning())
     {
         scriptError(0, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Debugger must be paused to run a script!")), gui);
@@ -721,21 +738,32 @@ bool ScriptLoadAwait(const char* filename, bool gui)
     });
 }
 
+static void scriptUnload()
+{
+    ExclusiveSectionLocker<LockScriptLineMap> lockLineMap;
+    ExclusiveSectionLocker<LockScriptBreakpoints> lockBreakpoints;
+    GuiScriptClear();
+    scriptLineMap.clear();
+    scriptBpList.clear();
+    scriptStack.clear();
+    scriptIp = 0;
+    scriptIpOld = 0;
+    gScriptCreatedDebugSession = false;
+    scriptResetInterruptState();
+}
+
 void ScriptUnloadAwait()
 {
-    scriptQueue.await([]()
+    const auto request = std::make_shared<ScriptUnloadRequest>();
+    ScriptInterruptAwait(ScriptInterrupt::AbortUser);
+    auto unload = [request]()
     {
-        ExclusiveSectionLocker<LockScriptLineMap> lockLineMap;
-        ExclusiveSectionLocker<LockScriptBreakpoints> lockBreakpoints;
-        GuiScriptClear();
-        scriptLineMap.clear();
-        scriptBpList.clear();
-        scriptStack.clear();
-        scriptIp = 0;
-        scriptIpOld = 0;
-        gScriptCreatedDebugSession = false;
-        scriptResetInterruptState();
-    });
+        scriptUnload();
+    };
+    if(scriptQueue.on_worker_thread())
+        scriptQueue.async(std::move(unload));
+    else
+        scriptQueue.await(std::move(unload));
 }
 
 void ScriptRunAsync(int destline, bool gui)
@@ -758,6 +786,8 @@ void ScriptStepAsync(bool gui)
 {
     scriptQueue.async([gui]()
     {
+        if(gScriptUnloadRequests.load())
+            return;
         if(scriptState == SCRIPT_PAUSED)  // only step when the script is paused
         {
             scriptResetInterruptState();
@@ -952,7 +982,7 @@ bool ScriptExecAwait(const char* filename, bool gui)
             return false;
         if(!scriptRun(0, gui))
             return false;
-        ScriptUnloadAwait();
+        scriptUnload();
         return true;
     });
 }
