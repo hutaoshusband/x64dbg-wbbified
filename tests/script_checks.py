@@ -18,9 +18,13 @@ BRANCH_SCRIPT = "varnew $workflow_counter, 0\nloop:\ninc $workflow_counter\ncmp 
 LOOP_SCRIPT = "varnew $workflow_counter, 0\nloop:\ninc $workflow_counter\njmp loop\n"
 QUEUED_SCRIPT = "varnew $workflow_counter, .99\nloop:\ninc $workflow_counter\njmp loop\n"
 WORKER_SCRIPT = "varnew $workflow_counter, 0\ninc $workflow_counter\nscriptunloadprobe\ninc $workflow_counter\nret\n"
+INVALID_SCRIPTS = [("missing_file", None, "FileHelper::ReadAllText failed..."),
+                   ("empty_label", ":\nret\n", "Empty label detected on line 1!"),
+                   ("duplicate_label", "repeat:\nrepeat:\nret\n", 'Duplicate label "repeat" detected on lines 1 and 2!'),
+                   ("missing_branch", "jmp missing\nret\n", 'Invalid branch label "missing" detected on line 1!')]
 
 
-def run_script_session(command, operations, child, timeout, required):
+def run_script_session(command, operations, child, timeout, required, required_messages=()):
     output = []
     messages = queue.Queue()
     capture = {"bytes": 0, "truncated": False, "readerError": None}
@@ -75,6 +79,9 @@ def run_script_session(command, operations, child, timeout, required):
                 process.stdin.flush()
                 while not receive().startswith("SCRIPT_OBSERVE command=" + operation + " "):
                     pass
+            for message in required_messages:
+                while not any(line.rstrip("\r\n") == message for line in output):
+                    receive()
             process.stdin.write("exit\n")
             process.stdin.flush()
             process.stdin.close()
@@ -121,12 +128,14 @@ def script_observations(receipt, operations):
     return observed
 
 
-def check_script_session(receipt, operations, expected, branches=()):
+def check_script_session(receipt, operations, expected, branches=(), parse_message=None):
     observed = script_observations(receipt, operations)
     assert observed == [(operation, str(result), str(counter), str(receipt["startupThread"])) for operation, (result, counter) in zip(operations, expected)], "Native script effects, actual stop/resume or invalid-input nonmutation differs"
     assert len(operations) == len(expected) == len(observed), "Script observations omit or repeat a command"
     metadata = re.findall(r"^SCRIPT_BRANCH result=([01]) type=(\d+) destination=(\d+) label=(\S*)$", receipt["stdout"], re.MULTILINE)
     assert metadata == [(str(result), str(kind), str(destination), label) for result, kind, destination, label in branches], "Native script branch metadata differs from its source label, type or executable destination"
+    if parse_message is not None:
+        assert receipt["stdout"].splitlines().count(parse_message) == 1, "Native script parse diagnostic differs from its declared invalid source"
     return [{"command": operation, "providerResult": bool(result), "actualCounter": counter} for operation, (result, counter) in zip(operations, expected)]
 
 
@@ -196,7 +205,8 @@ def interruption_negative_controls(receipt, operations, kind):
     return rejected
 
 
-def run_gui_script_session(runtime, plugin, scope, child, timeout, engine):
+def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scenario="unload"):
+    assert scenario in ("unload", "reload"), "Unknown Qt script scenario"
     KERNEL.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
     KERNEL.CreateEventW.restype = wintypes.HANDLE
     KERNEL.SetEvent.argtypes = [wintypes.HANDLE]
@@ -213,7 +223,8 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine):
     queued.write_text(QUEUED_SCRIPT, encoding="utf-8", newline="\n")
     finite.write_text(CONTROL_SCRIPT, encoding="utf-8", newline="\n")
     child.update(WI_REENTRY_OUTPUT=str(output_path), WI_REENTRY_EVENT=event_name, WI_REENTRY_QUEUED=str(queued), WI_REENTRY_FINITE=str(finite))
-    command = [str(runtime / "wininspect.exe"), "-userdir", str(profile), "-plugin", str(plugin), "-c", "scriptguireentry"]
+    command = [str(runtime / "wininspect.exe"), "-userdir", str(profile), "-plugin", str(plugin), "-c",
+               "scriptguireentryreload" if scenario == "reload" else "scriptguireentry"]
     engine_path = runtime / ("TitanEngine.dll" if engine == "TitanEngine" else "GleeBug/TitanEngine.dll")
     required = [file_identity(runtime / name) for name in ("wininspect.exe", "wingui.dll", "wininspect.dll", "winbridge.dll", "Qt5Widgets.dll")]
     required.extend((file_identity(plugin), file_identity(engine_path)))
@@ -288,7 +299,7 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine):
         observation_truncated |= output_path.stat().st_size > 65536
         with output_path.open("rb") as stream:
             observed = stream.read(65536).decode("utf-8", errors="replace")
-    return {"command": command, "processIdentity": identity, "startupThread": startup,
+    return {"scenario": scenario, "command": command, "processIdentity": identity, "startupThread": startup,
             "exitCode": process.returncode if process is not None else None, "terminalObserved": process is not None and process.poll() is not None,
             "jobClosed": True, "timedOut": timed_out, "error": failure, "stdout": b"".join(output).decode("utf-8", errors="replace"),
             "outputTruncated": capture["truncated"], "observationTruncated": observation_truncated,
@@ -298,11 +309,15 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine):
 
 
 def check_gui_script_session(receipt):
+    scenario = receipt.get("scenario", "unload")
+    assert scenario in ("unload", "reload"), "Unknown captured Qt script scenario"
     assert receipt["exitCode"] == 0 and receipt["terminalObserved"] and receipt["jobClosed"] and not receipt["timedOut"] and not receipt["error"] and not receipt["outputTruncated"] and not receipt["observationTruncated"], "Qt script reference did not terminate with complete observations"
     assert receipt["requiredModules"] and all(item in receipt["loadedModules"] for item in receipt["requiredModules"]), "Qt script source/loaded-module identities differ"
     assert not any("mcp-server" in item["path"].lower() or "agent smithers" in item["path"].lower() for item in receipt["loadedModules"]), "Qt script reference loaded an external MCP dependency"
     rows = re.findall(r"^GUI_REENTRY phase=(\w+) pid=(\d+) thread=(\d+) owner=(\d+) worker=(\d+) nestedThread=(\d+) nestedCount=(\d+) outer=([01]) counter=(\d+) line=(\d+) completed=([01])$", receipt["observed"], re.MULTILINE)
-    phases = ["ready", "queued", "outer_enter", "nested_enter", "nested_leave", "outer_leave", "wrapper_canceled", "reset", "reloaded", "reused", "finished"]
+    phases = (["ready", "worker_completed", "reload_enter", "nested_enter", "nested_leave", "reload_canceled", "reloaded", "reused", "finished"]
+              if scenario == "reload" else
+              ["ready", "queued", "outer_enter", "nested_enter", "nested_leave", "outer_leave", "wrapper_canceled", "reset", "reloaded", "reused", "finished"])
     assert [row[0] for row in rows] == phases and len(receipt["observed"].splitlines()) == len(phases), "Qt script omitted, repeated or changed an actual event"
     pid, owner = receipt["processIdentity"]["pid"], receipt["startupThread"]
     assert all(int(row[1]) == pid and int(row[2]) == owner and row[2] == row[3] for row in rows), "Qt script event belongs to a different PID or GUI owner"
@@ -312,12 +327,18 @@ def check_gui_script_session(receipt):
                 (owner, 1, 1, 0, 0, 0), (owner, 1, 1, 0, 4, 1), (owner, 1, 1, 0, 4, 1),
                 (owner, 1, 0, 0, 4, 1), (owner, 1, 0, 0, 4, 1), (owner, 1, 0, 0, 0, 1),
                 (owner, 1, 0, 3, 0, 1), (owner, 1, 0, 3, 4, 1)]
+    if scenario == "reload":
+        expected = [(0, 0, 0, 0, 4, 0), (0, 0, 0, 0, 4, 1), (0, 0, 1, 0, 4, 1),
+                    (owner, 1, 1, 0, 0, 1), (owner, 1, 1, 0, 4, 1), (owner, 1, 1, 0, 4, 1),
+                    (owner, 1, 0, 0, 0, 1), (owner, 1, 0, 3, 0, 1), (owner, 1, 0, 3, 4, 1)]
     assert [tuple(int(value) for value in row[5:]) for row in rows] == expected, "Qt nested unload, pending nonmutation, callback completion or finite reuse differs"
     return [{"phase": row[0], "counter": int(row[8]), "lineType": int(row[9]), "guiThread": int(row[2]), "workerThread": int(row[4]), "nestedCount": int(row[6])} for row in rows]
 
 
 def gui_script_negative_controls(receipt):
     output = receipt["observed"]
+    reload = receipt.get("scenario") == "reload"
+    canceled = "reload_canceled" if reload else "wrapper_canceled"
     candidates = [("missing_terminal", {"terminalObserved": False}), ("truncated_stdout", {"outputTruncated": True}),
                   ("truncated_observations", {"observationTruncated": True}), ("wrong_owner", {"startupThread": receipt["startupThread"] + 1}),
                   ("wrong_process", {"processIdentity": {**receipt["processIdentity"], "pid": receipt["processIdentity"]["pid"] + 1}}),
@@ -328,7 +349,8 @@ def gui_script_negative_controls(receipt):
                   ("missing_outer_wait", {"observed": output.replace("outer=1", "outer=0", 1)}),
                   ("pending_code_executed", {"observed": output.replace("counter=0 line=0", "counter=99 line=0", 1)}),
                   ("missing_worker_completion", {"observed": output.replace("completed=1", "completed=0", 1)}),
-                  ("invented_wrapper_success", {"observed": output.replace("phase=wrapper_canceled", "phase=wrapper_success", 1)}),
+                  ("invented_load_completion" if reload else "invented_wrapper_success",
+                   {"observed": output.replace("phase=" + canceled, "phase=reload_completed" if reload else "phase=wrapper_success", 1)}),
                   ("wrong_finite_reuse", {"observed": output.replace("counter=3", "counter=4", 1)}),
                   ("missing_final_clear", {"observed": re.sub(r"(phase=finished .+ line=)4", r"\g<1>0", output)}),
                   ("missing_gui_artifact", {"loadedModules": [item for item in receipt["loadedModules"] if Path(item["path"]).name.lower() != "wingui.dll"]})]
@@ -356,17 +378,18 @@ def run_gui_script_oracles(environment, runtime, plugin, engines, timeout):
     (stage / "plugins").mkdir()
     references = []
     for engine in engines:
-        scope = environment.root / "script-gui" / engine
-        receipt = run_gui_script_session(stage, plugin, scope, os.environ, timeout, engine)
-        write_json(scope / "receipt.json", receipt)
-        reference = check_gui_script_session(receipt)
-        controls = gui_script_negative_controls(receipt)
-        references.append({"engine": engine, "name": "gui_reentrant_unload", "receipt": receipt, "reference": reference, "negativeControls": controls})
-        print(f"[VERIFIED] Native {environment.architecture} {engine} actual Qt GUI nested unload, canceled pending run/step, finite reuse and exit 0", flush=True)
+        for scenario in ("unload", "reload"):
+            scope = environment.root / "script-gui" / engine / scenario
+            receipt = run_gui_script_session(stage, plugin, scope, os.environ, timeout, engine, scenario)
+            write_json(scope / "receipt.json", receipt)
+            reference = check_gui_script_session(receipt)
+            controls = gui_script_negative_controls(receipt)
+            references.append({"engine": engine, "name": "gui_reentrant_" + scenario, "receipt": receipt, "reference": reference, "negativeControls": controls})
+            print(f"[VERIFIED] Native {environment.architecture} {engine} actual Qt GUI nested {scenario}, canceled pending step, finite reuse and exit 0", flush=True)
     return references
 
 
-def script_negative_controls(receipt, operations, expected, branches=()):
+def script_negative_controls(receipt, operations, expected, branches=(), parse_message=None):
     observed = []
     candidates = [("wrong_counter", {"stdout": receipt["stdout"].replace("counter=0", "counter=99", 1)}),
                   ("missing_provider", {"stdout": receipt["stdout"].replace("SCRIPT_PROVIDER ", "IGNORED_PROVIDER ", 1)}),
@@ -377,9 +400,12 @@ def script_negative_controls(receipt, operations, expected, branches=()):
         candidates.extend((("wrong_branch_type", {"stdout": receipt["stdout"].replace("type=2 destination=3", "type=1 destination=3", 1)}),
                            ("wrong_branch_destination", {"stdout": receipt["stdout"].replace("destination=3 label=loop", "destination=2 label=loop", 1)}),
                            ("wrong_branch_label", {"stdout": receipt["stdout"].replace("label=loop", "label=wrong", 1)})))
+    if parse_message is not None:
+        candidates.extend((("missing_parse_error", {"stdout": receipt["stdout"].replace(parse_message, "", 1)}),
+                           ("wrong_parse_error", {"stdout": receipt["stdout"].replace(parse_message, "Wrong parse diagnostic", 1)})))
     for name, changed in candidates:
         try:
-            check_script_session({**receipt, **changed}, operations, expected, branches)
+            check_script_session({**receipt, **changed}, operations, expected, branches, parse_message)
         except (AssertionError, ValueError, KeyError) as error:
             observed.append({"name": name, "status": "rejected", "error": str(error), "scriptExecuted": False})
         else:
@@ -459,6 +485,27 @@ def run_script_oracles(environment, results, selected_engine, timeout, fixture_i
             controls = interruption_negative_controls(receipt, operations, kind)
             observations.append({"engine": engine, "name": kind, "script": file_identity(script), "sourceScript": file_identity(selected_source),
                                  "finiteScript": file_identity(finite), "operations": operations, "receipt": receipt, "reference": reference, "negativeControls": controls})
+        for name, text, message in INVALID_SCRIPTS:
+            scope = environment.root / "script" / engine / name
+            profile = scope / "userdir"
+            profile.mkdir(parents=True)
+            engine_id = 0 if engine == "TitanEngine" else 1
+            (profile / "headless.ini").write_text(f"[Engine]\nDebugEngine={engine_id}\nNoConsoleWindow=1\n", encoding="utf-8")
+            script, finite = scope / "invalid.txt", scope / "\u590d\u7528.txt"
+            if text is not None:
+                script.write_text(text, encoding="utf-8", newline="\n")
+            finite.write_text(CONTROL_SCRIPT, encoding="utf-8", newline="\n")
+            operations = ['scriptexec "' + str(script) + '"', "scriptrun", "unloadapi", "load " + str(finite), "scriptrun"]
+            expected = [(0, 0), (0, 0), (1, 0), (1, 0), (1, 3)]
+            receipt = run_script_session([str(runtime / "headless.exe"), "-userdir", str(profile), "-plugin", str(plugin)], operations, child, timeout,
+                                         [plugin, runtime / "wininspect.dll", runtime / "winbridge.dll"], (message,))
+            write_json(scope / "receipt.json", receipt)
+            reference = check_script_session(receipt, operations, expected, parse_message=message)
+            controls = script_negative_controls(receipt, operations, expected, parse_message=message)
+            observations.append({"engine": engine, "name": name, "declaredSource": text, "parseMessage": message,
+                                 "script": file_identity(script) if script.is_file() else None, "finiteScript": file_identity(finite),
+                                 "operations": operations, "expected": expected, "expectedBranches": [], "receipt": receipt,
+                                 "reference": reference, "negativeControls": controls})
         scope = environment.root / "script" / engine / "owned_timeout"
         profile = scope / "userdir"
         profile.mkdir(parents=True)

@@ -133,9 +133,54 @@ namespace ScriptGuiControl
         return true;
     }
 
+    void ProbeReload(void*)
+    {
+        std::unique_ptr<void, decltype(&CloseHandle)> event(OpenEventW(SYNCHRONIZE, FALSE, Variable(L"WI_REENTRY_EVENT").c_str()), CloseHandle);
+        Observe("ready");
+        if(!event || WaitForSingleObject(event.get(), 5000) != WAIT_OBJECT_0)
+        {
+            Observe("gate_failed");
+            CloseOwnedWindow();
+            return;
+        }
+        gWorker = 0;
+        gRelease = false;
+        gCompleted = false;
+        bool wrapper = false;
+        std::thread blocked([&]() { wrapper = DbgScriptCmdExec("scriptguireentryblock"); });
+        const auto deadline = GetTickCount64() + 5000;
+        while(!gWorker && GetTickCount64() < deadline)
+            Sleep(1);
+        gRelease = true;
+        blocked.join();
+        Observe(wrapper ? "worker_completed" : "worker_failed");
+        std::thread nested([]() { GuiExecuteOnGuiThreadEx(Reenter, nullptr); });
+        nested.join();
+        const auto finite = Utf8(Variable(L"WI_REENTRY_FINITE"));
+        gOuterWaiting = true;
+        Observe("reload_enter");
+        DbgScriptLoad(finite.c_str());
+        Observe("reload_canceled");
+        gOuterWaiting = false;
+        DbgScriptLoad(finite.c_str());
+        Observe("reloaded");
+        const auto executed = DbgScriptCmdExec("scriptrun");
+        Observe(executed ? "reused" : "reuse_failed");
+        DbgScriptUnload();
+        Observe("finished");
+        CloseOwnedWindow();
+    }
+
+    bool QueueProbeReload(int, char**)
+    {
+        GuiExecuteOnGuiThreadEx(ProbeReload, nullptr);
+        return true;
+    }
+
     bool Register(int plugin)
     {
         return _plugin_registercommand(plugin, "scriptguireentryblock", BlockWorker, false)
-               && _plugin_registercommand(plugin, "scriptguireentry", QueueProbe, false);
+               && _plugin_registercommand(plugin, "scriptguireentry", QueueProbe, false)
+               && _plugin_registercommand(plugin, "scriptguireentryreload", QueueProbeReload, false);
     }
 }

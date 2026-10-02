@@ -215,12 +215,12 @@ static void scriptError(int line, const char* error, bool gui)
         dputs_untranslated(error);
 }
 
-static bool scriptCreateLineMap(const char* filename, bool gui)
+static bool scriptCreateLineMap(const char* filename, String& error)
 {
     String filedata;
     if(!FileHelper::ReadAllText(filename, filedata))
     {
-        scriptError(0, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "FileHelper::ReadAllText failed...")), gui);
+        error = GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "FileHelper::ReadAllText failed..."));
         return false;
     }
     auto len = filedata.length();
@@ -325,7 +325,7 @@ static bool scriptCreateLineMap(const char* filename, bool gui)
             {
                 char message[256] = "";
                 sprintf_s(message, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Empty label detected on line %d!")), i + 1);
-                scriptError(0, message, gui);
+                error = message;
                 scriptLineMap.clear();
                 return false;
             }
@@ -334,7 +334,7 @@ static bool scriptCreateLineMap(const char* filename, bool gui)
             {
                 char message[256] = "";
                 sprintf_s(message, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Duplicate label \"%s\" detected on lines %d and %d!")), cur.label.c_str(), foundlabel, i + 1);
-                scriptError(0, message, gui);
+                error = message;
                 scriptLineMap.clear();
                 return false;
             }
@@ -374,7 +374,7 @@ static bool scriptCreateLineMap(const char* filename, bool gui)
             {
                 char message[256] = "";
                 sprintf_s(message, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Invalid branch label \"%s\" detected on line %d!")), currentLine.branch.branchlabel, i + 1);
-                scriptError(0, message, gui);
+                error = message;
                 scriptLineMap.clear();
                 return false;
             }
@@ -708,25 +708,42 @@ static bool scriptRun(int destline, bool gui)
 
 static bool scriptLoad(const char* filename, bool gui)
 {
-    ExclusiveSectionLocker<LockScriptLineMap> lockLineMap;
-    ExclusiveSectionLocker<LockScriptBreakpoints> lockBreakpoints;
+    std::vector<String> lines;
+    String error;
+    bool loaded;
+    int ip = 0;
+    {
+        ExclusiveSectionLocker<LockScriptLineMap> lockLineMap;
+        ExclusiveSectionLocker<LockScriptBreakpoints> lockBreakpoints;
+        scriptIp = 0;
+        scriptIpOld = 0;
+        scriptBpList.clear();
+        scriptStack.clear();
+        gScriptCreatedDebugSession = false;
+        scriptResetInterruptState();
+        loaded = scriptCreateLineMap(filename, error);
+        if(loaded)
+        {
+            lines.reserve(scriptLineMap.size());
+            for(const auto& line : scriptLineMap)
+                lines.push_back(line.raw);
+            scriptIp = scriptNextIp(0);
+            ip = scriptIp;
+        }
+    }
     GuiScriptClear();
-    GuiScriptEnableHighlighting(true); //enable default script syntax highlighting
-    scriptIp = 0;
-    scriptIpOld = 0;
-    scriptBpList.clear();
-    scriptStack.clear();
-    gScriptCreatedDebugSession = false;
-    scriptResetInterruptState();
-    if(!scriptCreateLineMap(filename, gui))
-        return false; // Script load failed
-    int lines = (int)scriptLineMap.size();
-    auto script = (const char**)BridgeAlloc(lines * sizeof(const char*));
-    for(int i = 0; i < lines; i++) //add script lines
-        script[i] = scriptLineMap.at(i).raw.c_str();
-    GuiScriptAdd(lines, script);
-    scriptIp = scriptNextIp(0);
-    GuiScriptSetIp(scriptIp);
+    GuiScriptEnableHighlighting(true);
+    if(!loaded)
+    {
+        scriptError(0, error.c_str(), gui);
+        return false;
+    }
+    const auto count = int(lines.size());
+    auto script = static_cast<const char**>(BridgeAlloc(count * sizeof(const char*)));
+    for(int i = 0; i < count; ++i)
+        script[i] = lines[i].c_str();
+    GuiScriptAdd(count, script);
+    GuiScriptSetIp(ip);
     return true;
 }
 
