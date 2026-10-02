@@ -1,0 +1,87 @@
+settingset Engine, HideDebugger, 0
+settingset Events, TlsCallbacks, 0
+settingset Events, SystemBreakpoint, 1
+settingset Events, EntryBreakpoint, 1
+mov mutation, 0
+call thread_session
+mov mutation, 1
+call thread_session
+testfinalize
+ret
+
+thread_session:
+init tests/scriptcmd_call_threads.exe
+mov startup_stops, 0
+await_entry:
+cmp cip, scriptcmd_call_threads:entry
+je entry_ready
+inc startup_stops
+testassert startup_stops <= .64, "thread reference entry stop limit"
+run
+jmp await_entry
+entry_ready:
+testassert cip == scriptcmd_call_threads:entry, "thread reference reached its actual entry"
+mov dword:[scriptcmd_call_threads:gThreadMode], 1
+mov dword:[scriptcmd_call_threads:gThreadMutation], mutation
+testassert dword:[scriptcmd_call_threads:gThreadMode] == 1 && dword:[scriptcmd_call_threads:gThreadMutation] == mutation, "thread scenario write readback"
+bp scriptcmd_call_threads:ThreadReady
+bp scriptcmd_call_threads:ThreadHeld
+bp scriptcmd_call_threads:ThreadFinish
+bp scriptcmd_call_threads:ThreadStop0
+bp scriptcmd_call_threads:ThreadStop1
+run
+testassert cip == scriptcmd_call_threads:ThreadReady, "target reached its real thread creation barrier"
+bpd scriptcmd_call_threads:ThreadReady
+rtr
+mov held_tid, dword:[scriptcmd_call_threads:gThreadIds]
+mov other_tid, dword:[scriptcmd_call_threads:gThreadIds+4]
+mov main_tid, dword:[scriptcmd_call_threads:gThreadMainId]
+cmp mutation, 0
+jne prepare_mutated
+threadprepare 0
+jmp prepared
+prepare_mutated:
+threadprepare 1
+prepared:
+switchthread held_tid, silent
+threadcontext 0
+switchthread other_tid, silent
+threadcontext 1
+switchthread main_tid, silent
+threadcontext 2
+threadcount 0
+suspendthread held_tid
+threadcount 1
+resumethread held_tid
+threadcount 2
+run
+threadstop 1
+cmp mutation, 0
+je keep_worker_register
+mov cax, 2468ACE0
+testassert cax == 2468ACE0, "selected worker register write readback"
+keep_worker_register:
+switchthread held_tid, silent
+threadcontext 0
+switchthread main_tid, silent
+threadcontext 2
+switchthread other_tid, silent
+threadcontext 1
+run
+testassert cip == scriptcmd_call_threads:ThreadHeld, "target reached its held-worker observation after the other worker exited"
+threadheld
+bpd scriptcmd_call_threads:ThreadHeld
+run
+threadstop 0
+run
+testassert cip == scriptcmd_call_threads:ThreadFinish, "target reached its actual thread completion barrier"
+threadresult
+bpd scriptcmd_call_threads:ThreadFinish
+run
+cmp mutation, 0
+jne expect_mutated_exit
+threadexit 87
+ret
+expect_mutated_exit:
+threadexit 88
+ret
