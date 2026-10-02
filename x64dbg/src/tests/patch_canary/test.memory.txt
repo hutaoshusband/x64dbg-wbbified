@@ -1,0 +1,66 @@
+settingset Engine, HideDebugger, 0
+settingset Events, TlsCallbacks, 0
+settingset Events, SystemBreakpoint, 1
+settingset Events, EntryBreakpoint, 1
+init tests/patch_canary.exe
+mov startup_stops, 0
+await_entry:
+cmp cip, patch_canary:entry
+je entry_ready
+inc startup_stops
+testassert startup_stops <= .64, "patch fixture entry stop limit"
+run
+jmp await_entry
+entry_ready:
+testassert cip == patch_canary:entry, "patch fixture reached its actual entry"
+patchselect 4
+bp patch_canary:PatchReady
+bp patch_canary:PatchFinish
+bpmrange patch_canary:PatchValue,1,x
+run
+patchprepare
+run
+patchhit 0
+sti
+patchstep 0
+testassert cip == patch_canary:PatchValue+5 && eax == 7, "original MOV actually executes"
+testassert cip == patch_canary:PatchValue+5 && dis.isret(cip), "function reaches its actual RET"
+sti
+patchstep 1
+testassert cip == patch_canary:PatchAfterCall && eax == 7, "original function actually returns its canary"
+run
+bp ptr(patch_canary:gPatchWriteFailureRegion)+.16
+bpmrange ptr(patch_canary:gPatchWriteFailureRegion),1,x
+patchwritefailure
+bpmc ptr(patch_canary:gPatchWriteFailureRegion)
+bc ptr(patch_canary:gPatchWriteFailureRegion)+.16
+patchfailurefinish
+patchapply
+run
+patchhit 1
+sti
+patchstep 2
+testassert cip == patch_canary:PatchValue+4 && eax == .42, "assembled MOV actually executes"
+sti
+patchstep 3
+testassert cip == patch_canary:PatchValue+5 && dis.isret(cip), "function reaches its actual RET"
+sti
+patchstep 4
+testassert cip == patch_canary:PatchAfterCall && eax == .42, "patched function actually returns its canary"
+run
+patchundo
+run
+patchhit 2
+sti
+patchstep 5
+testassert cip == patch_canary:PatchValue+5 && eax == 7, "restored MOV actually executes"
+testassert cip == patch_canary:PatchValue+5 && dis.isret(cip), "function reaches its actual RET"
+sti
+patchstep 6
+testassert cip == patch_canary:PatchAfterCall && eax == 7, "restored function actually returns its canary"
+run
+patchfinish
+run
+patchexit
+testfinalize
+ret

@@ -2,6 +2,21 @@
 #include <cstdio>
 #include <cstring>
 
+struct ScopedAllocation
+{
+    void* value = VirtualAlloc(nullptr, 0x2000, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    ~ScopedAllocation() { if(value) VirtualFree(value, 0, MEM_RELEASE); }
+    bool Release()
+    {
+        if(!VirtualFree(value, 0, MEM_RELEASE)) return false;
+        value = nullptr;
+        return true;
+    }
+    ScopedAllocation() = default;
+    ScopedAllocation(const ScopedAllocation&) = delete;
+    ScopedAllocation& operator=(const ScopedAllocation&) = delete;
+};
+
 extern "C"
 {
     __declspec(dllexport) volatile unsigned gPatchMode = 0;
@@ -14,6 +29,7 @@ extern "C"
     __declspec(dllexport) char gPatchMarkers[3][9]{};
     __declspec(dllexport) DWORD gPatchCompleted = 0;
     __declspec(dllexport) DWORD gPatchVerified = 0;
+    __declspec(dllexport) uintptr_t gPatchWriteFailureRegion = 0;
     DWORD PatchCall();
 }
 extern "C" __declspec(dllexport) __declspec(noinline) void PatchReady()
@@ -39,6 +55,16 @@ int main()
     gPatchPid = GetCurrentProcessId();
     gPatchThread = GetCurrentThreadId();
     gPatchImageBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    ScopedAllocation failurePages;
+    if(!failurePages.value)
+        return 110;
+    if(!VirtualAlloc(failurePages.value, 0x1000, MEM_COMMIT, PAGE_EXECUTE_READWRITE))
+        return 111;
+    memset(failurePages.value, 0x5a, 0x1000);
+    DWORD previous = 0;
+    if(!VirtualProtect(failurePages.value, 0x1000, PAGE_EXECUTE_READ, &previous) || previous != PAGE_EXECUTE_READWRITE)
+        return 113;
+    gPatchWriteFailureRegion = reinterpret_cast<uintptr_t>(failurePages.value);
     const unsigned count = gPatchMode == 1 ? 3 : 1;
     DWORD sum = 0;
     for(unsigned index = 0; index < count; ++index)
@@ -64,5 +90,7 @@ int main()
         fflush(stdout);
     }
     PatchFinish();
+    if(!failurePages.Release())
+        return 112;
     return gPatchVerified ? static_cast<int>(sum) : 108;
 }

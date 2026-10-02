@@ -967,7 +967,8 @@ __declspec(dllexport) void TITCALL DebugLoop()
                         if(strstr(DisassembledString, "PUSHF"))
                             PushfBPX = true;
                     }
-                    engineStep();
+                    if(!ResetHwBPX)
+                        engineStep();
                 }
                 if(DBGCode == DBG_EXCEPTION_NOT_HANDLED) //NOTE: only call the chSingleStep callback when the debuggee generated the exception
                 {

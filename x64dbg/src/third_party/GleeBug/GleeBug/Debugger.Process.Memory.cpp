@@ -2,6 +2,69 @@
 
 namespace GleeBug
 {
+    struct ScopedBreakpointWriteProtection
+    {
+        struct Page
+        {
+            ptr address;
+            DWORD original, trapped;
+            bool applied = false;
+        };
+        Process& process;
+        std::vector<Page> pages;
+        explicit ScopedBreakpointWriteProtection(Process& owner) : process(owner) {}
+        ~ScopedBreakpointWriteProtection() { Restore(); }
+        bool Stage(ptr address, ptr size)
+        {
+            const auto first = address & ~ptr(PAGE_SIZE - 1);
+            const auto last = (address + size - 1) & ~ptr(PAGE_SIZE - 1);
+            for(ptr page = first;; page += PAGE_SIZE)
+            {
+                const auto found = process.memoryBreakpointPages.find(page);
+                if(found != process.memoryBreakpointPages.end())
+                {
+                    MEMORY_BASIC_INFORMATION region{};
+                    if(VirtualQueryEx(process.hProcess, reinterpret_cast<const void*>(page), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT)
+                        return false;
+                    const auto& data = found->second;
+                    if(region.Protect != data.OldProtect)
+                    {
+                        if(region.Protect != data.NewProtect)
+                            return false;
+                        pages.push_back({page, data.OldProtect, region.Protect});
+                    }
+                }
+                if(page == last)
+                    return true;
+            }
+        }
+        bool Apply()
+        {
+            for(auto& page : pages)
+            {
+                if(!process.MemProtect(page.address, PAGE_SIZE, page.original))
+                    return false;
+                page.applied = true;
+            }
+            return true;
+        }
+        bool Restore()
+        {
+            bool restored = true;
+            for(auto page = pages.rbegin(); page != pages.rend(); ++page)
+            {
+                if(page->applied)
+                {
+                    if(process.MemProtect(page->address, PAGE_SIZE, page->trapped))
+                        page->applied = false;
+                    else
+                        restored = false;
+                }
+            }
+            return restored;
+        }
+    };
+
     bool Process::MemReadUnsafe(ptr address, void* buffer, ptr size, ptr* bytesRead) const
     {
         //TODO: change page protection if reading failed
@@ -69,12 +132,16 @@ namespace GleeBug
     {
         std::lock_guard<std::recursive_mutex> lock(breakpointMutex);
 
+        if(bytesWritten)
+            *bytesWritten = 0;
         if(size == 0)
         {
             if(bytesWritten)
                 *bytesWritten = 0;
             return true;
         }
+        if(size > ~ptr(0) - address)
+            return false;
 
         std::vector<uint8> copy((const uint8*)buffer, (const uint8*)buffer + size);
 
@@ -103,14 +170,31 @@ namespace GleeBug
         }
 
         //write to memory (breakpoint bytes are preserved in the copy)
-        ptr written = 0;
-        if(!MemWriteUnsafe(address, copy.data(), size, &written))
-        {
-            if(bytesWritten)
-                *bytesWritten = written;
+        ScopedBreakpointWriteProtection protection(*this);
+        if(!protection.Stage(address, size) || !protection.Apply())
             return false;
+        ptr written = 0;
+        bool writeSuccess = true;
+        while(written < size)
+        {
+            const auto current = address + written;
+            const auto pageRemaining = ptr(PAGE_SIZE) - (current & ptr(PAGE_SIZE - 1));
+            const auto requested = std::min(size - written, pageRemaining);
+            ptr partWritten = 0;
+            const bool partSuccess = MemWriteUnsafe(current, copy.data() + written, requested, &partWritten);
+            if(partWritten > requested)
+            {
+                writeSuccess = false;
+                break;
+            }
+            written += partWritten;
+            if(!partSuccess || partWritten != requested)
+            {
+                writeSuccess = false;
+                break;
+            }
         }
-
+        const bool restored = protection.Restore();
         //apply oldbytes updates only for bytes that were actually written
         for(const auto & update : pendingUpdates)
         {
@@ -120,7 +204,7 @@ namespace GleeBug
 
         if(bytesWritten)
             *bytesWritten = written;
-        return true;
+        return writeSuccess && written == size && restored;
     }
 
     bool Process::MemIsValidPtr(ptr address) const

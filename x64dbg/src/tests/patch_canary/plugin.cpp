@@ -10,6 +10,11 @@
 namespace
 {
     int gPluginHandle = 0;
+    BPXTYPE gBreakpointType = bp_normal;
+    DWORD gOriginalProtection = 0;
+    unsigned gStepCount = 0;
+    duint gFailureAddress = 0;
+    SIZE_T gFailureWritten = 0;
     std::atomic<duint> gAddress{0};
     std::atomic<DWORD> gPid{0}, gThread{0}, gExit{0};
     std::atomic<unsigned> gHitCount{0};
@@ -21,10 +26,18 @@ namespace
     struct ScopedProcess
     {
         HANDLE value;
-        explicit ScopedProcess(DWORD pid) : value(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid)) {}
+        explicit ScopedProcess(DWORD pid, DWORD extra = 0) : value(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | extra, FALSE, pid)) {}
         ScopedProcess(const ScopedProcess&) = delete;
         ScopedProcess& operator=(const ScopedProcess&) = delete;
         ~ScopedProcess() { if(value) CloseHandle(value); }
+    };
+    struct ScopedThread
+    {
+        HANDLE value;
+        explicit ScopedThread(DWORD id) : value(OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, id)) {}
+        ScopedThread(const ScopedThread&) = delete;
+        ScopedThread& operator=(const ScopedThread&) = delete;
+        ~ScopedThread() { if(value) CloseHandle(value); }
     };
     duint FieldAddress(const char* name)
     {
@@ -39,7 +52,7 @@ namespace
     {
         if(type == CB_INITDEBUG)
         {
-            gAddress = 0; gPid = 0; gThread = 0; gExit = 0; gHitCount = 0; gOverflow = false; gExited = false;
+            gAddress = 0; gPid = 0; gThread = 0; gExit = 0; gHitCount = 0; gOverflow = false; gExited = false; gBreakpointType = bp_normal; gOriginalProtection = 0; gStepCount = 0; gFailureAddress = 0; gFailureWritten = 0;
         }
         else if(type == CB_DEBUGEVENT)
         {
@@ -74,20 +87,64 @@ namespace
             }
         }
     }
+    bool CheckBreakpoint()
+    {
+        const auto address = FieldAddress("PatchValue");
+        BRIDGEBP breakpoint{};
+        if(!_plugin_testassert(DbgFunctions()->GetBridgeBp(gBreakpointType, address, &breakpoint) && breakpoint.addr == address
+                              && breakpoint.type == gBreakpointType && breakpoint.enabled && breakpoint.active && !breakpoint.singleshoot,
+                              "the selected breakpoint remains active at the exact source function")) return false;
+        const ScopedProcess process(DbgGetProcessId());
+        MEMORY_BASIC_INFORMATION region{};
+        if(!_plugin_testassert(process.value && VirtualQueryEx(process.value, reinterpret_cast<const void*>(address), &region, sizeof(region)) == sizeof(region)
+                              && region.State == MEM_COMMIT && region.Type == MEM_IMAGE && region.RegionSize >= 0x1000,
+                              "the isolated function has an actual committed image page")) return false;
+        if(gBreakpointType == bp_hardware)
+        {
+            const ScopedThread thread(DbgGetThreadId());
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            const bool read = thread.value && GetThreadContext(thread.value, &context);
+            const std::array<duint, 4> slots{context.Dr0, context.Dr1, context.Dr2, context.Dr3};
+            const unsigned slot = breakpoint.slot;
+            if(!_plugin_testassert(read && slot < slots.size() && slots[slot] == address && (context.Dr7 & (3ull << (slot * 2))) != 0
+                                  && ((context.Dr7 >> (16 + slot * 4)) & 15) == 0 && breakpoint.typeEx == hw_execute && breakpoint.hwSize == hw_byte
+                                  && region.Protect == gOriginalProtection,
+                                  "actual OS debug registers retain the exact executable hardware slot and page protection")) return false;
+            _plugin_logprintf("PATCH_HARDWARE slot=%u address=%llx dr7=%llx\n", slot, static_cast<unsigned long long>(slots[slot]), static_cast<unsigned long long>(context.Dr7));
+        }
+        else if(gBreakpointType == bp_memory)
+        {
+            if(!_plugin_testassert(breakpoint.typeEx == mem_execute && DbgFunctions()->MemBpSize(address) == 1
+                                  && (region.Protect != gOriginalProtection) && ((region.Protect & PAGE_GUARD) || (region.Protect & 0xf0) == 0),
+                                  "the memory breakpoint keeps its exact execute range and actual OS trap protection")) return false;
+        }
+        else if(!_plugin_testassert(region.Protect == gOriginalProtection, "software trapping preserves the original OS page protection")) return false;
+        _plugin_logprintf("PATCH_BREAKPOINT type=%u address=%llx typeEx=%u enabled=%u active=%u singleshoot=%u hits=%u protection=%lx originalProtection=%lx\n",
+                          unsigned(breakpoint.type), static_cast<unsigned long long>(breakpoint.addr), unsigned(breakpoint.typeEx), breakpoint.enabled ? 1 : 0,
+                          breakpoint.active ? 1 : 0, breakpoint.singleshoot ? 1 : 0, breakpoint.hitCount, region.Protect, gOriginalProtection);
+        return true;
+    }
     bool CheckBytes(bool patched, bool trapped)
     {
         const auto address = FieldAddress("PatchValue");
         const auto& expected = patched ? Patched : Original;
+        trapped = trapped && gBreakpointType == bp_normal;
+        if(!CheckBreakpoint()) return false;
         std::array<unsigned char, 6> logical{}, raw{};
         const ScopedProcess process(DbgGetProcessId());
         SIZE_T read = 0;
+        MEMORY_BASIC_INFORMATION before{}, after{};
+        if(process.value) VirtualQueryEx(process.value, reinterpret_cast<const void*>(address), &before, sizeof(before));
         if(!_plugin_testassert(process.value && DbgMemRead(address, logical.data(), logical.size()) && logical == expected
                               && ReadProcessMemory(process.value, reinterpret_cast<const void*>(address), raw.data(), raw.size(), &read) && read == raw.size(),
                               "logical patch bytes and independent OS read are available"))
             return false;
+        if(!_plugin_testassert(VirtualQueryEx(process.value, reinterpret_cast<const void*>(address), &after, sizeof(after)) == sizeof(after)
+                              && before.Protect == after.Protect, "logical and OS reads preserve the breakpoint's actual page protection")) return false;
         auto expectedRaw = expected;
         if(trapped) expectedRaw[0] = 0xcc;
-        if(!_plugin_testassert(raw == expectedRaw && FieldAddress("PatchValueEnd") == address + expected.size(), "software trap, logical opcode and exact function boundary agree"))
+        if(!_plugin_testassert(raw == expectedRaw && FieldAddress("PatchValueEnd") == address + expected.size(), "selected trap, logical opcode and exact function boundary agree"))
             return false;
         BASIC_INSTRUCTION_INFO first{}, terminal{};
         DbgDisasmFastAt(address, &first);
@@ -160,8 +217,16 @@ namespace
                           (static_cast<unsigned long long>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime);
         return true;
     }
-    bool cbSelect(int, char**)
+    bool cbSelect(int argc, char** argv)
     {
+        if(!_plugin_testassert(argc == 1 || (argc == 2 && strlen(argv[1]) == 1 && (argv[1][0] == '1' || argv[1][0] == '2' || argv[1][0] == '4')),
+                              "reference declares an exact software, hardware or memory breakpoint type")) return false;
+        gBreakpointType = argc == 1 ? bp_normal : static_cast<BPXTYPE>(argv[1][0] - '0');
+        const ScopedProcess process(DbgGetProcessId());
+        MEMORY_BASIC_INFORMATION region{};
+        if(!_plugin_testassert(process.value && VirtualQueryEx(process.value, reinterpret_cast<const void*>(FieldAddress("PatchValue")), &region, sizeof(region)) == sizeof(region)
+                              && (region.Protect & 0xff) == PAGE_EXECUTE_READ, "reference captures its actual original executable page protection")) return false;
+        gOriginalProtection = region.Protect;
         unsigned mode = 0, mutation = 0;
         const unsigned selected = 1;
         if(!ReadTarget("gPatchMode", mode) || !ReadTarget("gPatchMutation", mutation)) return false;
@@ -204,6 +269,78 @@ namespace
         if(!_plugin_testassert(DbgFunctions()->AssembleAtEx(address, "mov ax,0x2a", error, true), "requested assembly installs with explicit native NOP fill")) return false;
         return CheckBytes(true, true) && CheckTracking(true);
     }
+    bool cbWriteFailure(int, char**)
+    {
+        if(!CheckPhase(2, {7, 0, 0}) || !CheckTracking(false)) return false;
+        uintptr_t address = 0;
+        if(!ReadTarget("gPatchWriteFailureRegion", address)) return false;
+        const ScopedProcess process(DbgGetProcessId(), PROCESS_VM_WRITE | PROCESS_VM_OPERATION);
+        MEMORY_BASIC_INFORMATION first{}, second{}, after{};
+        std::array<unsigned char, 0x1001> buffer{};
+        buffer.fill(0x5b);
+        if(!_plugin_testassert(gBreakpointType == bp_memory && process.value && address && (address & 0xfff) == 0
+                              && VirtualQueryEx(process.value, reinterpret_cast<const void*>(address), &first, sizeof(first)) == sizeof(first)
+                              && VirtualQueryEx(process.value, reinterpret_cast<const void*>(address + 0x1000), &second, sizeof(second)) == sizeof(second)
+                              && first.State == MEM_COMMIT && first.Protect == PAGE_READONLY && second.State == MEM_RESERVE,
+                              "controlled raw write spans an armed execute trap and a reserved inaccessible page")) return false;
+        BRIDGEBP breakpoint{}, software{};
+        if(!_plugin_testassert(DbgFunctions()->GetBridgeBp(bp_memory, address, &breakpoint) && breakpoint.enabled && breakpoint.typeEx == mem_execute
+                              && DbgFunctions()->MemBpSize(address) == 1 && DbgFunctions()->GetBridgeBp(bp_normal, address + 0x10, &software)
+                              && software.enabled && software.active && !software.singleshoot,
+                              "controlled failure page has exact memory and overlapping software breakpoints")) return false;
+        wchar_t path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        duint engine = 0;
+        if(!_plugin_testassert(length && length < MAX_PATH && BridgeSettingGetUint("Engine", "DebugEngine", &engine) && engine <= 1,
+                              "controlled write uses the actual selected native engine")) return false;
+        std::wstring modulePath(path, length);
+        modulePath.resize(modulePath.find_last_of(L"\\/") + 1);
+        modulePath += engine == 0 ? L"TitanEngine.dll" : L"GleeBug\\TitanEngine.dll";
+        const auto module = GetModuleHandleW(modulePath.c_str());
+        using WriteMemory = bool(__cdecl*)(HANDLE, LPVOID, LPCVOID, SIZE_T, SIZE_T*);
+        const auto write = module ? reinterpret_cast<WriteMemory>(GetProcAddress(module, "MemoryWriteSafe")) : nullptr;
+        if(!_plugin_testassert(write != nullptr, "controlled write resolves the source-built engine's exact raw safe-write export")) return false;
+        SIZE_T written = 0;
+        const bool success = write(process.value, reinterpret_cast<void*>(address), buffer.data(), buffer.size(), &written);
+        const DWORD error = GetLastError();
+        std::array<unsigned char, 0x1000> actual{}, logical{}, expected{};
+        SIZE_T read = 0;
+        if(!_plugin_testassert(!success && written <= actual.size(), "a partial raw write rejects full success and reports its actual prefix")) return false;
+        for(SIZE_T index = 0; index < expected.size(); ++index) expected[index] = index < written ? 0x5b : 0x5a;
+        if(!_plugin_testassert(VirtualQueryEx(process.value, reinterpret_cast<const void*>(address), &after, sizeof(after)) == sizeof(after)
+                              && after.Protect == first.Protect && DbgMemRead(address, logical.data(), logical.size()) && logical == expected
+                              && ReadProcessMemory(process.value, reinterpret_cast<const void*>(address), actual.data(), actual.size(), &read) && read == actual.size(),
+                              "failed raw write restores trap protection and logical bytes reflect its actual written prefix")) return false;
+        expected[0x10] = 0xcc;
+        if(!_plugin_testassert(actual == expected, "independent OS bytes retain the software trap and exact changed prefix")) return false;
+        gFailureAddress = address;
+        gFailureWritten = written;
+        _plugin_logprintf("PATCH_WRITE_FAILURE engine=%llu address=%llx requested=%llu written=%llu success=%u before=%lx after=%lx reserved=%lx error=%lu softwareOffset=16 softwareLogical=%02x softwareRaw=%02x prefix=5b remainder=5a\n",
+                          static_cast<unsigned long long>(engine), static_cast<unsigned long long>(address), static_cast<unsigned long long>(buffer.size()),
+                          static_cast<unsigned long long>(written), success ? 1 : 0, first.Protect, after.Protect, second.State, error, logical[0x10], actual[0x10]);
+        return CheckTracking(false) && CheckBytes(false, true);
+    }
+    bool cbFailureFinish(int, char**)
+    {
+        if(!CheckPhase(2, {7, 0, 0}) || !CheckTracking(false)) return false;
+        uintptr_t address = 0;
+        if(!ReadTarget("gPatchWriteFailureRegion", address)) return false;
+        const ScopedProcess process(DbgGetProcessId());
+        MEMORY_BASIC_INFORMATION region{};
+        BRIDGEBP breakpoint{};
+        std::array<unsigned char, 0x1000> actual{}, logical{}, expected{};
+        SIZE_T read = 0;
+        for(SIZE_T index = 0; index < expected.size(); ++index) expected[index] = index < gFailureWritten ? 0x5b : 0x5a;
+        if(!_plugin_testassert(address && address == gFailureAddress && gFailureWritten <= expected.size() && process.value
+                              && !DbgFunctions()->GetBridgeBp(bp_memory, address, &breakpoint) && !DbgFunctions()->GetBridgeBp(bp_normal, address + 0x10, &breakpoint)
+                              && VirtualQueryEx(process.value, reinterpret_cast<const void*>(address), &region, sizeof(region)) == sizeof(region) && region.Protect == PAGE_EXECUTE_READ
+                              && DbgMemRead(address, logical.data(), logical.size()) && logical == expected
+                              && ReadProcessMemory(process.value, reinterpret_cast<const void*>(address), actual.data(), actual.size(), &read) && read == actual.size() && actual == expected,
+                              "clearing both overlap breakpoints restores the actual partial-write bytes and original OS protection")) return false;
+        _plugin_logprintf("PATCH_WRITE_RESTORE address=%llx written=%llu protection=%lx logical=%02x raw=%02x\n", static_cast<unsigned long long>(address),
+                          static_cast<unsigned long long>(gFailureWritten), region.Protect, logical[0x10], actual[0x10]);
+        return true;
+    }
     bool cbUndo(int, char**)
     {
         if(!CheckPhase(3, {7, 42, 0}) || !CheckBytes(true, true) || !CheckTracking(true)) return false;
@@ -217,9 +354,38 @@ namespace
         const auto count = gHitCount.load(std::memory_order_acquire);
         if(!_plugin_testassert(index < 3 && count == index + 1 && !gOverflow.load() && DbgValFromString("cip") == FieldAddress("PatchValue"), "breakpoint actually stops each selected function call")) return false;
         const auto& hit = gHits[index];
-        if(!_plugin_testassert(hit.address == FieldAddress("PatchValue") && hit.pid == DbgGetProcessId() && hit.thread == DbgGetThreadId() && hit.type == bp_normal && hit.enabled,
-                              "bounded raw breakpoint event has the actual software breakpoint and OS identity")) return false;
-        _plugin_logprintf("PATCH_HIT index=%u address=%llx pid=%lu thread=%lu\n", index, static_cast<unsigned long long>(hit.address), hit.pid, hit.thread);
+        if(!_plugin_testassert(hit.address == FieldAddress("PatchValue") && hit.pid == DbgGetProcessId() && hit.thread == DbgGetThreadId() && hit.type == gBreakpointType && hit.enabled,
+                              "bounded raw breakpoint event has the actual selected breakpoint and OS identity")) return false;
+        _plugin_logprintf("PATCH_HIT index=%u address=%llx pid=%lu thread=%lu type=%u\n", index, static_cast<unsigned long long>(hit.address), hit.pid, hit.thread, unsigned(hit.type));
+        return true;
+    }
+    bool cbStep(int argc, char** argv)
+    {
+        const unsigned index = argc == 2 && strlen(argv[1]) == 1 && argv[1][0] >= '0' && argv[1][0] <= '6' ? unsigned(argv[1][0] - '0') : 7;
+        if(!_plugin_testassert(index < 7 && index == gStepCount, "each real CPU step has its declared sequence index")) return false;
+        const std::array<unsigned, 7> offsets{5, 0, 4, 5, 0, 5, 0};
+        const std::array<unsigned, 7> hits{1, 1, 2, 2, 2, 3, 3};
+        const std::array<duint, 7> values{7, 7, 42, 42, 42, 7, 7};
+        const auto expectedIP = offsets[index] ? FieldAddress("PatchValue") + offsets[index] : FieldAddress("PatchAfterCall");
+        REGDUMP dump{};
+        const bool nativeRead = DbgGetRegDumpEx(reinterpret_cast<REGDUMP_AVX512*>(&dump), sizeof(dump));
+        const ScopedThread thread(DbgGetThreadId());
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
+        const bool read = thread.value && GetThreadContext(thread.value, &context);
+#ifdef _WIN64
+        const duint ip = context.Rip, ax = context.Rax;
+#else
+        const duint ip = context.Eip, ax = context.Eax;
+#endif
+        if(!_plugin_testassert(nativeRead && read && gHitCount.load(std::memory_order_acquire) == hits[index]
+                              && dump.regcontext.cip == expectedIP && ip == expectedIP && dump.regcontext.cax == values[index] && ax == values[index],
+                              "native and independent OS contexts prove that the requested instruction actually executed")) return false;
+        _plugin_logprintf("PATCH_STEP index=%u hits=%u nativeIP=%llx nativeAX=%llx osRead=%u osIP=%llx osAX=%llx flags=%lx dr6=%llx dr7=%llx\n", index, hits[index],
+                          static_cast<unsigned long long>(dump.regcontext.cip), static_cast<unsigned long long>(dump.regcontext.cax), read ? 1 : 0,
+                          static_cast<unsigned long long>(ip), static_cast<unsigned long long>(ax), context.EFlags,
+                          static_cast<unsigned long long>(context.Dr6), static_cast<unsigned long long>(context.Dr7));
+        ++gStepCount;
         return true;
     }
     bool cbFinish(int, char**)
@@ -230,7 +396,7 @@ namespace
         std::array<std::array<char, 9>, 3> markers{};
         if(!ReadTarget("gPatchPhase", phase) || !ReadTarget("gPatchCompleted", completed) || !ReadTarget("gPatchVerified", verified)
                 || !ReadTarget("gPatchValues", values) || !ReadTarget("gPatchMarkers", markers)) return false;
-        if(!_plugin_testassert(phase == 4 && completed == 3 && verified == 1 && values == std::array<DWORD, 3>{7, 42, 7}
+        if(!_plugin_testassert(phase == 4 && completed == 3 && verified == 1 && gStepCount == 7 && values == std::array<DWORD, 3>{7, 42, 7}
                               && strcmp(markers[0].data(), "original") == 0 && strcmp(markers[1].data(), "patched") == 0 && strcmp(markers[2].data(), "original") == 0
                               && DbgValFromString("cip") == FieldAddress("PatchFinish"), "actual target calls and markers prove original, changed and restored execution")) return false;
         _plugin_logprintf("PATCH_RESULT values=%lu/%lu/%lu markers=%s/%s/%s completed=%lu verified=%lu\n", values[0], values[1], values[2],
@@ -251,9 +417,12 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* init)
     gPluginHandle = init->pluginHandle;
     for(const auto type : {CB_INITDEBUG, CB_DEBUGEVENT, CB_BREAKPOINT, CB_EXITPROCESS})
         _plugin_registercallback(gPluginHandle, type, cbPatchEvent);
-    return _plugin_registercommand(gPluginHandle, "patchselect", cbSelect, true)
+    return _plugin_registercommand(gPluginHandle, "patchstep", cbStep, true)
+           && _plugin_registercommand(gPluginHandle, "patchselect", cbSelect, true)
            && _plugin_registercommand(gPluginHandle, "patchprepare", cbPrepare, true)
            && _plugin_registercommand(gPluginHandle, "patchapply", cbApply, true)
+           && _plugin_registercommand(gPluginHandle, "patchwritefailure", cbWriteFailure, true)
+           && _plugin_registercommand(gPluginHandle, "patchfailurefinish", cbFailureFinish, true)
            && _plugin_registercommand(gPluginHandle, "patchundo", cbUndo, true)
            && _plugin_registercommand(gPluginHandle, "patchhit", cbHit, true)
            && _plugin_registercommand(gPluginHandle, "patchfinish", cbFinish, true)

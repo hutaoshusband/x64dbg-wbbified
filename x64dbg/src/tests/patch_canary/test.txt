@@ -22,28 +22,35 @@ patchprepare
 run
 patchhit 0
 sti
+patchstep 0
 testassert cip == patch_canary:PatchValue+5 && eax == 7, "original MOV actually executes"
 testassert cip == patch_canary:PatchValue+5 && dis.isret(cip), "function reaches its actual RET"
 sti
+patchstep 1
 testassert cip == patch_canary:PatchAfterCall && eax == 7, "original function actually returns its canary"
 run
 patchapply
 run
 patchhit 1
 sti
+patchstep 2
 testassert cip == patch_canary:PatchValue+4 && eax == .42, "assembled MOV actually executes"
 sti
+patchstep 3
 testassert cip == patch_canary:PatchValue+5 && dis.isret(cip), "function reaches its actual RET"
 sti
+patchstep 4
 testassert cip == patch_canary:PatchAfterCall && eax == .42, "patched function actually returns its canary"
 run
 patchundo
 run
 patchhit 2
 sti
+patchstep 5
 testassert cip == patch_canary:PatchValue+5 && eax == 7, "restored MOV actually executes"
 testassert cip == patch_canary:PatchValue+5 && dis.isret(cip), "function reaches its actual RET"
 sti
+patchstep 6
 testassert cip == patch_canary:PatchAfterCall && eax == 7, "restored function actually returns its canary"
 run
 patchfinish
