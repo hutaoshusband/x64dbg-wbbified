@@ -25,7 +25,7 @@ INVALID_SCRIPTS = [("missing_file", None, "FileHelper::ReadAllText failed..."),
                    ("missing_branch", "jmp missing\nret\n", 'Invalid branch label "missing" detected on line 1!')]
 
 
-def run_script_session(command, operations, child, timeout, required, required_messages=()):
+def run_script_session(command, operations, child, timeout, required, required_messages=(), observe_line=None):
     output = []
     messages = queue.Queue()
     capture = {"bytes": 0, "truncated": False, "readerError": None}
@@ -67,6 +67,8 @@ def run_script_session(command, operations, child, timeout, required, required_m
                 line = messages.get(timeout=remaining)
                 if line is None:
                     raise McpError("Debugger ended before the requested script observation")
+                if observe_line is not None:
+                    observe_line(line, process, deadline)
                 return line
 
             while language is None:
@@ -551,8 +553,11 @@ def run_script_oracles(environment, results, selected_engine, timeout, fixture_i
                              "receipt": receipt, "negativeControls": [timeout_control]})
         print(f"[VERIFIED] Native {environment.architecture} {engine} script controls, active abort/unload, canceled queued run/step, deferred worker unload, finite reuse and owned deadline", flush=True)
     gui_observations = run_gui_script_oracles(environment, runtime, plugin, engines, timeout)
+    from script_workflow_checks import run_workflow_oracles
+    workflow_observations = run_workflow_oracles(environment, runtime, plugin, engines, timeout, run_owned)
     assert file_identity(binary) == identity, "Script runtime reference changed the existing target"
     results.append({"name": "test_native_script_oracles", "status": "verified", "oracle": {
         "binary": identity, "plugin": file_identity(plugin), "sourceScript": file_identity(source), "branchSourceScript": file_identity(branch_source),
         "interruptionSources": {name: file_identity(path) for name, path in interruption_sources.items()}, "normal": normal, "observations": observations, "guiObservations": gui_observations,
-        "openGates": ["target workflow and artifact", "remaining GUI reentrancy and multi-session ownership", "unload while debug-event yielded", "library workflow and JavaScript", "platform matrix"]}})
+        "workflowObservations": workflow_observations,
+        "openGates": ["remaining GUI reentrancy and multi-session ownership", "yielded abort/error and target ownership", "library workflow and JavaScript", "platform matrix"]}})

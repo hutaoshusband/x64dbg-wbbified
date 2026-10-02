@@ -83,7 +83,6 @@ public:
 
     void DebugLoop()
     {
-        processFromHandleCache.clear();
         threadFromHandleCache.clear();
         Start();
     }
@@ -1086,23 +1085,14 @@ private: //functions
     }
 #pragma warning(pop)
 
-    std::unordered_map<HANDLE, Process*> processFromHandleCache;
-
-    Process* processFromHandle(HANDLE hProcess)
+    std::shared_ptr<Process> processFromHandle(HANDLE hProcess)
     {
-        auto found = processFromHandleCache.find(hProcess);
-        if(found != processFromHandleCache.end())
-            return found->second;
-        auto result = [this, hProcess]() -> Process*
-        {
-            auto foundP = mProcesses.find(GetProcessId(hProcess));
-            if(foundP == mProcesses.end())
-                return nullptr;
-            return foundP->second.get();
-        }();
-        if(result)
-            processFromHandleCache[hProcess] = result;
-        return result;
+        const auto processId = GetProcessId(hProcess);
+        if(!processId)
+            return {};
+        std::lock_guard<std::mutex> lock(mProcessesMutex);
+        const auto found = mProcesses.find(processId);
+        return found == mProcesses.end() ? nullptr : found->second;
     }
 
     static HardwareType hwtypeFromTitan(DWORD type)

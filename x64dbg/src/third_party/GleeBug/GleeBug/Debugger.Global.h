@@ -41,7 +41,7 @@ namespace GleeBug
     typedef std::function<void(const BreakpointInfo & info)> BreakpointCallback;
 
     //map typedefs
-    typedef std::map<uint32, std::unique_ptr<Process>> ProcessMap;
+    typedef std::map<uint32, std::shared_ptr<Process>> ProcessMap;
     typedef std::map<uint32, std::unique_ptr<Thread>> ThreadMap;
     typedef std::map<BreakpointKey, BreakpointInfo> BreakpointMap;
     typedef std::map<BreakpointKey, BreakpointCallback> BreakpointCallbackMap;

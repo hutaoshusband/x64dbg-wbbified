@@ -273,8 +273,11 @@ namespace GleeBug
         }
 
         //cleanup
-        mProcesses.clear();
-        mProcess = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mProcessesMutex);
+            mProcesses.clear();
+            mProcess = nullptr;
+        }
         mIsDebugging = false;
     }
 };

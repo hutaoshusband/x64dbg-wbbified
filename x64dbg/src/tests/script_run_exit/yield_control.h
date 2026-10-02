@@ -200,9 +200,6 @@ namespace ScriptYieldControl
 
     bool Register(int plugin)
     {
-        _plugin_registercallback(plugin, CB_BREAKPOINT, Callback);
-        _plugin_registercallback(plugin, CB_EXITPROCESS, Callback);
-        _plugin_registercallback(plugin, CB_PAUSEDEBUG, Callback);
         return _plugin_registercommand(plugin, "scriptyieldunload", Queue, false);
     }
 }

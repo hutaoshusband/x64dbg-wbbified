@@ -56,7 +56,7 @@ def yield_target_rows(text):
     return rows
 
 
-def observe_script_yield(output, gui, events, model, deadline, capture):
+def configure_target_reads():
     KERNEL.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     KERNEL.OpenProcess.restype = wintypes.HANDLE
     KERNEL.ReadProcessMemory.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.LPVOID, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
@@ -67,6 +67,50 @@ def observe_script_yield(output, gui, events, model, deadline, capture):
     KERNEL.WaitForSingleObject.restype = wintypes.DWORD
     KERNEL.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
     KERNEL.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    KERNEL.GetProcessId.argtypes = [wintypes.HANDLE]
+    KERNEL.GetProcessId.restype = wintypes.DWORD
+
+
+def capture_native_target(handle, fields, model, state_fields=("gPatchMode", "gPatchPhase", "gPatchCompleted", "gPatchPid", "gPatchThread", "gPatchImageBase"), call_values=False):
+    pid = KERNEL.GetProcessId(handle)
+    identity = process_identity(type("TargetHandle", (), {"pid": pid, "_handle": handle})())
+    assert identity == {"pid": int(fields["pid"]), "creationTime": fields["creation"]}, "Independent target handle belongs to a different generation"
+    path, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+    if not KERNEL.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    artifact = file_identity(Path(path.value))
+    assert artifact == model["artifact"], "Actual target executable differs from its private source-built image"
+    base = int(fields["base"], 16)
+
+    def read(address, count):
+        data, copied = (ctypes.c_ubyte * count)(), ctypes.c_size_t()
+        if not KERNEL.ReadProcessMemory(handle, address, data, count, ctypes.byref(copied)) or copied.value != count:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return bytes(data)
+
+    values = {name: int.from_bytes(read(base + model["exports"][name], model["pointerSize"] if name == "gPatchImageBase" else 4), "little")
+              for name in state_fields}
+    code = read(base + model["exports"]["PatchValue"], 6).hex()
+    thread = KERNEL.OpenThread(0x40, False, values["gPatchThread"])
+    if not thread:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        thread_owner = KERNEL.GetProcessIdOfThread(thread)
+    finally:
+        KERNEL.CloseHandle(thread)
+    exit_code = wintypes.DWORD()
+    if not KERNEL.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    snapshot = {"phase": fields["phase"], "processIdentity": identity, "artifact": artifact, "base": base,
+                "values": values, "code": code, "wait": KERNEL.WaitForSingleObject(handle, 0),
+                "exitCode": exit_code.value, "threadOwner": thread_owner}
+    if call_values:
+        snapshot["callValues"] = [int.from_bytes(read(base + model["exports"]["gPatchValues"] + index * 4, 4), "little") for index in range(3)]
+    return snapshot
+
+
+def observe_script_yield(output, gui, events, model, deadline, capture):
+    configure_target_reads()
     capture.update(snapshots=[], terminalObserved=False, exitCode=None)
     handle = None
     try:
@@ -85,37 +129,7 @@ def observe_script_yield(output, gui, events, model, deadline, capture):
                 handle = KERNEL.OpenProcess(0x101010, False, pid)
                 if not handle:
                     raise ctypes.WinError(ctypes.get_last_error())
-            identity = process_identity(type("TargetHandle", (), {"pid": pid, "_handle": handle})())
-            assert identity == {"pid": pid, "creationTime": fields["creation"]}, "Independent target handle belongs to a different generation"
-            path, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
-            if not KERNEL.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size)):
-                raise ctypes.WinError(ctypes.get_last_error())
-            artifact = file_identity(Path(path.value))
-            assert artifact == model["artifact"], "Actual target executable differs from its private source-built image"
-            base = int(fields["base"], 16)
-
-            def read(address, count):
-                data, copied = (ctypes.c_ubyte * count)(), ctypes.c_size_t()
-                if not KERNEL.ReadProcessMemory(handle, address, data, count, ctypes.byref(copied)) or copied.value != count:
-                    raise ctypes.WinError(ctypes.get_last_error())
-                return bytes(data)
-
-            values = {name: int.from_bytes(read(base + model["exports"][name], model["pointerSize"] if name == "gPatchImageBase" else 4), "little")
-                      for name in ("gPatchMode", "gPatchPhase", "gPatchCompleted", "gPatchPid", "gPatchThread", "gPatchImageBase")}
-            code = read(base + model["exports"]["PatchValue"], 6).hex()
-            thread = KERNEL.OpenThread(0x40, False, values["gPatchThread"])
-            if not thread:
-                raise ctypes.WinError(ctypes.get_last_error())
-            try:
-                thread_owner = KERNEL.GetProcessIdOfThread(thread)
-            finally:
-                KERNEL.CloseHandle(thread)
-            exit_code = wintypes.DWORD()
-            if not KERNEL.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                raise ctypes.WinError(ctypes.get_last_error())
-            capture["snapshots"].append({"phase": phase, "processIdentity": identity, "artifact": artifact, "base": base,
-                                         "values": values, "code": code, "wait": KERNEL.WaitForSingleObject(handle, 0),
-                                         "exitCode": exit_code.value, "threadOwner": thread_owner})
+            capture["snapshots"].append(capture_native_target(handle, fields, model))
             assert KERNEL.SetEvent(event), "Owned target observation gate could not resume"
         remaining = max(0, int((deadline - time.monotonic()) * 1000))
         wait = KERNEL.WaitForSingleObject(handle, remaining)
