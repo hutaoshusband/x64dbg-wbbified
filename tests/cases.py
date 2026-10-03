@@ -26,6 +26,8 @@ def test_parity_registry_refresh(output, catalog_path):
     original_bytes = original_path.read_bytes()
     original = json.loads(original_bytes)
     original_hash = hashlib.sha256(original_bytes).hexdigest()
+    native_path = inventory.ROOT / "x64dbg/src/mcp/common/parity_catalog.jsonl"
+    native_bytes = native_path.read_bytes()
     source = inventory.collect_source_inventory()
     previous = {row["id"]: row for row in original["operations"]}
     current = {row["id"]: row for row in source["operations"]}
@@ -58,6 +60,30 @@ def test_parity_registry_refresh(output, catalog_path):
     second.mkdir()
     inventory.run_inventory(second, catalog_path, True, registry_path=candidate)
     assert candidate.read_bytes() == published_bytes, "Repeated refresh changes an unchanged registry"
+    native_candidate = scope / "native-parity.jsonl"
+    inventory.write_native_parity_catalog(native_candidate, published, hashlib.sha256(published_bytes).hexdigest())
+    generated_bytes = native_candidate.read_bytes()
+    generated = [json.loads(line) for line in generated_bytes.splitlines()]
+    assert generated[0]["kind"] == "metadata" and generated[0]["data"]["sourceInputs"] == published["inputs"]
+    assert generated[0]["data"]["baselineManifestSha256"] == hashlib.sha256(published_bytes).hexdigest()
+    assert len(generated[0]["data"]["historicalCaptures"]) == len(published["runtimeCaptures"])
+    for kind, field in (("operation", "operations"), ("binding", "bindings"), ("registration_factory", "registrationFactories"), ("excluded_declaration", "excludedDeclarations")):
+        rows = [row for row in generated[1:] if row["kind"] == kind]
+        assert [row["data"] for row in rows] == published[field]
+        keys = ["parity." + hashlib.sha256(row["id"].encode("utf-8")).hexdigest() if kind == "operation" else str(index) for index, row in enumerate(published[field])]
+        assert [row["key"] for row in rows] == keys
+    inventory.write_native_parity_catalog(native_candidate, published, hashlib.sha256(published_bytes).hexdigest())
+    assert native_candidate.read_bytes() == generated_bytes
+    for field, value in (("status", "verified"), ("agentRoute", "commands_execute"), ("evidence", {"fixture": "unadmitted"})):
+        invalid = copy.deepcopy(published)
+        invalid["operations"][0][field] = value
+        try:
+            inventory.write_native_parity_catalog(native_candidate, invalid, original_hash)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Native parity declarations accepted unimplemented readiness")
+        assert native_candidate.read_bytes() == generated_bytes
     controlled = copy.deepcopy(published)
     touched = next(row for row in controlled["operations"] if row["id"] == "command.inc")
     untouched = next(row for row in controlled["operations"] if row["id"] == "setting.JIT.Old")
@@ -137,12 +163,14 @@ def test_parity_registry_refresh(output, catalog_path):
     next(iter(conflict["runtimeCaptures"].values()))["state"] = "different"
     reject("conflicting-capture", conflict, original)
     assert original_path.read_bytes() == original_bytes
+    assert native_path.read_bytes() == native_bytes, "Private registry tests changed the native product declarations"
     assert candidate.read_bytes() == published_bytes
     write_json(scope / "controls.json", controls)
     return {"name": "test_parity_registry_refresh", "status": "verified", "originalOperations": len(previous),
             "currentSourceOperations": len(current), "retainedOperations": len(retained), "publishedOperations": len(observed),
             "currentSourceInputs": len(source["inputs"]), "idempotentPublication": True, "invalidMetadataControls": len(controls),
-            "controlledEvidenceInvalidation": True, "historicalArchitectureRetention": True, "registry": file_identity(candidate)}
+            "controlledEvidenceInvalidation": True, "historicalArchitectureRetention": True, "nativeProjection": file_identity(native_candidate),
+            "nativeProjectionIdempotent": True, "nativeReadinessControls": 3, "registry": file_identity(candidate)}
 
 
 def test_echo(wi):

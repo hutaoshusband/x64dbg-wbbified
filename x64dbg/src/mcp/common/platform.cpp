@@ -174,6 +174,24 @@ NativeImageIdentity current_image()
 }
 }
 
+Checked<std::string> sha256_bytes(std::string_view bytes)
+{
+    if(bytes.size() > MaximumFrameBytes)
+        return ContractError{"payload_limit", "", "Hash input exceeds the frame bound"};
+    try
+    {
+        Sha256 digest;
+        std::vector<unsigned char> input(bytes.begin(), bytes.end());
+        if(!input.empty())
+            digest.add(input.data(), static_cast<ULONG>(input.size()));
+        return digest.finish();
+    }
+    catch(const std::exception& error)
+    {
+        return ContractError{"native_failure", "", error.what()};
+    }
+}
+
 Checked<NativeProcessIdentity> capture_current_process()
 {
     try

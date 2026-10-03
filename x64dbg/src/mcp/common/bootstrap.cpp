@@ -2,6 +2,7 @@
 #include "ipc.h"
 #include "registry.h"
 #include "legacy_aliases.h"
+#include "parity_catalog.h"
 #include "build_identity.h"
 #include <iostream>
 
@@ -19,6 +20,7 @@ Checked<Json> component_build_info(NativeComponent component)
     return Json{{"schemaVersion", ContractVersion}, {"component", names[static_cast<std::size_t>(component)]},
         {"buildId", BuildId}, {"wireVersion", IpcWireVersion}, {"process", std::move(process)},
         {"declaredToolCount", tool_registry().size()}, {"declaredLegacyAliasCount", legacy_alias_registry().size()},
+        {"declaredParityOperationCount", compiled_parity_metadata().at("recordCounts").at("operation")},
         {"implementedTransports", Json::array()}, {"operationalTools", Json::array()}};
 }
 

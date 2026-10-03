@@ -1,6 +1,8 @@
 #include "contracts.h"
 #include "registry.h"
 #include "legacy_aliases.h"
+#include "parity_catalog.h"
+#include "platform.h"
 #include "lifecycle.h"
 #include "ipc.h"
 #include "worker.h"
@@ -227,6 +229,39 @@ int main(int argc, char** argv)
             reply = compiled_contracts();
         else if(mode == "registry" && argc == 2)
             reply = compiled_tool_registry();
+        else if(mode == "parity-metadata" && argc == 2)
+            reply = compiled_parity_metadata();
+        else if(mode == "parity-dispatch-check" && argc == 2)
+        {
+            reply = {{"rejectedActionIds", Json::array()}};
+            Json request = {{"limit", MaximumPageLimit}};
+            for(;;)
+            {
+                const auto page = parity_records_page(request);
+                if(const auto* error = std::get_if<ContractError>(&page))
+                    throw std::runtime_error(error->message);
+                const auto& value = std::get<Json>(page);
+                for(const auto& item : value.at("items"))
+                {
+                    const auto actionId = item.at("actionId").get<std::string>();
+                    const auto result = call_registry_tool(actionId, Json::object(), {{"operation-fixture"}, 1, 1});
+                    const auto* error = std::get_if<ContractError>(&result);
+                    if(!error || error->code != "unsupported_capability")
+                        throw std::runtime_error("Planned parity declaration was admitted to operational dispatch");
+                    reply["rejectedActionIds"].push_back(actionId);
+                }
+                if(!value.at("hasMore").get<bool>())
+                    break;
+                request["cursor"] = value.at("nextCursor");
+            }
+        }
+        else if((mode == "parity-describe" || mode == "parity-resolve") && argc == 3)
+        {
+            const auto value = mode == "parity-describe" ? describe_parity_operation(argv[2]) : resolve_parity_inventory_id(argv[2]);
+            reply = checked_reply(value);
+            if(const auto* record = std::get_if<Json>(&value))
+                reply["record"] = *record;
+        }
         else if(mode == "legacy-registry" && argc == 2)
             reply = compiled_legacy_registry();
         else if(mode == "legacy-describe" && argc == 3)
@@ -251,6 +286,13 @@ int main(int argc, char** argv)
             const auto bytes = read_input();
             if(const auto error = std::get_if<ContractError>(&bytes))
                 reply = {{"valid", false}, {"error", error_json(*error)}};
+            else if(mode == "sha256" && argc == 2)
+            {
+                const auto value = sha256_bytes(std::get<std::string>(bytes));
+                reply = checked_reply(value);
+                if(const auto* hash = std::get_if<std::string>(&value))
+                    reply["sha256"] = *hash;
+            }
             else if(mode == "http" && argc == 2)
                 reply = http_probe(std::get<std::string>(bytes));
             else if(mode == "ipc-header" && argc == 2)
@@ -278,7 +320,26 @@ int main(int argc, char** argv)
                 else
                 {
                     const auto& input = std::get<Json>(parsed);
-                    if(mode == "legacy-input" && argc == 3)
+                    if(mode == "parity-resolve-input" && argc == 2)
+                    {
+                        if(const auto error = validate_schema(string_schema("utf8-text", 16384), input))
+                            reply = {{"valid", false}, {"error", error_json(*error)}};
+                        else
+                        {
+                            const auto value = resolve_parity_inventory_id(input.get<std::string>());
+                            reply = checked_reply(value);
+                            if(const auto* record = std::get_if<Json>(&value))
+                                reply["record"] = *record;
+                        }
+                    }
+                    else if(mode == "parity-page" && argc == 2)
+                    {
+                        const auto page = parity_records_page(input);
+                        reply = checked_reply(page);
+                        if(const auto* value = std::get_if<Json>(&page))
+                            reply["page"] = *value;
+                    }
+                    else if(mode == "legacy-input" && argc == 3)
                     {
                         const auto arguments = normalize_legacy_alias_input(argv[2], input);
                         reply = checked_reply(arguments);

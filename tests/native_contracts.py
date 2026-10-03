@@ -17,7 +17,7 @@ from wi_driver import KERNEL, McpError, OwnedJob, ROOT, compiler_environment, fi
 
 
 CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_context_roundtrip",
-              "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser", "test_legacy_alias_contracts",
+              "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser", "test_legacy_alias_contracts", "test_native_parity_catalog",
               "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
@@ -83,6 +83,9 @@ def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None, 
         configure.append(f"-DQt5_DIR={qt}")
     commands = []
     source_paths = [source / "cmake.toml", source / "CMakeLists.txt", *sorted((source / "src/mcp").rglob("*")), *sorted((source / "src/dbg/mcp").rglob("*"))]
+    parity_header = json.loads((source / "src/mcp/common/parity_catalog.jsonl").open(encoding="ascii").readline())["data"]
+    source_paths.extend(ROOT / entry["path"] for entry in parity_header["sourceInputs"])
+    source_paths = list(dict.fromkeys(source_paths))
     source_inputs = [file_identity(path) for path in source_paths if path.is_file()]
     with (build / "build.log").open("w", encoding="utf-8") as log:
         for command in (configure, [str(cmake_path), "--build", str(build), "--target", "mcp_contract_fixture", "mcp_launch_reference", "mcp_broker", "mcp_connect", "mcp_worker", "--parallel", "6"]):
@@ -152,6 +155,7 @@ class ContractProbe:
             process.communicate()
             raise
         observation = {"command": command, "inputSha256": hashlib.sha256(payload).hexdigest(), "inputSize": len(payload),
+                       "stdoutSize": len(stdout), "stdoutSha256": hashlib.sha256(stdout).hexdigest(),
                        "processIdentity": identity, "exitCode": process.returncode, "expectedExitCode": expected_exit,
                        "timedOut": timed_out, "stderr": stderr.decode("utf-8", "replace")}
         self.observations.append(observation)
@@ -1833,15 +1837,130 @@ def file_handle_oracle(binary):
         KERNEL.CloseHandle(handle)
 
 
+def check_native_parity_catalog(probe, catalog):
+    baseline_path = ROOT / "tests/native_mcp/parity-manifest.json"
+    baseline_bytes = baseline_path.read_bytes()
+    baseline = json.loads(baseline_bytes)
+    collections = {"operation": baseline["operations"], "binding": baseline["bindings"],
+                   "registration_factory": baseline["registrationFactories"], "excluded_declaration": baseline["excludedDeclarations"]}
+    counts = {kind: len(rows) for kind, rows in collections.items()}
+    assert counts == {"operation": 3940, "binding": 1623, "registration_factory": 29, "excluded_declaration": 87}
+    metadata = probe.call("parity-metadata")
+    captures = [{"captureRef": "runtimeCaptures." + key, "architecture": value["architecture"], "state": value["state"],
+                 "snapshotSha256": value["snapshot"]["sha256"], "receiptSha256": value["captureReceiptSha256"],
+                 "modules": value["loadedModules"], "currentRuntimeProof": False} for key, value in baseline["runtimeCaptures"].items()]
+    expected_metadata = {"schemaVersion": 1, "baselineManifestSha256": hashlib.sha256(baseline_bytes).hexdigest(),
+                         "sourceInputs": baseline["inputs"], "categories": baseline["categories"], "recordCounts": counts,
+                         "historicalCaptures": captures, "coverageGaps": baseline["coverageGaps"], "buildId": catalog["buildId"],
+                         "operationalActionIds": [], "runtimeValidated": False}
+    assert metadata == expected_metadata
+    build = json.loads((probe.binary.parent / "build-manifest.json").read_text(encoding="utf-8"))
+    for entry in baseline["inputs"]:
+        assert file_identity(ROOT / entry["path"])["sha256"] == entry["sha256"]
+        assert file_identity(ROOT / entry["path"]) in build["sourceInputs"]
+    action_ids = {row["id"]: "parity." + hashlib.sha256(row["id"].encode("utf-8")).hexdigest() for row in collections["operation"]}
+    assert len(set(action_ids.values())) == counts["operation"]
+    def operation(row):
+        return {"actionId": action_ids[row["id"]], "inventory": row, "availability": "planned", "operational": False,
+                "executionAdapterInstalled": False, "runtimeRegistrationBound": False, "classification": "unknown"}
+    expected = {kind: sorted((operation(row) for row in rows), key=lambda row: row["actionId"]) if kind == "operation" else
+                [{"key": str(index), "data": row} for index, row in enumerate(rows)] for kind, rows in collections.items()}
+    def events(value):
+        if isinstance(value, dict):
+            return 3 + sum(1 + events(child) for child in value.values())
+        if isinstance(value, list):
+            return 3 + sum(events(child) for child in value)
+        return 1
+    pages = []
+    cursors = []
+    def collect(request):
+        query = dict(request)
+        items = []
+        seen = set()
+        for _ in range(counts[query.get("kind", "operation")] + 1):
+            response = probe.call("parity-page", query)
+            assert response["valid"], response
+            page = response["page"]
+            assert set(page) == {"schemaVersion", "buildId", "kind", "items", "hasMore", "nextCursor", "snapshotRecordCount", "operational"}
+            assert page["schemaVersion"] == 1 and page["buildId"] == metadata["buildId"] and not page["operational"]
+            assert page["kind"] == query.get("kind", "operation") and page["snapshotRecordCount"] == str(counts[page["kind"]])
+            assert len(page["items"]) <= query.get("limit", 100)
+            assert probe.observations[-1]["stdoutSize"] <= 8 * 1024 * 1024 and events(response) <= 100000
+            pages.append({"kind": page["kind"], "rows": len(page["items"]), "stdoutSize": probe.observations[-1]["stdoutSize"], "events": events(response)})
+            items.extend(page["items"])
+            if not page["hasMore"]:
+                assert page["nextCursor"] is None
+                return items
+            cursor = page["nextCursor"]
+            assert isinstance(cursor, str) and cursor not in seen and len(cursor) <= 4096
+            seen.add(cursor)
+            cursors.append((dict(request), cursor))
+            query["cursor"] = cursor
+        raise AssertionError("Parity pagination failed to reach its finite compiled snapshot")
+    for kind in collections:
+        assert collect({"kind": kind, "limit": 1000}) == expected[kind]
+    assert any(page["kind"] == "operation" and 0 < page["rows"] < 1000 for page in pages), "Native event bound was not exercised"
+    categories = sorted(baseline["categories"])
+    queries = [{"category": category, "limit": 1000} for category in categories]
+    queries += [{"architecture": name, "limit": 1000} for name in ("x32", "x64")]
+    queries += [{"provider": name, "limit": 1000} for name in sorted({row["provider"] for row in collections["operation"]})]
+    queries += [{"category": "unknown-category", "limit": 7}, {"provider": "unknown-provider", "limit": 1}]
+    for query in queries:
+        rows = [item for item in expected["operation"] if
+                all(value in item["inventory"]["architectures"] if key == "architecture" else item["inventory"][key] == value
+                    for key, value in query.items() if key != "limit")]
+        assert collect(query) == rows
+    small = probe.call("parity-page", {"limit": 1})
+    assert small["valid"] and small["page"]["items"] == expected["operation"][:1]
+    assert probe.call("parity-page", {"limit": 2, "cursor": small["page"]["nextCursor"]})["page"]["items"] == expected["operation"][1:3]
+    assert probe.call("parity-page", {})["page"]["items"] == expected["operation"][:100]
+    request, cursor = cursors[0]
+    prefix = cursor.rsplit(":", 1)[0] + ":"
+    terminal = probe.call("parity-page", {**request, "cursor": prefix + str(counts["operation"])})
+    assert terminal["valid"] and terminal["page"]["items"] == [] and terminal["page"]["nextCursor"] is None
+    invalid = [[], None, 7, {"limit": 0}, {"limit": 1001}, {"limit": True}, {"limit": "1"}, {"unknown": 1},
+               {"kind": "metadata"}, {"category": 1}, {"provider": None}, {"architecture": "arm64"}, {"category": "x" * 129},
+               {"provider": "a\0b"}, {"cursor": "x" * 4097}, {"cursor": "wrong"}, {"kind": "binding", "category": "command"},
+               {**request, "cursor": cursor, "provider": "changed"}, {"kind": "binding", "cursor": cursor},
+               {**request, "cursor": cursor.replace(metadata["buildId"], "0" * 64)},
+               *({**request, "cursor": prefix + suffix} for suffix in ("-1", "01", "", "18446744073709551616", "3941", "18446744073709551615"))]
+    for value in invalid:
+        response = probe.call("parity-page", raw=json.dumps(value).encode("utf-8"))
+        assert not response["valid"] and response["error"]["code"] == "invalid_argument", response
+    selected = {next(row["id"] for row in collections["operation"] if row["category"] == name) for name in categories}
+    selected.add(next(name for name in action_ids if not re.fullmatch(r"[A-Za-z0-9_.:-]+", name)))
+    selected.update(name for name in action_ids if not name.isascii())
+    for name in sorted(selected):
+        record = next(item for item in expected["operation"] if item["inventory"]["id"] == name)
+        assert probe.call("parity-describe", argument=action_ids[name]) == {"valid": True, "record": record}
+        assert probe.call("parity-resolve-input", name) == {"valid": True, "record": record}
+    for mode, name in (("parity-describe", "parity." + "0" * 64), ("parity-describe", next(iter(action_ids.values())).upper()),
+                       ("parity-resolve", "absent.inventory"), ("parity-resolve", "COMMAND.INC")):
+        response = probe.call(mode, argument=name)
+        assert not response["valid"] and response["error"]["code"] == "unsupported_capability"
+    dispatched = probe.call("parity-dispatch-check")
+    assert dispatched == {"rejectedActionIds": sorted(action_ids.values())}
+    vectors = [b"", b"abc", "Hu Tao ❤ 😀".encode("utf-8"), b"a\0b", bytes(range(256)) * 4096]
+    for raw in vectors:
+        assert probe.call("sha256", raw=raw) == {"valid": True, "sha256": hashlib.sha256(raw).hexdigest()}
+    assert probe.call("sha256", raw=b"x" * (8 * 1024 * 1024 + 1))["error"]["code"] == "payload_limit"
+    assert baseline_path.read_bytes() == baseline_bytes
+    write_json(probe.output / "parity-pages.json", pages)
+    return {"baselineManifest": file_identity(baseline_path), "compiledMetadata": metadata, "completeRecordComparisons": counts,
+            "boundedPages": len(pages), "filteredQueries": len(queries), "rejectedPageInputs": len(invalid),
+            "exactLookupPairs": len(selected), "unavailableDispatchRejected": len(action_ids), "sha256Vectors": len(vectors)}
+
+
 def check_native_components(probe, architecture, validators, catalog):
     expected_token, token_queries = parent_token_oracle()
     observations = []
     def verify(information, identity, binary, component):
-        assert set(information) == {"schemaVersion", "component", "buildId", "wireVersion", "process", "declaredToolCount", "declaredLegacyAliasCount", "implementedTransports", "operationalTools"}
+        assert set(information) == {"schemaVersion", "component", "buildId", "wireVersion", "process", "declaredToolCount", "declaredLegacyAliasCount", "declaredParityOperationCount", "implementedTransports", "operationalTools"}
         assert information["schemaVersion"] == information["wireVersion"] == 1 and information["component"] == component
         assert information["buildId"] == catalog["buildId"] and information["declaredToolCount"] == len(catalog["tools"])
         assert information["implementedTransports"] == information["operationalTools"] == []
         assert information["declaredLegacyAliasCount"] == 80
+        assert information["declaredParityOperationCount"] == 3940
         process = information["process"]
         assert validators["NativeProcessIdentity"].is_valid(process)
         assert {key: process[key] for key in identity} == identity and process["architecture"] == architecture
@@ -1997,6 +2116,8 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_registry_contracts(probe, registry, tool_validators))
             elif name == "test_legacy_alias_contracts":
                 result.update(check_legacy_alias_contracts(probe, registry))
+            elif name == "test_native_parity_catalog":
+                result.update(check_native_parity_catalog(probe, catalog))
             elif name == "test_registry_dispatch":
                 result.update(check_registry_dispatch(probe, registry, tool_validators))
             elif name == "test_schema_references":

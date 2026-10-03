@@ -26,6 +26,7 @@ struct NativeProcessIdentity
     NativeImageIdentity image;
 };
 
+Checked<std::string> sha256_bytes(std::string_view bytes);
 Checked<NativeProcessIdentity> capture_current_process();
 Json native_process_json(const NativeProcessIdentity& identity);
 }

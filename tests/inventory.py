@@ -1301,7 +1301,7 @@ def merge_recorded_registry(current, previous, previous_sha256):
     return merged, report
 
 
-def write_parity_registry(path, inventory):
+def parity_registry_content(inventory):
     fields = []
     for name, value in inventory.items():
         if name in ("inputs", "operations", "bindings", "registrationFactories", "excludedDeclarations"):
@@ -1310,7 +1310,39 @@ def write_parity_registry(path, inventory):
         else:
             serialized = json.dumps(value, indent=2, ensure_ascii=False).replace("\n", "\n  ")
         fields.append("  " + json.dumps(name) + ": " + serialized)
-    Path(path).write_text("{\n" + ",\n".join(fields) + "\n}\n", encoding="utf-8", newline="\n")
+    return "{\n" + ",\n".join(fields) + "\n}\n"
+
+
+def write_parity_registry(path, inventory):
+    Path(path).write_text(parity_registry_content(inventory), encoding="utf-8", newline="\n")
+
+
+def native_parity_catalog_content(inventory, manifest_sha256):
+    validate_recorded_registry(inventory)
+    if not isinstance(manifest_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256):
+        raise ValueError("Native parity source requires a baseline SHA-256")
+    if any(row["status"] != "planned" or row["agentRoute"] is not None or row["evidence"] is not None for row in inventory["operations"]):
+        raise ValueError("Native declaration discovery cannot publish unimplemented operational routes or readiness")
+    captures = []
+    for key, value in inventory.get("runtimeCaptures", {}).items():
+        captures.append({"captureRef": "runtimeCaptures." + key, "architecture": value["architecture"], "state": value["state"],
+                         "snapshotSha256": value["snapshot"]["sha256"], "receiptSha256": value["captureReceiptSha256"],
+                         "modules": value["loadedModules"], "currentRuntimeProof": False})
+    collections = {"operation": inventory["operations"], "binding": inventory["bindings"],
+                   "registration_factory": inventory["registrationFactories"], "excluded_declaration": inventory["excludedDeclarations"]}
+    metadata = {"schemaVersion": 1, "baselineManifestSha256": manifest_sha256, "sourceInputs": inventory["inputs"],
+                "categories": inventory["categories"], "recordCounts": {key: len(rows) for key, rows in collections.items()},
+                "historicalCaptures": captures, "coverageGaps": inventory["coverageGaps"]}
+    records = [{"kind": "metadata", "data": metadata}]
+    for kind, rows in collections.items():
+        for index, row in enumerate(rows):
+            key = "parity." + hashlib.sha256(row["id"].encode("utf-8")).hexdigest() if kind == "operation" else str(index)
+            records.append({"kind": kind, "key": key, "data": row})
+    return "".join(json.dumps(row, ensure_ascii=True, separators=(",", ":")) + "\n" for row in records)
+
+
+def write_native_parity_catalog(path, inventory, manifest_sha256):
+    Path(path).write_text(native_parity_catalog_content(inventory, manifest_sha256), encoding="ascii", newline="\n")
 
 
 def run_inventory(output, catalog_path, refresh, surface_paths=None, registry_path=None):
@@ -1319,6 +1351,7 @@ def run_inventory(output, catalog_path, refresh, surface_paths=None, registry_pa
         surface_paths = [surface_paths]
     for surface_path in surface_paths or []:
         merge_runtime_surface(inventory, surface_path)
+    native_refresh = registry_path is None
     registry_path = Path(registry_path) if registry_path is not None else REGISTRY_DIRECTORY / "parity-manifest.json"
     prior_reconciliation = None
     if registry_path.is_file():
@@ -1328,6 +1361,9 @@ def run_inventory(output, catalog_path, refresh, surface_paths=None, registry_pa
     reconciliation = reconcile_legacy_catalog(catalog_path)
     write_json(Path(output) / "legacy-reconciliation.json", reconciliation)
     if refresh:
+        native_content = native_parity_catalog_content(inventory, hashlib.sha256(parity_registry_content(inventory).encode("utf-8")).hexdigest()) if native_refresh else None
         write_parity_registry(registry_path, inventory)
+        if native_refresh:
+            (ROOT / "x64dbg/src/mcp/common/parity_catalog.jsonl").write_text(native_content, encoding="ascii", newline="\n")
     return {"legacy": reconciliation, "categories": inventory["categories"],
             "sourceInputs": len(inventory["inputs"]), "coverageGaps": inventory["coverageGaps"], "priorReconciliation": prior_reconciliation}
