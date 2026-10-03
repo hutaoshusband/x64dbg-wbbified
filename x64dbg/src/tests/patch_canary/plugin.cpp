@@ -286,6 +286,121 @@ namespace
         return ReadTarget("gPatchMode", mode) && ReadTarget("gPatchMutation", mutation) && CheckTracking(false)
                && _plugin_testassert(mode == 1 && mutation == 1, "reference mode and mutation read back exactly");
     }
+    bool ObserveRestoreBytes(unsigned scenario, const char* phase, duint allocation, duint address, const std::vector<unsigned char>& replacement, unsigned trackedMask, unsigned changedMask, unsigned reservedMask)
+    {
+        const ScopedProcess process(DbgGetProcessId());
+        size_t total = 0;
+        if(!_plugin_testassert(process.value && !DbgIsRunning() && DbgFunctions()->PatchEnum(nullptr, &total), "restore observation uses a live paused target")) return false;
+        unsigned trackedCount = 0;
+        bool valid = true;
+        for(unsigned index = 0; index < replacement.size(); ++index)
+        {
+            DBGPATCHINFO record{};
+            const bool tracked = DbgFunctions()->PatchGetEx(address + index, &record);
+            trackedCount += tracked ? 1 : 0;
+            MEMORY_BASIC_INFORMATION region{};
+            unsigned char logical = 0, raw = 0;
+            SIZE_T read = 0;
+            const bool logicalRead = DbgMemRead(address + index, &logical, 1);
+            SetLastError(ERROR_SUCCESS);
+            const bool rawRead = ReadProcessMemory(process.value, reinterpret_cast<void*>(address + index), &raw, 1, &read) != FALSE;
+            const DWORD error = GetLastError();
+            const bool queried = VirtualQueryEx(process.value, reinterpret_cast<void*>(address + index), &region, sizeof(region)) == sizeof(region);
+            const bool reserved = (reservedMask & (1u << index)) != 0;
+            const unsigned char expected = changedMask & (1u << index) ? replacement[index] : 0x5a;
+            _plugin_logprintf("PATCH_RESTORE_BYTE scenario=%u phase=%s index=%u address=%llx allocation=%llx tracked=%u old=%02x new=%02x state=%lx protection=%lx logicalRead=%u logical=%02x rawRead=%u raw=%02x read=%llu error=%lu paused=%u\n",
+                              scenario, phase, index, static_cast<unsigned long long>(address + index), static_cast<unsigned long long>(allocation), unsigned(tracked),
+                              tracked ? record.oldbyte : 0, tracked ? record.newbyte : 0, region.State, region.Protect, unsigned(logicalRead), logical,
+                              unsigned(rawRead), raw, static_cast<unsigned long long>(read), error, unsigned(!DbgIsRunning()));
+            valid = valid && queried && region.AllocationBase == reinterpret_cast<void*>(allocation)
+                    && tracked == ((trackedMask & (1u << index)) != 0)
+                    && (!tracked || (record.addr == address + index && record.oldbyte == 0x5a && record.newbyte == replacement[index] && record.mod[0] == 0))
+                    && region.State == DWORD(reserved ? MEM_RESERVE : MEM_COMMIT)
+                    && (reserved ? (!logicalRead && !rawRead && read == 0 && error == ERROR_PARTIAL_COPY)
+                        : (region.Type == MEM_PRIVATE && region.Protect == PAGE_EXECUTE_READ && logicalRead && rawRead && read == 1 && logical == expected && raw == expected));
+        }
+        _plugin_logprintf("PATCH_RESTORE_COUNT scenario=%u phase=%s tracked=%u total=%llu paused=%u\n", scenario, phase, trackedCount,
+                          static_cast<unsigned long long>(total / sizeof(DBGPATCHINFO)), unsigned(!DbgIsRunning()));
+        return _plugin_testassert(valid && total == trackedCount * sizeof(DBGPATCHINFO), "restore phase keeps exact native bytes and only unresolved records");
+    }
+    bool cbRestoreFailure(int, char**)
+    {
+        if(!CheckPhase(1, {0, 0, 0}) || !CheckTracking(false)) return false;
+        uintptr_t allocation = 0;
+        if(!ReadTarget("gPatchWriteFailureRegion", allocation)) return false;
+        const ScopedProcess process(DbgGetProcessId(), PROCESS_VM_WRITE | PROCESS_VM_OPERATION);
+        MEMORY_BASIC_INFORMATION first{}, second{};
+        if(!_plugin_testassert(process.value && allocation && (allocation & 0xfff) == 0
+                              && VirtualQueryEx(process.value, reinterpret_cast<void*>(allocation), &first, sizeof(first)) == sizeof(first)
+                              && first.State == MEM_COMMIT && first.Type == MEM_PRIVATE && first.Protect == PAGE_EXECUTE_READ
+                              && VirtualQueryEx(process.value, reinterpret_cast<void*>(allocation + 0x1000), &second, sizeof(second)) == sizeof(second)
+                              && second.State == MEM_RESERVE && second.AllocationBase == reinterpret_cast<void*>(allocation), "restore fixture owns one committed and one reserved page")) return false;
+        const auto writePage = [&](duint page, const std::array<unsigned char, 0x1000>& bytes)
+        {
+            SIZE_T written = 0;
+            DWORD previous = 0;
+            return VirtualAllocEx(process.value, reinterpret_cast<void*>(page), bytes.size(), MEM_COMMIT, PAGE_EXECUTE_READWRITE) == reinterpret_cast<void*>(page)
+                   && WriteProcessMemory(process.value, reinterpret_cast<void*>(page), bytes.data(), bytes.size(), &written) && written == bytes.size()
+                   && VirtualProtectEx(process.value, reinterpret_cast<void*>(page), bytes.size(), PAGE_EXECUTE_READ, &previous) && previous == PAGE_EXECUTE_READWRITE
+                   && FlushInstructionCache(process.value, reinterpret_cast<void*>(page), bytes.size());
+        };
+        const auto restore = [&](unsigned scenario, const char* phase, duint address, unsigned size)
+        {
+            unsigned result = 0;
+            if(scenario == 0)
+            {
+                for(unsigned index = 0; index < size; ++index)
+                    if(DbgFunctions()->PatchRestore(address + index)) result |= 1u << index;
+            }
+            else
+                DbgFunctions()->PatchRestoreRange(address, address + size - 1);
+            _plugin_logprintf("PATCH_RESTORE_CALL scenario=%u phase=%s api=%s address=%llx size=%u result=%u paused=%u\n", scenario, phase,
+                              scenario == 0 ? "byte" : "range_void", static_cast<unsigned long long>(address), size, result, unsigned(!DbgIsRunning()));
+            return scenario != 0 || result == (strcmp(phase, "failure") == 0 ? 0u : (1u << size) - 1);
+        };
+        std::array<unsigned char, 0x1000> original{};
+        original.fill(0x5a);
+        for(unsigned scenario = 0; scenario < 2; ++scenario)
+        {
+            const std::vector<unsigned char> replacement = scenario == 0 ? std::vector<unsigned char>{0x5b, 0x5c} : std::vector<unsigned char>{0x5b, 0x5c, 0x5d, 0x5e};
+            const duint address = allocation + (scenario == 0 ? 0x80 : 0xffe);
+            const duint failedPage = allocation + (scenario == 0 ? 0 : 0x1000);
+            const unsigned completeMask = (1u << replacement.size()) - 1;
+            const unsigned failedMask = scenario == 0 ? completeMask : 12;
+            if(scenario == 1 && !_plugin_testassert(writePage(failedPage, original), "range fixture commits only its declared second private page")) return false;
+            if(!_plugin_testassert(DbgFunctions()->MemPatch(address, replacement.data(), replacement.size()), "restore fixture installs genuine tracked native bytes")) return false;
+            if(!ObserveRestoreBytes(scenario, "initial", allocation, address, replacement, completeMask, completeMask, 0)) return false;
+            if(!_plugin_testassert(VirtualFreeEx(process.value, reinterpret_cast<void*>(failedPage), 0x1000, MEM_DECOMMIT), "failed restoration uses genuine owned-page decommit")) return false;
+            const bool result = restore(scenario, "failure", address, unsigned(replacement.size()));
+            const bool retained = ObserveRestoreBytes(scenario, "failed", allocation, address, replacement, failedMask, 0, failedMask);
+            if(!_plugin_testassert(result && retained, "failed restoration retains exact unresolved originals and rejects byte success")) return false;
+            auto repaired = original;
+            for(unsigned index = 0; index < replacement.size(); ++index)
+                if(failedMask & (1u << index)) repaired[address + index - failedPage] = replacement[index];
+            if(!_plugin_testassert(writePage(failedPage, repaired), "retry repairs native accessibility while keeping unresolved installed bytes")) return false;
+            if(!ObserveRestoreBytes(scenario, "repaired", allocation, address, replacement, failedMask, failedMask, 0)) return false;
+            if(!_plugin_testassert(restore(scenario, "retry", address, unsigned(replacement.size())), "native retry reports actual byte restoration")) return false;
+            if(!ObserveRestoreBytes(scenario, "restored", allocation, address, replacement, 0, 0, 0)) return false;
+            for(unsigned page = 0; page <= scenario; ++page)
+            {
+                std::array<unsigned char, 0x1000> actual{};
+                MEMORY_BASIC_INFORMATION region{};
+                SIZE_T read = 0;
+                const duint pageAddress = allocation + page * 0x1000;
+                if(!_plugin_testassert(ReadProcessMemory(process.value, reinterpret_cast<void*>(pageAddress), actual.data(), actual.size(), &read) && read == actual.size() && actual == original
+                                      && VirtualQueryEx(process.value, reinterpret_cast<void*>(pageAddress), &region, sizeof(region)) == sizeof(region)
+                                      && region.State == MEM_COMMIT && region.Type == MEM_PRIVATE && region.Protect == PAGE_EXECUTE_READ, "retry restores every original private page byte and RX protection")) return false;
+                _plugin_logprintf("PATCH_RESTORE_PAGE scenario=%u page=%u address=%llx read=%llu content=5a state=%lx protection=%lx\n", scenario, page,
+                                  static_cast<unsigned long long>(pageAddress), static_cast<unsigned long long>(read), region.State, region.Protect);
+            }
+            if(scenario == 1 && !_plugin_testassert(VirtualFreeEx(process.value, reinterpret_cast<void*>(failedPage), 0x1000, MEM_DECOMMIT), "range fixture returns its second page to its original reserved state")) return false;
+        }
+        if(!_plugin_testassert(VirtualQueryEx(process.value, reinterpret_cast<void*>(allocation + 0x1000), &second, sizeof(second)) == sizeof(second)
+                              && second.State == MEM_RESERVE && CheckTracking(false), "restore fixture leaves its original reservation and empty tracking")) return false;
+        _plugin_logprintf("PATCH_RESTORE_DONE allocation=%llx scenarios=2 reserved=%lx paused=%u\n", static_cast<unsigned long long>(allocation), second.State, unsigned(!DbgIsRunning()));
+        return true;
+    }
+
     bool cbSingleArm(int, char**)
     {
         const auto address = FieldAddress("PatchValue");
@@ -593,7 +708,8 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* init)
     gPluginHandle = init->pluginHandle;
     for(const auto type : {CB_INITDEBUG, CB_DEBUGEVENT, CB_BREAKPOINT, CB_EXITPROCESS})
         _plugin_registercallback(gPluginHandle, type, cbPatchEvent);
-    return _plugin_registercommand(gPluginHandle, "patchsinglearm", cbSingleArm, true)
+    return _plugin_registercommand(gPluginHandle, "patchrestorefailure", cbRestoreFailure, true)
+           && _plugin_registercommand(gPluginHandle, "patchsinglearm", cbSingleArm, true)
            && _plugin_registercommand(gPluginHandle, "patchstep", cbStep, true)
            && _plugin_registercommand(gPluginHandle, "patchselect", cbSelect, true)
            && _plugin_registercommand(gPluginHandle, "patchprepare", cbPrepare, true)

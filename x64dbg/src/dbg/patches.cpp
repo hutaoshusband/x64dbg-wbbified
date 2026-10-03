@@ -100,7 +100,12 @@ bool PatchDelete(duint Address, bool Restore)
 
     // Restore the original byte at this address
     if(Restore)
-        MemWrite((found->second.addr + ModBaseFromAddr(Address)), &found->second.oldbyte, sizeof(char));
+    {
+        const duint address = found->second.addr + ModBaseFromAddr(Address);
+        unsigned char restored = 0;
+        if(!MemWrite(address, &found->second.oldbyte, sizeof(char)) || !MemRead(address, &restored, sizeof(restored)) || restored != found->second.oldbyte)
+            return false;
+    }
 
     // Finally remove it from the list
     patches.erase(found);
