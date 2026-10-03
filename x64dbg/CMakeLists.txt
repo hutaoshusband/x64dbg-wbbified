@@ -1229,6 +1229,8 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/patch_transaction.h"
 		"src/mcp/common/patch_types.cpp"
 		"src/mcp/common/patch_types.h"
+		"src/mcp/common/pe_file_patch.cpp"
+		"src/mcp/common/pe_file_patch.h"
 		"src/mcp/common/platform.cpp"
 		"src/mcp/common/platform.h"
 		"src/mcp/common/provider_ui_tools.cpp"

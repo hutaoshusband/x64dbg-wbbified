@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <bcrypt.h>
 #include <sddl.h>
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <stdexcept>
@@ -184,6 +185,31 @@ Checked<std::string> sha256_bytes(std::string_view bytes)
         std::vector<unsigned char> input(bytes.begin(), bytes.end());
         if(!input.empty())
             digest.add(input.data(), static_cast<ULONG>(input.size()));
+        return digest.finish();
+    }
+    catch(const std::exception& error)
+    {
+        return ContractError{"native_failure", "", error.what()};
+    }
+}
+
+Checked<std::string> sha256_file_bytes(std::string_view bytes)
+{
+    constexpr std::size_t maximum_file_bytes = 512 * 1024 * 1024;
+    if(bytes.size() > maximum_file_bytes)
+        return ContractError{"resource_limit", "", "File hash exceeds the native artifact bound"};
+    try
+    {
+        Sha256 digest;
+        std::array<unsigned char, 65536> block{};
+        std::size_t offset = 0;
+        while(offset < bytes.size())
+        {
+            const auto size = (std::min)(block.size(), bytes.size() - offset);
+            std::copy_n(bytes.begin() + offset, size, block.begin());
+            digest.add(block.data(), static_cast<ULONG>(size));
+            offset += size;
+        }
         return digest.finish();
     }
     catch(const std::exception& error)

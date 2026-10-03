@@ -6,7 +6,12 @@
 #include <vector>
 #include <memory>
 #include <limits>
+#include <cstring>
 #include "../../mcp/common/patch_transaction.h"
+#ifdef WININSPECT_TEST_PE_PLANNER
+#include "../../mcp/common/pe_file_patch.h"
+#include "../../mcp/common/platform.h"
+#endif
 #include "_plugins.h"
 #include "bridgemain.h"
 #include "_dbgfunctions.h"
@@ -641,6 +646,9 @@ namespace
         }
         return true;
     }
+#ifdef WININSPECT_TEST_PE_PLANNER
+#include "file_reference.h"
+#endif
     bool cbUndo(int, char**)
     {
         if(!CheckPhase(3, {7, 42, 0}) || !CheckBytes(true, true) || !CheckTracking(true)) return false;
@@ -729,7 +737,11 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* init)
     gPluginHandle = init->pluginHandle;
     for(const auto type : {CB_INITDEBUG, CB_DEBUGEVENT, CB_BREAKPOINT, CB_EXITPROCESS, CB_PAUSEDEBUG})
         _plugin_registercallback(gPluginHandle, type, cbPatchEvent);
-    return _plugin_registercommand(gPluginHandle, "patchtransactionchecks", cbTransactionChecks, true)
+    return
+#ifdef WININSPECT_TEST_PE_PLANNER
+           _plugin_registercommand(gPluginHandle, "patchstrictfiles", cbStrictFiles, true) &&
+#endif
+           _plugin_registercommand(gPluginHandle, "patchtransactionchecks", cbTransactionChecks, true)
            && _plugin_registercommand(gPluginHandle, "patchrestorefailure", cbRestoreFailure, true)
            && _plugin_registercommand(gPluginHandle, "patchsinglearm", cbSingleArm, true)
            && _plugin_registercommand(gPluginHandle, "patchstep", cbStep, true)

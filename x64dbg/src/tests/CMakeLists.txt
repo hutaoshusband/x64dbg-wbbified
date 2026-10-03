@@ -179,7 +179,12 @@ foreach(test_name IN LISTS X64DBG_STANDARD_TESTS)
     x64dbg_add_test(NAME "${test_name}")
 endforeach()
 
-target_sources(test_patch_canary_plugin PRIVATE "${PROJECT_SOURCE_DIR}/src/mcp/common/patch_transaction.cpp")
+if(X64DBG_BUILD_MCP)
+    target_link_libraries(test_patch_canary_plugin PRIVATE mcp_common)
+    target_compile_definitions(test_patch_canary_plugin PRIVATE WININSPECT_TEST_PE_PLANNER)
+else()
+    target_sources(test_patch_canary_plugin PRIVATE "${PROJECT_SOURCE_DIR}/src/mcp/common/patch_transaction.cpp")
+endif()
 
 enable_language(ASM_MASM)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)

@@ -3,6 +3,7 @@
 #include "legacy_aliases.h"
 #include "parity_catalog.h"
 #include "platform.h"
+#include "pe_file_patch.h"
 #include "lifecycle.h"
 #include "ipc.h"
 #include "worker.h"
@@ -12,9 +13,12 @@
 #include <quickjs.h>
 #include <sqlite3.h>
 #include <chrono>
+#include <array>
 #include <fcntl.h>
 #include <io.h>
 #include <iostream>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 
@@ -102,6 +106,103 @@ Json http_probe(std::string_view input)
     const auto& request = parser.get();
     return {{"valid", true}, {"method", std::string(request.method_string())},
             {"target", std::string(request.target())}, {"body", request.body()}};
+}
+
+std::string read_fixture_file(const std::string& path)
+{
+    const auto decoded = launch_utf16(path);
+    if(const auto* error = std::get_if<ContractError>(&decoded))
+        throw std::runtime_error(error->message);
+    std::ifstream file(std::filesystem::path(std::get<std::wstring>(decoded)), std::ios::binary);
+    if(!file)
+        throw std::runtime_error("Cannot open the supplied private fixture file");
+    std::string bytes;
+    std::array<char, 65536> block{};
+    constexpr std::size_t maximum = 512 * 1024 * 1024;
+    while(file)
+    {
+        file.read(block.data(), block.size());
+        const auto size = static_cast<std::size_t>(file.gcount());
+        if(size > maximum - bytes.size())
+            throw std::runtime_error("Private fixture file exceeds the native artifact bound");
+        bytes.append(block.data(), size);
+    }
+    if(!file.eof())
+        throw std::runtime_error("Cannot completely read the supplied private fixture file");
+    return bytes;
+}
+
+PatchBytes fixture_bytes(const std::string& encoded)
+{
+    PatchBytes bytes;
+    for(std::size_t offset = 0; offset < encoded.size(); offset += 2)
+        bytes.push_back(static_cast<std::uint8_t>(std::stoul(encoded.substr(offset, 2), nullptr, 16)));
+    return bytes;
+}
+
+std::string fixture_hex(const PatchBytes& bytes)
+{
+    constexpr char digits[] = "0123456789abcdef";
+    std::string output;
+    for(const auto byte : bytes)
+    {
+        output.push_back(digits[byte >> 4]);
+        output.push_back(digits[byte & 15]);
+    }
+    return output;
+}
+
+Json pe_plan_probe(const Json& input)
+{
+    auto range = closed_object_schema({{"domain", enum_schema({"file_offset", "rva", "loaded_va"})}, {"addressHex", contract_schema("Hex64")},
+        {"encoding", enum_schema({"file_bytes", "loaded_bytes"})}, {"expectedHex", string_schema("hex-bytes", MaximumPatchBytes * 2)},
+        {"replacementHex", string_schema("hex-bytes", MaximumPatchBytes * 2)}}, {"domain", "addressHex", "encoding", "expectedHex", "replacementHex"});
+    auto schema = closed_object_schema({{"sourcePath", string_schema("windows-absolute-path", 32766)}, {"loadedBaseHex", contract_schema("Hex64")},
+        {"ranges", bounded_array_schema(range, MaximumPatchRanges, 1)}, {"outputPath", string_schema("windows-absolute-path", 32766)},
+        {"renderSourcePath", string_schema("windows-absolute-path", 32766)}}, {"sourcePath", "loadedBaseHex", "ranges"});
+    if(const auto error = validate_schema(schema, input))
+        return {{"valid", false}, {"error", error_json(*error)}};
+    const auto source = read_fixture_file(input.at("sourcePath").get<std::string>());
+    std::vector<PePatchRequest> requests;
+    for(const auto& item : input.at("ranges"))
+    {
+        const auto domain = item.at("domain").get<std::string>();
+        requests.push_back({domain == "file_offset" ? PePatchAddress::FileOffset : domain == "rva" ? PePatchAddress::Rva : PePatchAddress::LoadedVa,
+            std::get<std::uint64_t>(parse_hex64(item.at("addressHex").get<std::string>())),
+            item.at("encoding") == "file_bytes" ? PePatchEncoding::FileBytes : PePatchEncoding::LoadedBytes,
+            fixture_bytes(item.at("expectedHex").get<std::string>()), fixture_bytes(item.at("replacementHex").get<std::string>())});
+    }
+    const auto plan = plan_pe_file_patch(source, std::get<std::uint64_t>(parse_hex64(input.at("loadedBaseHex").get<std::string>())), requests);
+    auto reply = checked_reply(plan);
+    if(const auto* value = std::get_if<PeFilePatchPlan>(&plan))
+    {
+        Json ranges = Json::array();
+        for(const auto& item : value->ranges)
+            ranges.push_back({{"fileOffset", decimal64(item.fileOffset)}, {"expectedHex", fixture_hex(item.expected)},
+                {"replacementHex", fixture_hex(item.replacement)}, {"normalizedRelocations", item.normalizedRelocations}});
+        reply["plan"] = {{"sourceSize", decimal64(value->sourceSize)}, {"sourceSha256", value->sourceSha256}, {"preferredBaseHex", hex64(value->preferredBase)},
+            {"imageSize", value->imageSize}, {"pointerBits", value->pointerBits}, {"overlayOffset", decimal64(value->overlayOffset)},
+            {"hasCertificate", value->hasCertificate}, {"ranges", std::move(ranges)}};
+        const auto renderSource = input.contains("renderSourcePath") ? read_fixture_file(input.at("renderSourcePath").get<std::string>()) : source;
+        const auto rendered = render_pe_file_patch(renderSource, *value);
+        if(const auto* error = std::get_if<ContractError>(&rendered))
+            return {{"valid", false}, {"error", error_json(*error)}, {"plan", reply.at("plan")}};
+        const auto& output = std::get<std::string>(rendered);
+        const auto hash = sha256_file_bytes(output);
+        if(const auto* error = std::get_if<ContractError>(&hash))
+            return {{"valid", false}, {"error", error_json(*error)}};
+        reply["outputSha256"] = std::get<std::string>(hash);
+        if(input.contains("outputPath"))
+        {
+            const auto path = std::get<std::wstring>(launch_utf16(input.at("outputPath").get<std::string>()));
+            std::ofstream file(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
+            file.write(output.data(), static_cast<std::streamsize>(output.size()));
+            file.flush();
+            if(!file)
+                throw std::runtime_error("Private fixture materialization failed");
+        }
+    }
+    return reply;
 }
 
 Json normalized_contract(std::string_view name, const Json& input)
@@ -320,7 +421,9 @@ int main(int argc, char** argv)
                 else
                 {
                     const auto& input = std::get<Json>(parsed);
-                    if(mode == "parity-resolve-input" && argc == 2)
+                    if(mode == "pe-plan" && argc == 2)
+                        reply = pe_plan_probe(input);
+                    else if(mode == "parity-resolve-input" && argc == 2)
                     {
                         if(const auto error = validate_schema(string_schema("utf8-text", 16384), input))
                             reply = {{"valid", false}, {"error", error_json(*error)}};

@@ -1,4 +1,5 @@
 import os
+import hashlib
 from pathlib import Path
 import re
 
@@ -51,7 +52,7 @@ def file_image_facts(binary, machine):
 
 
 def check_file_log(receipt, facts, directory, engine):
-    reference = check_patch_reference(receipt, facts, engine=engine, file_exports=True)
+    reference = check_patch_reference(receipt, facts, engine=engine, file_exports=True, strict_files=True)
     output = receipt["stdout"]
     paths = re.findall(r"FILE_DIRECTORY utf16=([0-9a-f]+)", output)
     assert len(paths) == 1 and bytes.fromhex(paths[0]).decode("utf-16-le") == str(directory), "Native file output directory differs from the independently requested path"
@@ -96,7 +97,7 @@ def check_file_bytes(data, source, facts, kind, base):
 
 
 def check_guard_files(directory):
-    assert {path.name for path in directory.iterdir()} == {f"file-{kind}.exe" for kind in (0, 1, 2, 3, 4, 8)}, "Failed export publishes an unexpected destination"
+    assert {path.name for path in directory.iterdir()} == {f"file-{kind}.exe" for kind in (0, 1, 2, 3, 4, 8)} | {f"strict-{kind}.exe" for kind in range(3)}, "Failed export publishes an unexpected destination"
     for kind in (4, 8):
         path = directory / f"file-{kind}.exe"
         assert path.read_bytes() == GUARD, "Rejected destination lost its preexisting exact bytes"
@@ -106,6 +107,38 @@ def check_guard_files(directory):
 
 def check_relocation_exit(receipt):
     assert receipt["exitCode"] == 114 and not receipt["stdout"] and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"], "Fresh loader did not reject the persisted already-rebased pointer"
+
+
+def strict_file_bytes(source, facts, kind):
+    assert kind in (0, 1, 2)
+    return source if kind == 0 else expected_file_bytes(source, facts, 0 if kind == 1 else 2, 0)
+
+
+def check_strict_file_log(receipt, facts, source, observed, copied, directory):
+    output = receipt["stdout"]
+    records = re.findall(r"PE_FILE kind=(\d+) sourceSha=([0-9a-f]{64}) outputSha=([0-9a-f]{64}) preferred=([0-9a-f]+) actual=([0-9a-f]+) width=(\d+) pointerOffset=(\d+) normalized=(\d+) ranges=(\d+) size=(\d+)", output)
+    expected = [(str(kind), hashlib.sha256(source).hexdigest(), hashlib.sha256(strict_file_bytes(source, facts, kind)).hexdigest(),
+                 f"{facts['preferredBase']:x}", f"{observed['actualBase']:x}", str(facts["pointerWidth"] * 8), str(facts["pointerRawOffset"]),
+                 "1", str(1 if kind == 0 else 2), str(len(source))) for kind in range(3)]
+    assert records == expected, "Strict native PE plans differ from actual source, independent mappings or normalized complete-file bytes"
+    for kind in range(3):
+        data = (directory / f"strict-{kind}.exe").read_bytes()
+        assert data == strict_file_bytes(source, facts, kind), "Strict native saved bytes differ from the independent complete-file oracle"
+        assert data[facts["overlayOffset"]:] == bytes.fromhex(facts["overlay"]), "Strict native file lost its exact overlay"
+        assert data[facts["pointerRawOffset"]:facts["pointerRawOffset"] + facts["pointerWidth"]] == source[facts["pointerRawOffset"]:facts["pointerRawOffset"] + facts["pointerWidth"]], "Strict file contains a persisted loaded pointer"
+    rejections = re.findall(r"PE_REJECT name=([a-z_]+) code=([a-z_]+)", output)
+    assert rejections == [("virtual_tail", "unsupported_mapping"), ("partial_relocation", "unsupported_mapping"),
+                          ("expected_conflict", "expected_bytes_mismatch"), ("address_underflow", "unsupported_mapping"),
+                          ("range_overlap", "invalid_argument"), ("outside_source_change", "file_hash_mismatch")], "Strict native file rejection references differ"
+    identities = re.findall(r"PE_SOURCE pid=(\d+) thread=(\d+) epoch=(\d+) volume=(\d+) fileId=(\d+) unchanged=1", output)
+    target = observed["reference"]["targetIdentity"]
+    assert len(identities) == 1
+    pid, thread, epoch, volume, file_id = map(int, identities[0])
+    assert pid == target["pid"] and thread == target["thread"] and epoch > 0 and volume > 0 and file_id == copied.stat().st_ino, "Strict source file ID or selected native paused target identity differs"
+    positions = [output.index(f"PE_FILE kind={kind} ") for kind in range(3)] + [output.index(f"PE_REJECT name={name} ") for name, _ in rejections] + [output.index("PE_SOURCE ")]
+    assert positions == sorted(positions) and output.index("FILE_EXPORT kind=8 ") < positions[0] < positions[-1] < output.index("PATCH_STEP index=2 "), "Strict plans do not execute at the intended paused patch reference"
+    return {"records": [list(item) for item in records], "rejections": [list(item) for item in rejections],
+            "targetPid": pid, "targetThread": thread, "pauseEpoch": epoch, "sourceFileId": str(file_id), "sourceVolumeSerial": volume}
 
 
 def check_wrong_patch_output(receipt, facts):
@@ -131,7 +164,7 @@ def rejected_control(name, checker, *arguments):
 
 def file_negative_controls(receipt, facts, directory, engine, source, normal):
     output = receipt["stdout"]
-    controls = check_patch_negative_controls(receipt, facts, engine=engine, file_exports=True)
+    controls = check_patch_negative_controls(receipt, facts, engine=engine, file_exports=True, strict_files=True)
     changes = [("missing_export", "FILE_EXPORT kind=0", "IGNORED_EXPORT kind=0"),
                ("false_virtual_write", "kind=1 requested=1 written=0", "kind=1 requested=1 written=1"),
                ("ignored_lock_failure", "kind=4 requested=4 written=-1 errorPresent=1", "kind=4 requested=4 written=4 errorPresent=0"),
@@ -186,7 +219,7 @@ def run_file_patch_oracles(environment, results, selected_engine, timeout, fixtu
         script = scope / "reference.txt"
         text = source_script.read_text(encoding="utf-8")
         assert text.count("init tests/patch_canary.exe") == text.count("\npatchfileexports\n") == 1, "File reference script template differs"
-        text = text.replace("init tests/patch_canary.exe", f'init "{copied}"').replace("\npatchfileexports\n", f'\npatchfileexports "{directory}"\n')
+        text = text.replace("init tests/patch_canary.exe", f'init "{copied}"').replace("\npatchfileexports\n", f'\npatchfileexports "{directory}"\npatchstrictfiles "{directory}"\n')
         script.write_text(text, encoding="utf-8", newline="\n")
         baseline = run_owned([str(copied)], normal_environment, timeout)
         write_json(scope / "source-normal.json", baseline)
@@ -196,6 +229,14 @@ def run_file_patch_oracles(environment, results, selected_engine, timeout, fixtu
         write_json(scope / "receipt.json", receipt)
         observed = check_file_log(receipt, source_facts, directory, engine)
         check_guard_files(directory)
+        strict = check_strict_file_log(receipt, source_facts, source_bytes, observed, copied, directory)
+        strict_persisted = []
+        for kind in range(3):
+            destination = directory / f"strict-{kind}.exe"
+            normal = run_owned([str(destination)], normal_environment, timeout)
+            write_json(scope / f"strict-persisted-{kind}.json", normal)
+            actual = check_patch_output(normal, source_facts, 2, 42 if kind == 1 else 7)
+            strict_persisted.append({"kind": kind, "binary": file_identity(destination), "receipt": normal, "observed": actual})
         persisted = []
         for kind in range(4):
             destination = directory / f"file-{kind}.exe"
@@ -205,6 +246,14 @@ def run_file_patch_oracles(environment, results, selected_engine, timeout, fixtu
             actual = check_patch_output(normal, source_facts, 2, 42 if kind == 0 else 7) if kind != 3 else check_relocation_exit(normal)
             persisted.append({"kind": kind, "binary": file_identity(destination), "changedOffsets": changes, "receipt": normal, "observed": actual})
         controls = file_negative_controls(receipt, source_facts, directory, engine, source_bytes, persisted[0]["receipt"])
+        for name, old, new in (("missing_strict_plan", "PE_FILE kind=1 ", "IGNORED_FILE kind=1 "),
+                              ("false_normalization", "normalized=1 ranges=2", "normalized=0 ranges=2"),
+                              ("wrong_source_hash", f"sourceSha={source_identity['sha256']}", f"sourceSha={'0' * 64}"),
+                              ("missing_strict_rejection", "PE_REJECT name=virtual_tail ", "IGNORED_REJECT name=virtual_tail "),
+                              ("wrong_source_file_id", f"fileId={copied.stat().st_ino}", "fileId=0")):
+            altered = {**receipt, "stdout": receipt["stdout"].replace(old, new, 1)}
+            assert altered["stdout"] != receipt["stdout"], "Strict evidence control did not change its intended field"
+            controls.append(rejected_control(name, check_strict_file_log, altered, source_facts, source_bytes, observed, copied, directory))
         for name, offset, value, exit_code in (("wrong_canary", source_facts["valueRawOffset"] + 2, 43, 108),
                                              ("outside_plan_with_valid_canary", source_facts["valueRawOffset"] + 16, 1, 42)):
             data = bytearray(expected_file_bytes(source_bytes, source_facts, 0, observed["actualBase"]))
@@ -226,13 +275,16 @@ def run_file_patch_oracles(environment, results, selected_engine, timeout, fixtu
                          "targetExecuted": True, "receipt": persisted[1]["receipt"]})
         assert file_identity(copied) == source_identity, "File export or controls changed their source executable"
         assert receipt["loadedModules"] and not any("mcp-server" in item["path"].lower() or "agent smithers" in item["path"].lower() for item in receipt["loadedModules"]), "File reference loaded an external MCP dependency"
-        write_json(scope / "independent-files.json", {"source": source_identity, "facts": source_facts, "observed": observed, "persisted": persisted, "negativeControls": controls})
+        write_json(scope / "independent-files.json", {"source": source_identity, "facts": source_facts, "observed": observed, "persisted": persisted,
+                   "strict": strict, "strictPersisted": strict_persisted, "negativeControls": controls})
         observations.append({"engine": engine, "source": source_identity, "sourcePeFacts": source_facts, "script": file_identity(script),
                              "sourceScript": file_identity(source_script), "native": receipt, "observed": observed, "persisted": persisted,
+                             "strict": strict, "strictPersisted": strict_persisted,
                              "guardFiles": [file_identity(directory / f"file-{kind}.exe") for kind in (4, 8)], "negativeControls": controls})
-        print(f"[VERIFIED] Native {environment.architecture} {engine} file save-as executes 42; header/overlay/source, five destination failures and actual relocation rejection verified", flush=True)
+        print(f"[VERIFIED] Native {environment.architecture} {engine} strict normalized files execute 7/42/7; legacy export, source/overlay retention and rejection controls verified", flush=True)
     assert file_identity(binary) == identity, "File patch reference changed the source-built executable"
     results.append({"name": "test_native_file_patch_oracles", "status": "verified", "oracle": {
         "binary": identity, "plugin": file_identity(plugin), "sourcePeFacts": facts, "observations": observations,
-        "openGates": ["strict virtual-tail rejection", "relocation normalization/rejection", "signed and ambiguous PE mappings",
-                      "atomic publication", "backup/journal", "hash-bound plan", "compare-checked undo", "GUI/MCP export"]}})
+        "openGates": ["signed-image validity and mutation policy", "remaining PE mapping/relocation combinations and loader references",
+                      "atomic publication and path races", "backup/journal", "authenticated persistent file identity and plan lifecycle",
+                      "compare-checked undo", "GUI/MCP export"]}})

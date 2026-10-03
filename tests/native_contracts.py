@@ -14,10 +14,11 @@ import time
 from types import SimpleNamespace
 
 from wi_driver import KERNEL, McpError, OwnedJob, ROOT, compiler_environment, file_identity, process_identity, write_json
+from pe_patch_checks import check_pe_file_patch_plans
 
 
 CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_context_roundtrip",
-              "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser", "test_legacy_alias_contracts", "test_native_parity_catalog",
+              "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser", "test_legacy_alias_contracts", "test_native_parity_catalog", "test_pe_file_patch_plans",
               "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
@@ -2118,6 +2119,8 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_legacy_alias_contracts(probe, registry))
             elif name == "test_native_parity_catalog":
                 result.update(check_native_parity_catalog(probe, catalog))
+            elif name == "test_pe_file_patch_plans":
+                result.update(check_pe_file_patch_plans(probe))
             elif name == "test_registry_dispatch":
                 result.update(check_registry_dispatch(probe, registry, tool_validators))
             elif name == "test_schema_references":
