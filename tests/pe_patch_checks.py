@@ -5,6 +5,86 @@ import struct
 from wi_driver import file_identity
 
 
+def check_new_file_publication(probe):
+    root = Path(probe.output) / "publication"
+    root.mkdir()
+    source = root / "source.bin"
+    cases = []
+
+    def run(name, data, filename="published.bin", guard="none", discard=False, existing=None):
+        directory = root / name
+        directory.mkdir()
+        source.write_bytes(data)
+        source_before = file_identity(source)
+        directory_before = directory.stat().st_ino
+        destination = directory / filename
+        previous = None
+        if existing is not None:
+            destination.write_bytes(existing)
+            previous = (destination.read_bytes(), destination.stat().st_ino, destination.stat().st_mtime_ns, destination.stat().st_file_attributes)
+        request = {"sourcePath": str(source), "directory": str(directory), "filename": filename, "guard": guard, "discard": discard}
+        observed = probe.call("publish-new", request)
+        assert observed["valid"], observed
+        assert observed["temporaryWriteError"] == observed["temporaryDeleteError"] == 32, observed
+        assert not observed["selfRename"]["valid"] and observed["selfRename"]["error"]["code"] == "invalid_argument"
+        assert observed["directoryRenameAllowedBeforeStage"] and observed["directoryRenameError"] in (5, 32), observed
+        assert observed["temporaryAbsent"] and not Path(observed["temporaryPath"]).exists(), "Publication left its owned temporary file"
+        assert directory.stat().st_ino == directory_before and not directory.with_name(name + "-moved").exists(), "Pinned publication directory moved"
+        expected_names = set()
+        if discard:
+            assert observed["discard"] == {"valid": True} and "publication" not in observed
+        elif guard != "none" or previous is not None:
+            assert not observed["publication"]["valid"] and observed["publication"]["error"]["code"] in ("file_exists", "native_failure"), observed
+            assert observed["discard"] == {"valid": True}
+            assert destination.read_bytes() == (existing if previous is not None else b"publication-guard"), "Collision changed the competing file"
+            assert bool(destination.stat().st_file_attributes & 1) == (guard == "readonly"), "Collision changed read-only state"
+            if previous:
+                assert (destination.read_bytes(), destination.stat().st_ino, destination.stat().st_mtime_ns, destination.stat().st_file_attributes) == previous
+            expected_names = {filename}
+        else:
+            published = observed["publication"]
+            assert published["valid"] and destination.read_bytes() == data, observed
+            identity = published["identity"]
+            assert identity == {"sha256": hashlib.sha256(data).hexdigest(), "size": str(len(data)),
+                                "volumeSerial": destination.stat().st_dev & 0xffffffff, "fileIndex": str(destination.stat().st_ino)}, "Published path does not identify the staged complete file"
+            assert not observed["repeat"]["valid"] and observed["repeat"]["error"]["code"] == "invalid_argument"
+            assert not observed["discardAfterPublication"]["valid"] and observed["discardAfterPublication"]["error"]["code"] == "invalid_argument"
+            expected_names = {filename}
+        assert {path.name for path in directory.iterdir()} == expected_names, "Publication has undeclared namespace effects"
+        assert file_identity(source) == source_before, "Publication changed its input source"
+        cases.append({"name": name, "inputSha256": hashlib.sha256(data).hexdigest(), "observed": observed})
+
+    for size in (0, 1, 65535, 65536, 65537, 8 * 1024 * 1024 + 17):
+        run(f"size-{size}", (bytes(range(256)) * (size // 256 + 1))[:size])
+    run("unicode", b"published-unicode", "\u4fdd\u5b58-\u80e1\u6843.bin")
+    run("existing", b"new", existing=b"original-guard")
+    for guard in ("late", "locked", "readonly"):
+        run(f"guard-{guard}", b"new", guard=guard)
+    run("discard", b"never-published", discard=True)
+    invalid = (".", "..", "../escape.bin", "escape/name", "escape\\name", "stream:payload", "trailing.", "trailing ",
+               "CON", "NUL.txt", "COM0.txt", "LPT9.bin", "COM\u00b9.txt", "CONIN$", "a\x00b", "a?b", "x" * 256)
+    for index, filename in enumerate(invalid):
+        directory = root / f"invalid-{index}"
+        directory.mkdir()
+        source.write_bytes(b"invalid-name-source")
+        request = {"sourcePath": str(source), "directory": str(directory), "filename": filename}
+        observed = probe.call("publish-new", request)
+        if not observed["valid"]:
+            assert filename == "a\x00b" and observed["error"]["code"] == "invalid_argument" and observed["error"]["path"] == "/filename", observed
+            assert not list(directory.iterdir()), "Schema refusal created a temporary file"
+            cases.append({"name": f"invalid-{index}", "observed": observed})
+            continue
+        assert observed["valid"] and not observed["publication"]["valid"] and observed["publication"]["error"]["code"] == "invalid_argument", observed
+        assert observed["discard"] == {"valid": True} and observed["temporaryAbsent"] and not list(directory.iterdir())
+        cases.append({"name": f"invalid-{index}", "observed": observed})
+    for name, path in (("missing-directory", root / "missing"), ("file-directory", source)):
+        observed = probe.call("publish-new", {"sourcePath": str(source), "directory": str(path), "filename": "output"})
+        assert not observed["valid"] and observed["error"]["code"] == "native_failure", observed
+        cases.append({"name": name, "observed": observed})
+    assert not (root / "missing").exists() and not (root / "escape.bin").exists()
+    return {"publicationCases": cases, "caseCount": len(cases), "scope": "same-volume NTFS new-file publication reference"}
+
+
 def pe_fixture(bits):
     source = bytearray(0xa00)
     source[:2] = b"MZ"

@@ -16,24 +16,76 @@ bool PeReadWhole(HANDLE file, std::string& source)
     return ReadFile(file, block.data(), 1, &trailing, nullptr) && !trailing;
 }
 
-bool PeWritePrivate(const std::wstring& path, const std::string& bytes)
+bool PePublishPrivate(const std::wstring& directory, unsigned kind, const std::string& bytes)
 {
-    {
-        const ScopedFile file(path.c_str(), GENERIC_WRITE, 0, CREATE_NEW);
-        if(file.value == INVALID_HANDLE_VALUE) return false;
-        std::size_t offset = 0;
-        while(offset < bytes.size())
-        {
-            DWORD written = 0;
-            const auto count = static_cast<DWORD>((std::min)(bytes.size() - offset, std::size_t(65536)));
-            if(!WriteFile(file.value, bytes.data() + offset, count, &written, nullptr) || written != count) return false;
-            offset += written;
-        }
-        if(!FlushFileBuffers(file.value)) return false;
-    }
-    const ScopedFile read(path.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
+    using namespace wininspect::mcp;
+    auto staged = PreparedNewFile::stage(directory, bytes);
+    auto* prepared = std::get_if<std::unique_ptr<PreparedNewFile>>(&staged);
+    if(!_plugin_testassert(prepared && *prepared, "strict PE publication stages and verifies a sealed sibling file")) return false;
+    const auto temporary = (*prepared)->temporaryPath();
+    const auto name = L"strict-" + std::to_wstring(kind) + L".exe";
+    const auto destination = directory + L"\\" + name;
+    const ScopedFile write(temporary.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING);
+    const DWORD writeError = GetLastError();
+    const BOOL deleted = DeleteFileW(temporary.c_str());
+    const DWORD deleteError = GetLastError();
+    if(!_plugin_testassert(GetFileAttributesW(destination.c_str()) == INVALID_FILE_ATTRIBUTES && write.value == INVALID_HANDLE_VALUE
+                          && writeError == ERROR_SHARING_VIOLATION && !deleted && deleteError == ERROR_SHARING_VIOLATION,
+                          "sealed temporary file denies independent write and deletion before publication")) return false;
+    const auto published = (*prepared)->publish(name);
+    const auto* result = std::get_if<PublishedFile>(&published);
+    if(!_plugin_testassert(result && result->size == bytes.size() && result->volumeSerial && result->fileIndex,
+                          "strict PE publication uses the non-replacing same-volume rename")) return false;
+    const PublishedFile identity = *result;
+    const auto repeat = (*prepared)->publish(name);
+    const auto* rejected = std::get_if<ContractError>(&repeat);
+    if(!_plugin_testassert(rejected && rejected->code == "invalid_argument", "a committed prepared file cannot publish twice")) return false;
+    prepared->reset();
+    const ScopedFile read(destination.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
     std::string observed;
-    return PeReadWhole(read.value, observed) && observed == bytes;
+    BY_HANDLE_FILE_INFORMATION information{};
+    if(!_plugin_testassert(GetFileAttributesW(temporary.c_str()) == INVALID_FILE_ATTRIBUTES && PeReadWhole(read.value, observed) && observed == bytes
+                          && GetFileInformationByHandle(read.value, &information) && information.dwVolumeSerialNumber == identity.volumeSerial
+                          && ((static_cast<std::uint64_t>(information.nFileIndexHigh) << 32) | information.nFileIndexLow) == identity.fileIndex,
+                          "published path retains the exact staged file object and complete verified bytes")) return false;
+    _plugin_logprintf("PE_PUBLISH kind=%u volume=%lu fileId=%llu size=%llu source=sealed rename=nonreplace writeDenied=%lu deleteDenied=%lu tempAbsent=1\n",
+                      kind, static_cast<unsigned long>(identity.volumeSerial), static_cast<unsigned long long>(identity.fileIndex),
+                      static_cast<unsigned long long>(identity.size), writeError, deleteError);
+    return true;
+}
+
+bool PeCollisionPrivate(const std::wstring& directory, const std::string& bytes)
+{
+    using namespace wininspect::mcp;
+    for(const unsigned kind : {4u, 8u})
+    {
+        const auto name = L"file-" + std::to_wstring(kind) + L".exe";
+        const ScopedFile guard((directory + L"\\" + name).c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
+        BY_HANDLE_FILE_INFORMATION before{}, after{};
+        std::string original, observed;
+        if(!_plugin_testassert(GetFileInformationByHandle(guard.value, &before) && PeReadWhole(guard.value, original)
+                              && original == std::string("WBB_FILE_GUARD\0\x5a", 16), "publication retains the native destination guard")) return false;
+        auto staged = PreparedNewFile::stage(directory, bytes);
+        auto* prepared = std::get_if<std::unique_ptr<PreparedNewFile>>(&staged);
+        if(!_plugin_testassert(prepared && *prepared, "collision reference seals its complete temporary file")) return false;
+        const auto temporary = (*prepared)->temporaryPath();
+        const auto published = (*prepared)->publish(name);
+        const auto* error = std::get_if<ContractError>(&published);
+        if(!_plugin_testassert(error && (error->code == "file_exists" || error->code == "native_failure"),
+                              "publication refuses an existing held destination")) return false;
+        const auto discarded = (*prepared)->discard();
+        if(!_plugin_testassert(std::holds_alternative<bool>(discarded) && std::get<bool>(discarded), "collision reference explicitly removes its owned temporary file")) return false;
+        prepared->reset();
+        if(!_plugin_testassert(GetFileAttributesW(temporary.c_str()) == INVALID_FILE_ATTRIBUTES && GetFileInformationByHandle(guard.value, &after)
+                              && PeReadWhole(guard.value, observed) && observed == original && before.dwVolumeSerialNumber == after.dwVolumeSerialNumber
+                              && before.nFileIndexHigh == after.nFileIndexHigh && before.nFileIndexLow == after.nFileIndexLow
+                              && before.dwFileAttributes == after.dwFileAttributes && CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime) == 0,
+                              "refused publication preserves complete destination content, identity and attributes")) return false;
+        _plugin_logprintf("PE_COLLISION kind=%u code=%s volume=%lu fileId=%llu attributes=%lu unchanged=1 tempAbsent=1\n", kind, error->code.c_str(),
+                          before.dwVolumeSerialNumber, (static_cast<unsigned long long>(before.nFileIndexHigh) << 32) | before.nFileIndexLow,
+                          before.dwFileAttributes);
+    }
+    return true;
 }
 
 bool cbStrictFiles(int argc, char** argv)
@@ -80,14 +132,15 @@ bool cbStrictFiles(int argc, char** argv)
         if(!_plugin_testassert(bytes && (kind || *bytes == source), "normalized unmodified loaded pointer reproduces the complete original file")) return false;
         const auto outputHash = sha256_file_bytes(*bytes);
         const auto* hash = std::get_if<std::string>(&outputHash);
-        if(!_plugin_testassert(hash && PeWritePrivate(directory + L"\\strict-" + std::to_wstring(kind) + L".exe", *bytes),
-                              "strict PE fixture materializes a new private file and independently reads every byte back")) return false;
+        if(!_plugin_testassert(hash && PePublishPrivate(directory, kind, *bytes),
+                              "strict PE fixture publishes a verified new file and independently reads every byte back")) return false;
         _plugin_logprintf("PE_FILE kind=%u sourceSha=%s outputSha=%s preferred=%llx actual=%llx width=%u pointerOffset=%llu normalized=%u ranges=%u size=%llu\n",
                           kind, plan->sourceSha256.c_str(), hash->c_str(), static_cast<unsigned long long>(plan->preferredBase),
                           static_cast<unsigned long long>(base), plan->pointerBits, static_cast<unsigned long long>(plan->ranges[0].fileOffset),
                           static_cast<unsigned>(plan->ranges[0].normalizedRelocations), static_cast<unsigned>(plan->ranges.size()),
                           static_cast<unsigned long long>(bytes->size()));
     }
+    if(!PeCollisionPrivate(directory, source)) return false;
     auto reject = [&](const char* name, const char* code, const Checked<PeFilePatchPlan>& result)
     {
         const auto* error = std::get_if<ContractError>(&result);

@@ -11,6 +11,7 @@
 #ifdef WININSPECT_TEST_PE_PLANNER
 #include "../../mcp/common/pe_file_patch.h"
 #include "../../mcp/common/platform.h"
+#include "../../mcp/common/new_file_publish.h"
 #endif
 #include "_plugins.h"
 #include "bridgemain.h"

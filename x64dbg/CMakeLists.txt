@@ -1223,6 +1223,8 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/lifecycle.h"
 		"src/mcp/common/memory_tools.cpp"
 		"src/mcp/common/module_analysis_tools.cpp"
+		"src/mcp/common/new_file_publish.cpp"
+		"src/mcp/common/new_file_publish.h"
 		"src/mcp/common/parity_catalog.cpp"
 		"src/mcp/common/parity_catalog.h"
 		"src/mcp/common/patch_transaction.cpp"

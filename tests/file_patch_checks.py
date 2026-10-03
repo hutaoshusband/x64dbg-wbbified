@@ -121,7 +121,16 @@ def check_strict_file_log(receipt, facts, source, observed, copied, directory):
                  f"{facts['preferredBase']:x}", f"{observed['actualBase']:x}", str(facts["pointerWidth"] * 8), str(facts["pointerRawOffset"]),
                  "1", str(1 if kind == 0 else 2), str(len(source))) for kind in range(3)]
     assert records == expected, "Strict native PE plans differ from actual source, independent mappings or normalized complete-file bytes"
+    publications = re.findall(r"PE_PUBLISH kind=(\d+) volume=(\d+) fileId=(\d+) size=(\d+) source=sealed rename=nonreplace writeDenied=(\d+) deleteDenied=(\d+) tempAbsent=1", output)
+    assert publications == [(str(kind), str((directory / f"strict-{kind}.exe").stat().st_dev & 0xffffffff),
+                             str((directory / f"strict-{kind}.exe").stat().st_ino), str(len(source)), "32", "32") for kind in range(3)], "Native published path differs from the sealed file identity or lock controls"
+    collisions = re.findall(r"PE_COLLISION kind=(\d+) code=([a-z_]+) volume=(\d+) fileId=(\d+) attributes=(\d+) unchanged=1 tempAbsent=1", output)
+    assert len(collisions) == 2
+    for record, kind in zip(collisions, (4, 8)):
+        info = (directory / f"file-{kind}.exe").stat()
+        assert record[0] == str(kind) and record[1] in ("file_exists", "native_failure") and record[2:] == (str(info.st_dev & 0xffffffff), str(info.st_ino), str(info.st_file_attributes)), "Refused publication changed its held native guard"
     for kind in range(3):
+        assert output.index(f"PE_PUBLISH kind={kind} ") < output.index(f"PE_FILE kind={kind} "), "Plan evidence precedes actual publication"
         data = (directory / f"strict-{kind}.exe").read_bytes()
         assert data == strict_file_bytes(source, facts, kind), "Strict native saved bytes differ from the independent complete-file oracle"
         assert data[facts["overlayOffset"]:] == bytes.fromhex(facts["overlay"]), "Strict native file lost its exact overlay"
@@ -137,7 +146,7 @@ def check_strict_file_log(receipt, facts, source, observed, copied, directory):
     assert pid == target["pid"] and thread == target["thread"] and epoch > 0 and volume > 0 and file_id == copied.stat().st_ino, "Strict source file ID or selected native paused target identity differs"
     positions = [output.index(f"PE_FILE kind={kind} ") for kind in range(3)] + [output.index(f"PE_REJECT name={name} ") for name, _ in rejections] + [output.index("PE_SOURCE ")]
     assert positions == sorted(positions) and output.index("FILE_EXPORT kind=8 ") < positions[0] < positions[-1] < output.index("PATCH_STEP index=2 "), "Strict plans do not execute at the intended paused patch reference"
-    return {"records": [list(item) for item in records], "rejections": [list(item) for item in rejections],
+    return {"records": [list(item) for item in records], "publications": [list(item) for item in publications], "collisions": [list(item) for item in collisions], "rejections": [list(item) for item in rejections],
             "targetPid": pid, "targetThread": thread, "pauseEpoch": epoch, "sourceFileId": str(file_id), "sourceVolumeSerial": volume}
 
 
@@ -250,7 +259,11 @@ def run_file_patch_oracles(environment, results, selected_engine, timeout, fixtu
                               ("false_normalization", "normalized=1 ranges=2", "normalized=0 ranges=2"),
                               ("wrong_source_hash", f"sourceSha={source_identity['sha256']}", f"sourceSha={'0' * 64}"),
                               ("missing_strict_rejection", "PE_REJECT name=virtual_tail ", "IGNORED_REJECT name=virtual_tail "),
-                              ("wrong_source_file_id", f"fileId={copied.stat().st_ino}", "fileId=0")):
+                              ("wrong_source_file_id", f"fileId={copied.stat().st_ino}", "fileId=0"),
+                              ("missing_publication", "PE_PUBLISH kind=1 ", "IGNORED_PUBLISH kind=1 "),
+                              ("wrong_published_file_id", f"fileId={(directory / 'strict-0.exe').stat().st_ino}", "fileId=0"),
+                              ("retained_temporary", "tempAbsent=1", "tempAbsent=0"),
+                              ("missing_collision", "PE_COLLISION kind=4 ", "IGNORED_COLLISION kind=4 ")):
             altered = {**receipt, "stdout": receipt["stdout"].replace(old, new, 1)}
             assert altered["stdout"] != receipt["stdout"], "Strict evidence control did not change its intended field"
             controls.append(rejected_control(name, check_strict_file_log, altered, source_facts, source_bytes, observed, copied, directory))

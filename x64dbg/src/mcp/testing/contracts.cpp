@@ -4,6 +4,7 @@
 #include "parity_catalog.h"
 #include "platform.h"
 #include "pe_file_patch.h"
+#include "new_file_publish.h"
 #include "lifecycle.h"
 #include "ipc.h"
 #include "worker.h"
@@ -202,6 +203,77 @@ Json pe_plan_probe(const Json& input)
                 throw std::runtime_error("Private fixture materialization failed");
         }
     }
+    return reply;
+}
+
+Json publication_probe(const Json& input)
+{
+    const auto schema = closed_object_schema({{"sourcePath", string_schema("windows-absolute-path", 32766)},
+        {"directory", string_schema("windows-absolute-path", 32700)}, {"filename", string_schema("utf8-text", 1024)},
+        {"guard", enum_schema({"none", "late", "locked", "readonly"})}, {"discard", Json{{"type", "boolean"}}}}, {"sourcePath", "directory", "filename"});
+    if(const auto error = validate_schema(schema, input)) return {{"valid", false}, {"error", error_json(*error)}};
+    const auto source = read_fixture_file(input.at("sourcePath").get<std::string>());
+    const auto directory = std::get<std::wstring>(launch_utf16(input.at("directory").get<std::string>()));
+    const auto filename = std::get<std::wstring>(launch_utf16(input.at("filename").get<std::string>()));
+    const auto moved = directory + L"-moved";
+    const DWORD attributes = GetFileAttributesW(directory.c_str());
+    bool renameAllowed = false;
+    if(attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        if(!MoveFileExW(directory.c_str(), moved.c_str(), 0) || !MoveFileExW(moved.c_str(), directory.c_str(), 0))
+            throw std::runtime_error("Private directory rename positive control failed");
+        renameAllowed = true;
+    }
+    auto staged = PreparedNewFile::stage(directory, source);
+    auto* owner = std::get_if<std::unique_ptr<PreparedNewFile>>(&staged);
+    if(!owner) return checked_reply(staged);
+    const auto temporary = (*owner)->temporaryPath();
+    Json reply{{"valid", true}, {"temporaryPath", std::get<std::string>(launch_utf8(temporary))}, {"directoryRenameAllowedBeforeStage", renameAllowed}};
+    HANDLE write = CreateFileW(temporary.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    reply["temporaryWriteError"] = write == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    if(write != INVALID_HANDLE_VALUE) CloseHandle(write);
+    reply["temporaryDeleteError"] = DeleteFileW(temporary.c_str()) ? 0 : GetLastError();
+    reply["directoryRenameError"] = MoveFileExW(directory.c_str(), moved.c_str(), 0) ? 0 : GetLastError();
+    reply["selfRename"] = checked_reply((*owner)->publish(temporary.substr(temporary.find_last_of(L'\\') + 1)));
+    const auto guard = input.value("guard", std::string("none"));
+    struct GuardHandle
+    {
+        HANDLE value = INVALID_HANDLE_VALUE;
+        ~GuardHandle() { if(value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    } lock;
+    if(guard != "none")
+    {
+        const auto path = directory + L"\\" + filename;
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if(file == INVALID_HANDLE_VALUE) throw std::runtime_error("Late private guard creation failed");
+        constexpr char sentinel[] = "publication-guard";
+        DWORD written = 0;
+        const bool saved = WriteFile(file, sentinel, sizeof(sentinel) - 1, &written, nullptr) && written == sizeof(sentinel) - 1 && FlushFileBuffers(file);
+        CloseHandle(file);
+        if(!saved) throw std::runtime_error("Late private guard write failed");
+        if(guard == "readonly" && !SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_READONLY)) throw std::runtime_error("Private read-only guard failed");
+        if(guard == "locked")
+        {
+            lock.value = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if(lock.value == INVALID_HANDLE_VALUE) throw std::runtime_error("Private guard lock failed");
+        }
+    }
+    if(input.value("discard", false)) reply["discard"] = checked_reply((*owner)->discard());
+    else
+    {
+        const auto published = (*owner)->publish(filename);
+        reply["publication"] = checked_reply(published);
+        if(const auto* identity = std::get_if<PublishedFile>(&published))
+        {
+            reply["publication"]["identity"] = {{"sha256", identity->sha256}, {"size", decimal64(identity->size)},
+                {"volumeSerial", identity->volumeSerial}, {"fileIndex", decimal64(identity->fileIndex)}};
+            reply["repeat"] = checked_reply((*owner)->publish(filename));
+            reply["discardAfterPublication"] = checked_reply((*owner)->discard());
+        }
+        else reply["discard"] = checked_reply((*owner)->discard());
+    }
+    owner->reset();
+    reply["temporaryAbsent"] = GetFileAttributesW(temporary.c_str()) == INVALID_FILE_ATTRIBUTES;
     return reply;
 }
 
@@ -423,6 +495,8 @@ int main(int argc, char** argv)
                     const auto& input = std::get<Json>(parsed);
                     if(mode == "pe-plan" && argc == 2)
                         reply = pe_plan_probe(input);
+                    else if(mode == "publish-new" && argc == 2)
+                        reply = publication_probe(input);
                     else if(mode == "parity-resolve-input" && argc == 2)
                     {
                         if(const auto error = validate_schema(string_schema("utf8-text", 16384), input))
