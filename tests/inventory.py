@@ -11,9 +11,10 @@ import shutil
 import struct
 import subprocess
 import time
+import uuid
 import xml.etree.ElementTree as Xml
 
-from wi_driver import McpError, ROOT, compiler_environment, file_identity, loaded_modules, write_json
+from wi_driver import McpError, ROOT, USER, SuiteEnvironment, WinInspect, compiler_environment, file_identity, loaded_modules, write_json
 
 
 TOKEN_PATTERN = re.compile(
@@ -841,6 +842,155 @@ def build_inventory_fixture(environment, plugin_profile="shipped"):
         raise McpError(f"Inventory fixture build failed: {process.stdout} {process.stderr}")
     stage = environment.stage(plugin_profile)
     shutil.copy2(binary, stage / "plugins" / binary.name)
+
+
+def observe_gui_action(environment, fields, timeout):
+    token = uuid.uuid4().hex
+    request = environment.root / f"gui-action-{token}.json"
+    response = request.with_name(request.stem + ".result.json")
+    write_json(request, fields)
+    argument = request.as_posix()
+    if any(character in argument for character in '\"\r\n,'):
+        raise McpError("GUI fixture request path cannot be represented as a native argument")
+    debugger = WinInspect(environment, plugin_profile="native", timeout=timeout)
+    try:
+        debugger.start(f'baselineguiactions "{argument}"')
+        deadline = time.monotonic() + timeout
+        while not response.is_file() and time.monotonic() < deadline:
+            if debugger.proc.poll() is not None:
+                raise McpError("Native GUI exited before its action observation")
+            time.sleep(0.02)
+        if not response.is_file():
+            raise McpError("Native GUI action did not produce its observation")
+        observed = json.loads(response.read_text(encoding="utf-8"))
+        assert observed["nonce"] == fields["nonce"] and int(observed["processId"]) == debugger.proc.pid, "GUI observation has a stale request or process identity"
+        modules = loaded_modules(debugger.proc)
+        stage = environment.stage("native")
+        names = ["wininspect.exe", "wininspect.dll", "winbridge.dll", "wingui.dll"]
+        names.append("plugins/baseline_inventory.dp64" if environment.architecture == "x64" else "plugins/baseline_inventory.dp32")
+        for name in names:
+            expected = file_identity(stage / name)
+            matches = [module for module in modules if Path(module["path"]).resolve() == (stage / name).resolve()]
+            assert len(matches) == 1 and matches[0] == expected, f"GUI action loaded another native module: {name}"
+        assert not any(Path(module["path"]).name.lower().startswith("x64dbg-mcp-server") for module in modules), "GUI fixture loaded an external MCP provider"
+        debugger.record["loadedModules"] = modules
+        window_threads = set()
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def collect_window(window, context):
+            owner = wintypes.DWORD()
+            thread = USER.GetWindowThreadProcessId(window, ctypes.byref(owner))
+            if owner.value == debugger.proc.pid:
+                window_threads.add(thread)
+            return True
+
+        callback = callback_type(collect_window)
+        assert USER.EnumWindows(callback, 0) and window_threads, "No independently observed owned native GUI window"
+        if observed["valid"]:
+            assert observed["ownerThread"] and int(observed["guiThreadId"]) in window_threads, "GUI action did not execute on its actual window owner"
+            assert observed["guiThreadId"] != observed["commandThreadId"], "GUI action bypassed its native owner dispatch"
+        observation = {"request": file_identity(request), "response": file_identity(response), "fields": fields,
+                       "observed": observed, "windowOwnerThreads": sorted(window_threads), "process": debugger.record}
+    finally:
+        debugger.stop()
+    assert debugger.record is not None and debugger.record.get("exitCode") == 0, "Native GUI fixture did not exit normally"
+    return observation
+
+
+def check_gui_action(observation, before):
+    fields = observation["fields"]
+    observed = observation["observed"]
+    mode = fields["mode"]
+    edited = {name: fields[name] for name in ("counter", "label", "enabled")}
+    expected_fields = before if mode == "observe" else edited
+    after = edited if mode == "apply" else before
+    assert observed["valid"] and observed["mode"] == mode and observed["settingsStatus"] == 0
+    assert observed["nonce"] == fields["nonce"] and observed["ownerThread"] and int(observed["guiThreadId"]) in observation["windowOwnerThreads"]
+    assert observed["commandThreadId"] != observed["guiThreadId"]
+    assert observed["actionId"] == "WbbGuiFixtureApply" and observed["actionCalls"] == 1 and observed["actionChecked"] and observed["menuInstalled"], "Native Qt menu action was not triggered exactly once"
+    assert observed["dialogVisible"] and observed["dialogResult"] == int(mode == "apply"), "Actual dialog acceptance/cancellation differs"
+    assert observed["before"] == before and observed["fields"] == expected_fields and observed["after"] == after, "GUI fields or model differ from independent requested values"
+    assert observed["view"] == {"rows": 1, "columns": 3, **after}, "Actual Qt view did not expose the changed model"
+    assert observed["fieldSignals"] == {name: int(before[name] != expected_fields[name]) for name in before}, "Native field change signals differ"
+    return after
+
+
+def gui_action_negative_controls(observation, before):
+    observed = observation["observed"]
+    changes = [("stale_nonce", "nonce", "0" * 32), ("wrong_owner", "ownerThread", False),
+               ("wrong_owner_thread", "guiThreadId", "0"), ("missing_menu", "menuInstalled", False),
+               ("missing_action", "actionCalls", 0), ("inverted_dialog_result", "dialogResult", 1 - observed["dialogResult"]),
+               ("wrong_before", "before", {**before, "counter": before["counter"] + 1}),
+               ("wrong_fields", "fields", {**observed["fields"], "label": "altered field"}),
+               ("wrong_model", "after", {**observed["after"], "counter": observed["after"]["counter"] + 1}),
+               ("wrong_view", "view", {**observed["view"], "rows": 2}),
+               ("missing_field_signal", "fieldSignals", {**observed["fieldSignals"], "counter": observed["fieldSignals"]["counter"] + 1})]
+    controls = []
+    for name, key, value in changes:
+        altered = copy.deepcopy(observation)
+        altered["observed"][key] = value
+        try:
+            check_gui_action(altered, before)
+        except AssertionError:
+            controls.append({"name": name, "status": "rejected", "nativeEffectInjected": False})
+        else:
+            raise AssertionError(f"GUI checker admitted altered evidence: {name}")
+    return controls
+
+
+def run_gui_action_oracles(environment, results, timeout):
+    native = SuiteEnvironment(environment.root / "gui-actions", environment.architecture, ROOT / "x64dbg/bin" / environment.architecture)
+    observations = []
+    result = {"name": "test_native_gui_action_oracles", "status": "verified"}
+    try:
+        build_inventory_fixture(native, "native")
+        before = {"counter": 7, "label": "initial", "enabled": False}
+        phases = [("apply", 42, '源 "quote", {field}\\tail 🌸', True), ("cancel", 13, "cancelled", False),
+                  ("observe", 99, "ignored", False), ("apply", -3, "second revision", False),
+                  ("observe", 0, "ignored again", True), ("apply", 0, "", False),
+                  ("observe", 100, "ignored empty", True)]
+        settings = native.root / "gui-actions.ini"
+        for mode, counter, label, enabled in phases:
+            previous_settings = file_identity(settings) if settings.exists() else None
+            fields = {"mode": mode, "counter": counter, "label": label, "enabled": enabled, "nonce": uuid.uuid4().hex}
+            observation = observe_gui_action(native, fields, timeout)
+            previous_values = before
+            before = check_gui_action(observation, before)
+            observation["checkerControls"] = gui_action_negative_controls(observation, previous_values)
+            parser = configparser.RawConfigParser()
+            parser.read(settings, encoding="utf-8-sig")
+            saved = parser["General"]
+            assert int(saved["counter"]) == before["counter"] and saved["enabled"] == str(before["enabled"]).lower(), "Independent settings file contains another value"
+            assert bytes.fromhex(saved["labelUtf16"]).decode("utf-16-le") == before["label"], "Independent settings file lost its Unicode field"
+            current_settings = file_identity(settings)
+            if mode != "apply":
+                assert previous_settings == current_settings, "Cancel/observe changed persistent settings"
+            observation["settings"] = current_settings
+            observations.append(observation)
+        invalid = [("counter_range", {"counter": 4097}), ("fractional_counter", {"counter": 1.5}),
+                   ("wrong_boolean", {"enabled": "true"}), ("unknown_field", {"extra": 1}),
+                   ("nul_label", {"label": "invalid\0label"}), ("long_label", {"label": "x" * 257}),
+                   ("long_nonce", {"nonce": "x" * 65})]
+        for name, changes in invalid:
+            previous_settings = file_identity(settings)
+            fields = {"mode": "apply", "counter": 42, "label": "invalid", "enabled": True, "nonce": uuid.uuid4().hex, **changes}
+            observation = observe_gui_action(native, fields, timeout)
+            assert observation["observed"]["valid"] is False and observation["observed"]["error"] == "Invalid GUI fixture input"
+            assert "actionCalls" not in observation["observed"] and file_identity(settings) == previous_settings, "Rejected request executed a GUI effect"
+            observation["control"] = name
+            observation["settings"] = previous_settings
+            observations.append(observation)
+        result["oracle"] = {"scope": "native Qt menu/dialog/model/private-settings fixture reference",
+                           "observations": observations, "settings": file_identity(settings),
+                           "openGates": ["operational MCP GUI dispatch", "complete shipped GUI/provider parity", "accessibility and hosted-client acceptance"]}
+    except Exception as error:
+        result.update(status="failed", error=str(error), observations=observations)
+    finally:
+        native.retain([result], "fixtures")
+    results.append(result)
+    print(f"[{result['status'].upper()}] {environment.architecture} {result['name']}", flush=True)
+    if result.get("error"):
+        print(result["error"], flush=True)
 
 
 def capture_native_runtime_surface(debugger):

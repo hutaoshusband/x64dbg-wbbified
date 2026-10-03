@@ -432,7 +432,7 @@ def main():
         names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles", "test_native_memory_oracles",
                  "test_native_database_oracles", "test_native_stale_breakpoint_oracles", "test_native_execution_oracles", "test_native_register_oracles",
                  "test_native_module_oracles", "test_native_exception_oracles", "test_native_thread_oracles", "test_native_trace_oracles", "test_native_patch_oracles",
-                 "test_native_file_patch_oracles", "test_native_script_oracles", "test_native_breakin_oracles"]
+                 "test_native_file_patch_oracles", "test_native_script_oracles", "test_native_breakin_oracles", "test_native_gui_action_oracles"]
     if arguments.phase == "runner":
         names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
@@ -523,6 +523,9 @@ def main():
                     run_fixture_oracles(environment, architecture_results)
                 if "test_native_argument_oracles" in selected_names:
                     run_native_argument_oracles(environment, architecture_results)
+                if "test_native_gui_action_oracles" in selected_names:
+                    from inventory import run_gui_action_oracles
+                    run_gui_action_oracles(environment, architecture_results, arguments.timeout)
                 if "test_native_guard_page_oracles" in selected_names:
                     run_native_guard_page_oracles(environment, architecture_results)
                 if "test_native_memory_oracles" in selected_names:
