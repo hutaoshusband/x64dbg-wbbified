@@ -160,6 +160,44 @@ class ContractProbe:
         return stdout, stderr, observation
 
 
+def check_dependency_sources(build):
+    record_path = ROOT / "x64dbg/src/mcp/dependencies.json"
+    record_identity = file_identity(record_path)
+    manifest = json.loads((build / "build-manifest.json").read_text(encoding="utf-8"))
+    assert record_identity in manifest["sourceInputs"], "Dependency record differs from the built source"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    packages = {"http": ("mcp_boost", "LICENSE_1_0.txt"), "json": ("mcp_json_source", "LICENSE.MIT"),
+                "store": ("mcp_sqlite_source", None), "javascript": ("mcp_quickjs_source", "LICENSE")}
+    assert record["schemaVersion"] == 1 and len(record["dependencies"]) == len(packages)
+    assert {entry["role"] for entry in record["dependencies"]} == set(packages)
+    observations = []
+    for entry in record["dependencies"]:
+        package, notice_filename = packages[entry["role"]]
+        archive_root = build / "_deps" / f"{package}-subbuild" / f"{package}-populate-prefix/src"
+        fetch_path = archive_root / f"{package}-populate-stamp/{package}-populate-urlinfo.txt"
+        fetch = dict(line.split("=", 1) for line in fetch_path.read_text(encoding="utf-8").splitlines() if "=" in line)
+        if "url(s)" in fetch:
+            assert fetch["url(s)"] == entry["sourceUrl"], f"{entry['role']} fetched a different source URL"
+            assert fetch["hash"] == "SHA256=" + entry["archiveSha256"], f"{entry['role']} fetched a different archive pin"
+        else:
+            assert fetch["repository"] == "'external project URL'", f"{entry['role']} fetch is not a source archive"
+            assert fetch["module"] == f"'{entry['sourceUrl']}'", f"{entry['role']} fetched a different source URL"
+            assert fetch["tag"] == f"'SHA256={entry['archiveSha256']}'", f"{entry['role']} fetched a different archive pin"
+        archives = [file_identity(path) for path in archive_root.iterdir() if path.is_file()]
+        matches = [archive for archive in archives if archive["sha256"] == entry["archiveSha256"]]
+        assert len(matches) == 1, f"{entry['role']} retained archive does not match its SHA-256"
+        notice_path = build / "mcp-notices" / entry["notice"]
+        source_notice = build / "_deps" / f"{package}-src" / notice_filename if notice_filename else ROOT / "x64dbg/src/mcp/notices/sqlite.txt"
+        notice = file_identity(notice_path)
+        assert notice["sha256"] == entry["noticeSha256"], f"{entry['role']} notice differs from its recorded SHA-256"
+        assert notice_path.read_bytes() == source_notice.read_bytes(), f"{entry['role']} source notice was changed"
+        observations.append({"role": entry["role"], "version": entry["version"], "license": entry["license"],
+                             "sourceUrl": entry["sourceUrl"], "archive": matches[0], "fetch": file_identity(fetch_path),
+                             "notice": notice, "sourceNotice": file_identity(source_notice)})
+    assert file_identity(record_path) == record_identity, "Dependency record changed during verification"
+    return {"dependencyRecord": record_identity, "sourceDependencies": observations}
+
+
 def independent_validators(catalog):
     try:
         from jsonschema import Draft202012Validator, FormatChecker
@@ -1846,6 +1884,7 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                     assert not probe.call("range", {"address": {"addressHex": "0x100000000"}, "size": 1}, "x32")["valid"]
                 result["targetWidths"] = [32, 64]
             elif name == "test_source_dependencies":
+                result.update(check_dependency_sources(binary.parent))
                 observed = probe.call("dependencies")
                 assert observed["pointerBits"] == (64 if architecture == "x64" else 32)
                 assert observed["boostVersion"] == "1_92" and observed["jsonVersion"] == 31200

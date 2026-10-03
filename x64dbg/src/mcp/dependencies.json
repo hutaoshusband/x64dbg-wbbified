@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "reviewedAt": "2026-10-01",
+  "reviewedAt": "2026-10-03",
   "architectures": [
     "x64",
     "x32"
@@ -11,14 +11,51 @@
     "compiler": "MSVC",
     "compilerMinimum": "19.44.35228.0",
     "minimumToolsetFixture": "14.44.35207",
-    "languages": ["C11", "C++17", "C++23 for the inherited GleeBug target"],
+    "languages": [
+      "C11",
+      "C++17",
+      "C++23 for the inherited GleeBug target"
+    ],
     "runtimeVendorMinimum": "Windows 10 or Windows Server 2016 for the default Visual Studio 2026 toolchain; appropriate v14 runtime must match or exceed the selected build tools",
     "runtimeVendorReference": "https://learn.microsoft.com/en-us/cpp/overview/supported-platforms-visual-cpp?view=msvc-170",
     "redistributableReference": "https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170",
-    "verifiedHost": {"version": "10.0.19044", "architecture": "x64"},
-    "verifiedTargetArchitectures": ["x64", "x32"],
-    "unverifiedRuntimeMatrix": ["Other Windows 10 builds", "Windows 11", "Windows Server", "Native x86 OS", "ARM64 OS"],
-    "unsupportedBuildMatrix": ["CMake before 3.22.6", "MSVC before 19.44.35228.0", "Other compilers"]
+    "verifiedHost": {
+      "version": "10.0.19044",
+      "architecture": "x64"
+    },
+    "verifiedTargetArchitectures": [
+      "x64",
+      "x32"
+    ],
+    "unverifiedRuntimeMatrix": [
+      "Windows 7",
+      "Windows 8",
+      "Windows 8.1",
+      "Other Windows 10 builds",
+      "Windows 11",
+      "Windows Server",
+      "Native x86 OS",
+      "ARM64 OS"
+    ],
+    "unsupportedBuildMatrix": [
+      "CMake before 3.22.6",
+      "MSVC before 19.44.35228.0",
+      "Other compilers"
+    ],
+    "inheritedRuntimeRequirements": {
+      "windowsApiTarget": "0x0601",
+      "sourceBoundaries": [
+        "x64dbg/src/dbg/_global.h",
+        "x64dbg/src/exe/manifest.xml"
+      ],
+      "legacyWindows": [
+        "Windows 7",
+        "Windows 8",
+        "Windows 8.1"
+      ],
+      "status": "required_unverified",
+      "acceptance": "Preserve the inherited Windows API target and platform requirements; select a compatible compiler and deployed runtime, then verify the exact source-built components and debugger on each required OS. Current-host results and vendor policy do not close this gate."
+    }
   },
   "licenseCompatibilitySource": "https://www.gnu.org/licenses/license-list.html.html",
   "ownedCodeLicense": "Root LICENSE scopes MIT to owned contributions; original debugger license remains unchanged",
@@ -74,7 +111,8 @@
         "SQLITE_DQS=0",
         "SQLITE_DEFAULT_FOREIGN_KEYS=1",
         "SQLITE_OMIT_LOAD_EXTENSION"
-      ]
+      ],
+      "noticeSha256": "01423e006805feb9ff0d93b07cf7181ff8716bf332ede80ec6fa7e9a6e7ef5ce"
     },
     {
       "role": "javascript",
