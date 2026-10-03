@@ -22,7 +22,7 @@ CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_
               "test_new_file_publication", "test_native_library_fault_oracles", "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
-              "test_provider_ui_contracts", "test_library_script_contracts", "test_job_event_artifact_contracts", "test_native_launch_arguments", "test_native_peer_identity", "test_native_component_builds", "test_ipc_wire_codec")
+              "test_provider_ui_contracts", "test_library_script_contracts", "test_job_event_artifact_contracts", "test_native_launch_arguments", "test_native_peer_identity", "test_native_local_pipe", "test_native_component_builds", "test_ipc_wire_codec")
 
 EXECUTION_TOOLS = ("execution_resume", "execution_pause", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to",
                    "execution_skip_instruction", "execution_wait", "threads_list", "threads_select", "threads_suspend", "threads_resume", "threads_context",
@@ -54,6 +54,14 @@ JOB_EVENT_ARTIFACT_TOOLS = ("jobs_list", "job_get", "job_wait", "job_cancel", "o
 JOB_NATIVE_EFFECT_TOOLS = ("job_cancel",)
 
 
+def contract_source_inputs():
+    source = ROOT / "x64dbg"
+    paths = [source / "cmake.toml", source / "CMakeLists.txt", *sorted((source / "src/mcp").rglob("*")), *sorted((source / "src/dbg/mcp").rglob("*"))]
+    parity = json.loads((source / "src/mcp/common/parity_catalog.jsonl").open(encoding="ascii").readline())["data"]
+    paths.extend(ROOT / entry["path"] for entry in parity["sourceInputs"])
+    return [file_identity(path) for path in dict.fromkeys(paths) if path.is_file()]
+
+
 def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None, unity_build=False):
     build = Path(output) / f"build-{architecture}"
     build.mkdir()
@@ -67,11 +75,7 @@ def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None, 
     if qt.is_dir():
         configure.append(f"-DQt5_DIR={qt}")
     commands = []
-    source_paths = [source / "cmake.toml", source / "CMakeLists.txt", *sorted((source / "src/mcp").rglob("*")), *sorted((source / "src/dbg/mcp").rglob("*"))]
-    parity_header = json.loads((source / "src/mcp/common/parity_catalog.jsonl").open(encoding="ascii").readline())["data"]
-    source_paths.extend(ROOT / entry["path"] for entry in parity_header["sourceInputs"])
-    source_paths = list(dict.fromkeys(source_paths))
-    source_inputs = [file_identity(path) for path in source_paths if path.is_file()]
+    source_inputs = contract_source_inputs()
     with (build / "build.log").open("w", encoding="utf-8") as log:
         for command in (configure, [str(cmake_path), "--build", str(build), "--target", "mcp_contract_fixture", "mcp_launch_reference", "mcp_broker", "mcp_connect", "mcp_worker", "--parallel", "6"]):
             print(f"Building MCP contracts {architecture}: {command[1]}", flush=True)
@@ -102,6 +106,33 @@ def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None, 
     for key in ("cmake", "compiler"):
         assert file_identity(toolchain[key]["path"]) == toolchain[key], "Build tool changed during compilation"
     write_json(build / "build-manifest.json", manifest)
+    return binary
+
+
+def reuse_contract_fixture(builds, output, architecture):
+    build = Path(builds) / f"build-{architecture}"
+    manifest_path = build / "build-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["architecture"] == architecture
+    assert all(command["exitCode"] == 0 for command in manifest["commands"])
+    assert manifest["sourceInputs"] == contract_source_inputs(), "Compiled native source bindings changed or incomplete; rebuild required"
+    binary = build / "wininspect-mcp-contract-fixture.exe"
+    assert file_identity(binary) == manifest["binary"]
+    assert file_identity(build / "wininspect-mcp-launch-reference.exe") == manifest["launchReference"]
+    assert all(file_identity(item["path"]) == item for item in manifest["nativeComponents"] + manifest["compiledDependencies"] + manifest["notices"])
+    assert file_identity(manifest["buildInputs"]["path"]) == manifest["buildInputs"]
+    for key in ("cmake", "compiler"):
+        assert file_identity(manifest["toolchain"][key]["path"]) == manifest["toolchain"][key]
+    image = binary.read_bytes()
+    pe = struct.unpack_from("<I", image, 0x3c)[0]
+    assert image[:2] == b"MZ" and image[pe:pe + 4] == b"PE\0\0"
+    assert struct.unpack_from("<H", image, pe + 4)[0] == (0x8664 if architecture == "x64" else 0x14c)
+    receipt = {"manifest": file_identity(manifest_path), "originalSourceHead": manifest["sourceHead"],
+               "currentSourceHead": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+               "architecture": architecture, "binary": manifest["binary"], "toolchain": manifest["toolchain"],
+               "currentNativeSourcesEqual": True, "artifactsEqual": True, "reusedBuild": True}
+    write_json(Path(output) / f"reuse-{architecture}.json", receipt)
+    print(f"Reusing source-bound MCP contracts {architecture}: {binary}", flush=True)
     return binary
 
 
@@ -2230,6 +2261,9 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_native_launch(probe, architecture))
             elif name == "test_native_peer_identity":
                 result.update(check_native_peer_identity(probe, architecture))
+            elif name == "test_native_local_pipe":
+                from pipe_checks import check_local_pipes
+                result.update(check_local_pipes(probe, architecture, process_token_oracle, file_handle_oracle))
             elif name == "test_native_component_builds":
                 result.update(check_native_components(probe, architecture, validators, catalog))
             elif name == "test_ipc_wire_codec":

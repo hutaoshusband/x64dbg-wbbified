@@ -337,7 +337,7 @@ compile-features = ["cxx_std_17"]
 [target.mcp_contract_fixture]
 type = "executable"
 condition = "mcp"
-sources = ["src/mcp/testing/contracts.cpp", "src/mcp/testing/library_reference.cpp", "src/mcp/testing/library_reference.h"]
+sources = ["src/mcp/testing/contracts.cpp", "src/mcp/testing/library_reference.cpp", "src/mcp/testing/library_reference.h", "src/mcp/testing/pipe_reference.cpp", "src/mcp/testing/pipe_reference.h"]
 link-libraries = ["::mcp_common", "::mcp_worker", "mcp_http", "mcp_sqlite", "mcp_quickjs"]
 compile-features = ["cxx_std_17"]
 msvc.link-options = ["/MANIFESTUAC:level='asInvoker' uiAccess='false'"]

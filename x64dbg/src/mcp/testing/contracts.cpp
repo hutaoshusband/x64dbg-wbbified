@@ -10,6 +10,7 @@
 #include "ipc.h"
 #include "worker.h"
 #include "library_reference.h"
+#include "pipe_reference.h"
 #include <boost/beast/http.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/version.hpp>
@@ -520,6 +521,8 @@ int main(int argc, char** argv)
                         reply = publication_probe(input);
                     else if(mode == "library-reference" && argc == 2)
                         reply = library_reference(input);
+                    else if(mode == "local-pipe-reference" && argc == 2)
+                        reply = local_pipe_reference(input);
                     else if(mode == "parity-resolve-input" && argc == 2)
                     {
                         if(const auto error = validate_schema(string_schema("utf8-text", 16384), input))

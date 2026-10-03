@@ -315,6 +315,7 @@ def parse_arguments():
     parser.add_argument("--cmake", type=Path, help="CMake executable for the native or mcp-contracts source build")
     parser.add_argument("--msvc-toolset", help="Exact installed MSVC toolset version for the native or mcp-contracts source build")
     parser.add_argument("--unity-build", action="store_true", help="Enable global CMake unity compilation for the mcp-contracts source build")
+    parser.add_argument("--contract-builds", type=Path, help="Reuse source-bound MCP artifacts from a private run containing build-x64/build-x32")
     arguments = parser.parse_args()
     if not 1 <= arguments.timeout <= 60:
         parser.error("--timeout must be between 1 and 60 seconds")
@@ -339,6 +340,10 @@ def parse_arguments():
             parser.error("--msvc-toolset must be an exact numeric version")
     if arguments.unity_build and arguments.phase != "mcp-contracts":
         parser.error("--unity-build requires --phase mcp-contracts")
+    if arguments.contract_builds:
+        if arguments.phase != "mcp-contracts" or arguments.cmake or arguments.msvc_toolset or arguments.unity_build:
+            parser.error("--contract-builds requires mcp-contracts without new build options")
+        arguments.contract_builds = arguments.contract_builds.expanduser().resolve()
     return arguments
 
 
@@ -507,13 +512,13 @@ def main():
             build_debugger(run_root, architecture, arguments.cmake, arguments.msvc_toolset)
         return 0
     if arguments.phase == "mcp-contracts":
-        from native_contracts import build_contract_fixture, run_contract_checks
+        from native_contracts import build_contract_fixture, reuse_contract_fixture, run_contract_checks
         architectures = ("x64", "x32") if arguments.arch == "all" else (arguments.arch,)
         results = []
         catalogs = []
         for architecture in architectures:
             try:
-                binary = build_contract_fixture(run_root, architecture, arguments.cmake, arguments.msvc_toolset, arguments.unity_build)
+                binary = reuse_contract_fixture(arguments.contract_builds, run_root, architecture) if arguments.contract_builds else build_contract_fixture(run_root, architecture, arguments.cmake, arguments.msvc_toolset, arguments.unity_build)
                 checks, catalog = run_contract_checks(binary, run_root / architecture, architecture, arguments.case, arguments.timeout)
                 results.extend(checks)
                 catalogs.append(catalog)
