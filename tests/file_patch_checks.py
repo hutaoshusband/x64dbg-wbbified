@@ -11,7 +11,7 @@ OVERLAY = b"WBB_FILE_OVERLAY\0" + bytes(range(256))
 GUARD = b"WBB_FILE_GUARD\0\x5a"
 
 
-def file_image_facts(binary, machine):
+def file_image_facts(binary, machine, *, allow_linker_checksum=False):
     import pefile
     facts = patch_image_facts(binary, machine)
     data = Path(binary).read_bytes()
@@ -40,13 +40,17 @@ def file_image_facts(binary, machine):
         tail = [section for section in sections if section["rva"] == exports["PatchVirtualTail"]]
         assert len(tail) == 1 and tail[0]["name"] == "PBSS" and tail[0]["virtualSize"] == 8192 and tail[0]["rawSize"] == tail[0]["rawOffset"] == 0 and tail[0]["flags"] & 0x80, "Virtual zero tail unexpectedly has raw bytes"
         security = image.OPTIONAL_HEADER.DATA_DIRECTORY[4]
-        assert security.VirtualAddress == security.Size == 0 and image.OPTIONAL_HEADER.CheckSum == 0, "Reference requires its declared unsigned zero-checksum source"
+        assert security.VirtualAddress == security.Size == 0, "Reference requires its declared unsigned source"
+        checksum = image.OPTIONAL_HEADER.CheckSum
+        computed_checksum = image.generate_checksum()
+        assert checksum == 0 or allow_linker_checksum and checksum == computed_checksum, "Reference requires zero or an explicitly admitted valid linker checksum"
         assert image.OPTIONAL_HEADER.DllCharacteristics & 0x40 and data[0x1c] == 0 and 0x1c < header_size, "Source ASLR or reserved header predicate differs"
         overlay_offset = max([header_size, *(end for _, end in raw_ranges)])
         return {**facts, "pointerWidth": width, "preferredBase": preferred, "pointerRawOffset": pointer_raw,
                 "headerOffset": 0x1c, "headersSize": header_size, "sections": sections, "relocations": relocations,
                 "overlayOffset": overlay_offset, "overlay": data[overlay_offset:].hex(), "fileSize": len(data),
-                "checksum": image.OPTIONAL_HEADER.CheckSum, "computedChecksum": image.generate_checksum(), "signed": False}
+                "checksum": checksum, "checksumOffset": image.OPTIONAL_HEADER.get_field_absolute_offset("CheckSum"),
+                "computedChecksum": computed_checksum, "signed": False}
     finally:
         image.close()
 
@@ -163,9 +167,9 @@ def check_wrong_patch_output(receipt, facts):
     assert observed == expected, "Wrong saved instruction did not actually execute 43 with its invalid marker"
 
 
-def rejected_control(name, checker, *arguments):
+def rejected_control(name, checker, *arguments, **keywords):
     try:
-        checker(*arguments)
+        checker(*arguments, **keywords)
     except (AssertionError, ValueError, KeyError) as error:
         return {"name": name, "status": "rejected", "error": str(error)}
     raise AssertionError(f"File patch negative control was admitted: {name}")
@@ -185,7 +189,8 @@ def file_negative_controls(receipt, facts, directory, engine, source, normal):
     base = int(re.findall(r"PATCH_LAYOUT .* base=([0-9a-f]+)", output)[0], 16)
     saved = expected_file_bytes(source, facts, 0, base)
     for name, offset in (("changed_overlay", len(saved) - 1), ("wrong_instruction", facts["valueRawOffset"] + 2),
-                         ("outside_plan_raw_byte", facts["valueRawOffset"] + 16), ("wrong_header", facts["headerOffset"])):
+                         ("outside_plan_raw_byte", facts["valueRawOffset"] + 16), ("wrong_header", facts["headerOffset"]),
+                         ("changed_checksum", facts["checksumOffset"])):
         candidate = bytearray(saved)
         candidate[offset] ^= 1
         controls.append(rejected_control(name, check_file_bytes, candidate, source, facts, 0, base))
@@ -199,7 +204,7 @@ def run_file_patch_oracles(environment, results, selected_engine, timeout, fixtu
         raise McpError("File execution references require TitanEngine or GleeBug")
     engines = ("TitanEngine", "GleeBug") if selected_engine == "all" else (selected_engine,)
     binary, identity, machine = fixture_identity(environment, "patch_canary")
-    facts = file_image_facts(binary, machine)
+    facts = file_image_facts(binary, machine, allow_linker_checksum=True)
     runtime = binary.parent.parent
     plugin = runtime / "tests/patch_canary" / ("patch_canary.dp64" if machine == 0x8664 else "patch_canary.dp32")
     source_script = plugin.parent / "test.file.txt"
@@ -217,10 +222,16 @@ def run_file_patch_oracles(environment, results, selected_engine, timeout, fixtu
         profile.mkdir(parents=True)
         inputs.mkdir()
         copied = inputs / "patch_canary.exe"
-        copied.write_bytes(binary.read_bytes() + OVERLAY)
+        original_bytes = binary.read_bytes()
+        checksum_offset = facts["checksumOffset"]
+        source_payload = bytearray(original_bytes)
+        source_payload[checksum_offset:checksum_offset + 4] = bytes(4)
+        source_payload.extend(OVERLAY)
+        copied.write_bytes(source_payload)
         source_identity = file_identity(copied)
         source_bytes = copied.read_bytes()
         source_facts = file_image_facts(copied, machine)
+        assert source_facts["checksum"] == 0 and source_bytes[:checksum_offset] == original_bytes[:checksum_offset] and source_bytes[checksum_offset + 4:len(original_bytes)] == original_bytes[checksum_offset + 4:], "Private source preparation changed bytes outside its declared checksum field"
         assert source_facts["overlay"] == (bytes.fromhex(facts["overlay"]) + OVERLAY).hex(), "Source copy lacks its independently appended overlay"
         engine_id = 0 if engine == "TitanEngine" else 1
         (profile / "headless.ini").write_text(f"[Engine]\nDebugEngine={engine_id}\nNoConsoleWindow=1\n", encoding="utf-8")
@@ -233,6 +244,22 @@ def run_file_patch_oracles(environment, results, selected_engine, timeout, fixtu
         baseline = run_owned([str(copied)], normal_environment, timeout)
         write_json(scope / "source-normal.json", baseline)
         check_patch_output(baseline, source_facts, 2)
+        invalid_checksum = bytearray(original_bytes)
+        invalid_checksum_value = (facts["computedChecksum"] ^ 1) or 2
+        invalid_checksum[checksum_offset:checksum_offset + 4] = invalid_checksum_value.to_bytes(4, "little")
+        invalid_source = scope / "control-invalid-source-checksum.exe"
+        invalid_source.write_bytes(invalid_checksum)
+        invalid_normal = run_owned([str(invalid_source)], normal_environment, timeout)
+        write_json(scope / "control-invalid-source-checksum.json", invalid_normal)
+        check_patch_output(invalid_normal, facts, 2)
+        source_admission = rejected_control("invalid_source_checksum", file_image_facts, invalid_source, machine,
+                                            allow_linker_checksum=True)
+        assert source_admission["error"] == "Reference requires zero or an explicitly admitted valid linker checksum", "Invalid source was refused by an unrelated predicate"
+        source_admission.update(targetExecuted=True, binary=file_identity(invalid_source), receipt=invalid_normal)
+        preparation = {"original": identity, "source": source_identity, "checksumOffset": checksum_offset,
+                       "originalChecksum": facts["checksum"], "preparedChecksum": source_facts["checksum"],
+                       "appendedOverlay": OVERLAY.hex()}
+        write_json(scope / "source-preparation.json", {"preparation": preparation, "negativeControl": source_admission})
         receipt = run_owned([str(required[0]), "-testing", "-userdir", str(profile), "-plugin", str(plugin), "-cf", str(script)], child, timeout,
                             required_modules=[*required, runtime / ("TitanEngine.dll" if engine_id == 0 else "GleeBug/TitanEngine.dll")])
         write_json(scope / "receipt.json", receipt)
@@ -255,6 +282,7 @@ def run_file_patch_oracles(environment, results, selected_engine, timeout, fixtu
             actual = check_patch_output(normal, source_facts, 2, 42 if kind == 0 else 7) if kind != 3 else check_relocation_exit(normal)
             persisted.append({"kind": kind, "binary": file_identity(destination), "changedOffsets": changes, "receipt": normal, "observed": actual})
         controls = file_negative_controls(receipt, source_facts, directory, engine, source_bytes, persisted[0]["receipt"])
+        controls.append(source_admission)
         for name, old, new in (("missing_strict_plan", "PE_FILE kind=1 ", "IGNORED_FILE kind=1 "),
                               ("false_normalization", "normalized=1 ranges=2", "normalized=0 ranges=2"),
                               ("wrong_source_hash", f"sourceSha={source_identity['sha256']}", f"sourceSha={'0' * 64}"),
@@ -289,10 +317,10 @@ def run_file_patch_oracles(environment, results, selected_engine, timeout, fixtu
         assert file_identity(copied) == source_identity, "File export or controls changed their source executable"
         assert receipt["loadedModules"] and not any("mcp-server" in item["path"].lower() or "agent smithers" in item["path"].lower() for item in receipt["loadedModules"]), "File reference loaded an external MCP dependency"
         write_json(scope / "independent-files.json", {"source": source_identity, "facts": source_facts, "observed": observed, "persisted": persisted,
-                   "strict": strict, "strictPersisted": strict_persisted, "negativeControls": controls})
+                   "preparation": preparation, "strict": strict, "strictPersisted": strict_persisted, "negativeControls": controls})
         observations.append({"engine": engine, "source": source_identity, "sourcePeFacts": source_facts, "script": file_identity(script),
                              "sourceScript": file_identity(source_script), "native": receipt, "observed": observed, "persisted": persisted,
-                             "strict": strict, "strictPersisted": strict_persisted,
+                             "preparation": preparation, "strict": strict, "strictPersisted": strict_persisted,
                              "guardFiles": [file_identity(directory / f"file-{kind}.exe") for kind in (4, 8)], "negativeControls": controls})
         print(f"[VERIFIED] Native {environment.architecture} {engine} strict normalized files execute 7/42/7; legacy export, source/overlay retention and rejection controls verified", flush=True)
     assert file_identity(binary) == identity, "File patch reference changed the source-built executable"
