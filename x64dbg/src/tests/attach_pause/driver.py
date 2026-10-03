@@ -245,7 +245,7 @@ def main() -> int:
             "-userdir",
             str(userdir),
             "-c",
-            f'RedirectLog "{path_arg(log_path, headless_dir)}"',
+            f'RedirectLog "{log_path}"',
         ]
         suffix = ".dp32" if any(peb["kind"] == "wow64" for peb in observations["beforeAttach"]["pebs"]) else ".dp64"
         provider = Path(args.runtime_dir).resolve() / ("attach_pause" + suffix)

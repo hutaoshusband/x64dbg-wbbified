@@ -137,7 +137,7 @@ def main() -> int:
             "-p",
             str(target.pid),
             "-c",
-            f'RedirectLog "{path_arg(log_path, headless_dir)}"',
+            f'RedirectLog "{log_path}"',
             "-cf",
             path_arg(script, headless_dir),
         ]

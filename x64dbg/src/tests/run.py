@@ -359,7 +359,7 @@ def run_test(headless: Path, test: TestCase, timeout: int, artifact_root: Path, 
     command.extend(
         [
             "-c",
-            f'RedirectLog "{path_arg(log_path, headless_dir)}"',
+            f'RedirectLog "{log_path}"',
             "-cf",
             command_file,
         ]
