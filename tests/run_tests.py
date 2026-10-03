@@ -436,7 +436,7 @@ def main():
     if arguments.phase == "runner":
         names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
-        names = ["test_source_inventory"]
+        names = ["test_source_inventory", "test_parity_registry_refresh"]
     if arguments.phase in ("native", "build"):
         names = [arguments.phase]
     if arguments.phase == "mcp-contracts":
@@ -448,6 +448,8 @@ def main():
                       any(fnmatch.fnmatchcase(name, pattern) for pattern in arguments.case)]
     if not selected_names and arguments.phase not in ("native", "build"):
         raise McpError("No cases match the selection")
+    if arguments.phase == "inventory" and (arguments.refresh_registries or arguments.runtime_surface) and "test_source_inventory" not in selected_names:
+        raise McpError("Registry refresh and runtime surface reconciliation require test_source_inventory")
     if arguments.list:
         print("\n".join(selected_names))
         return 0
@@ -490,10 +492,17 @@ def main():
         return int(any(result["status"] != "verified" for result in results))
     if arguments.phase == "inventory":
         from inventory import run_inventory
-        outcome = run_inventory(run_root, arguments.catalog, arguments.refresh_registries, arguments.runtime_surface)
-        write_json(run_root / "summary.json", outcome)
-        print(f"Reconciled {outcome['legacy']['count']} legacy tools; parity candidates: {outcome['categories']}", flush=True)
-        print("Runtime provider reconciliation remains pending", flush=True)
+        results = []
+        if "test_parity_registry_refresh" in selected_names:
+            results.append(cases.test_parity_registry_refresh(run_root, arguments.catalog))
+            print("[VERIFIED] test_parity_registry_refresh", flush=True)
+        outcome = {}
+        if "test_source_inventory" in selected_names:
+            outcome = run_inventory(run_root, arguments.catalog, arguments.refresh_registries, arguments.runtime_surface)
+            results.append({"name": "test_source_inventory", "status": "verified", **outcome})
+            print(f"Reconciled {outcome['legacy']['count']} legacy tools; parity candidates: {outcome['categories']}", flush=True)
+            print("Runtime provider behavioral acceptance remains pending", flush=True)
+        write_json(run_root / "summary.json", {**outcome, "phase": arguments.phase, "results": results})
         return 0
     architectures = ("x64", "x32") if arguments.arch == "all" else (arguments.arch,)
     results = []

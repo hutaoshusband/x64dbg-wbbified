@@ -1,4 +1,5 @@
 from collections import Counter
+import copy
 import configparser
 import ctypes
 from ctypes import wintypes
@@ -1162,6 +1163,144 @@ def merge_runtime_surface(inventory, surface_path):
         inventory["coverageGaps"].append(f"This registry contains only the {capture['architecture']} runtime capture; other captures need merging")
 
 
+RUNTIME_VARIANT_FIELDS = frozenset(("runtimeCommandNames", "runtimeCommandObservations", "runtimeObserved", "runtimeObservations", "nativeExportObservations"))
+RUNTIME_CAPTURE_LISTS = ("nativeScriptExportCaptures", "commandReconciliations")
+
+
+def validate_recorded_registry(inventory):
+    if inventory.get("schemaVersion") != 2 or inventory.get("scope") != "source-registration-and-form-inventory":
+        raise ValueError("Recorded parity registry has an unsupported version or scope")
+    for field, key in (("inputs", "path"), ("operations", "id")):
+        rows = inventory.get(field)
+        if not isinstance(rows, list) or not rows or any(not isinstance(row, dict) or not isinstance(row.get(key), str) for row in rows):
+            raise ValueError("Recorded parity registry has invalid " + field)
+        if len({row[key] for row in rows}) != len(rows):
+            raise ValueError("Recorded parity registry has duplicate " + key)
+    for source in inventory["inputs"]:
+        if not isinstance(source.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", source["sha256"]):
+            raise ValueError("Recorded parity source input has an invalid digest")
+    for row in inventory["operations"]:
+        required = ("category", "aliases", "provider", "architectures", "stateRequirement", "agentRoute", "acceptanceIds", "completionPredicate", "status", "evidence")
+        if any(field not in row for field in required):
+            raise ValueError("Recorded parity operation lacks a mandatory contract field")
+        if not isinstance(row.get("source"), dict) or not isinstance(row.get("variants"), dict):
+            raise ValueError("Recorded parity operation lacks its source or variants")
+        capture = row["source"].get("runtimeCaptureRef")
+        if capture is not None and (not isinstance(capture, str) or not capture.startswith("runtimeCaptures.") or capture.split(".", 1)[1] not in inventory.get("runtimeCaptures", {})):
+            raise ValueError("Recorded parity operation refers to a missing runtime capture")
+    if dict(Counter(row["category"] for row in inventory["operations"])) != inventory.get("categories"):
+        raise ValueError("Recorded parity registry category totals do not match its operations")
+
+
+def source_projection(row):
+    fields = ("id", "category", "source", "aliases", "provider", "architectures", "stateRequirement", "completionPredicate", "acceptanceIds")
+    result = {field: row[field] for field in fields}
+    result["variants"] = {key: value for key, value in row["variants"].items() if key not in RUNTIME_VARIANT_FIELDS}
+    return result
+
+
+def operation_source_paths(value):
+    if isinstance(value, dict):
+        if isinstance(value.get("path"), str):
+            yield value["path"]
+        for child in value.values():
+            yield from operation_source_paths(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from operation_source_paths(child)
+
+
+def merge_recorded_registry(current, previous, previous_sha256):
+    validate_recorded_registry(current)
+    validate_recorded_registry(previous)
+    current = copy.deepcopy(current)
+    merged = copy.deepcopy(previous)
+    old_inputs = {entry["path"]: entry["sha256"] for entry in previous["inputs"]}
+    new_inputs = {entry["path"]: entry["sha256"] for entry in current["inputs"]}
+    changed_inputs = {path for path in old_inputs if old_inputs[path] != new_inputs.get(path)}
+    current_rows = {row["id"]: row for row in current["operations"]}
+    rows = []
+    retained = []
+    unresolved = []
+    newly_unresolved = []
+    restored = []
+    changed_rows = []
+    invalidated = []
+    for old in previous["operations"]:
+        replacement = current_rows.pop(old["id"], None)
+        source_owned = "path" in old["source"]
+        if replacement is None:
+            replacement = copy.deepcopy(old)
+            retained.append(old["id"])
+            if source_owned:
+                replacement["sourceAvailability"] = "not_found_in_current_inventory"
+                unresolved.append(old["id"])
+                if old.get("sourceAvailability") != "not_found_in_current_inventory":
+                    newly_unresolved.append(old["id"])
+        elif old["category"] != replacement["category"] or old["provider"] != replacement["provider"]:
+            raise ValueError("A parity identity changed category or provider")
+        else:
+            if old.get("sourceAvailability") == "not_found_in_current_inventory":
+                restored.append(old["id"])
+            if not source_owned:
+                replacement["architectures"] = sorted(set(old["architectures"]) | set(replacement["architectures"]))
+            if source_projection(old) != source_projection(replacement):
+                changed_rows.append(old["id"])
+            for field, value in old.items():
+                if field not in replacement and field != "sourceAvailability":
+                    replacement[field] = copy.deepcopy(value)
+            for field in ("agentRoute", "status", "evidence"):
+                replacement[field] = copy.deepcopy(old[field])
+            for field in RUNTIME_VARIANT_FIELDS:
+                if field in old["variants"]:
+                    if field not in replacement["variants"]:
+                        replacement["variants"][field] = copy.deepcopy(old["variants"][field])
+                    elif isinstance(old["variants"][field], list):
+                        replacement["variants"][field] = copy.deepcopy(old["variants"][field]) + [value for value in replacement["variants"][field] if value not in old["variants"][field]]
+            if "runtimeObservations" in old:
+                replacement["runtimeObservations"] = copy.deepcopy(old["runtimeObservations"]) + [value for value in replacement.get("runtimeObservations", []) if value not in old["runtimeObservations"]]
+        touched_source = bool(set(operation_source_paths(source_projection(old))) & changed_inputs)
+        if old["status"] in ("verified", "complete") and (touched_source or old["id"] in changed_rows or old["id"] in unresolved):
+            replacement.setdefault("invalidatedEvidence", []).append({"status": old["status"], "evidence": copy.deepcopy(old["evidence"]), "reason": "source_binding_changed"})
+            replacement["status"], replacement["evidence"] = "planned", None
+            invalidated.append(old["id"])
+        rows.append(replacement)
+    rows.extend(current_rows.values())
+    for field in ("schemaVersion", "scope", "inputs", "bindings", "registrationFactories", "excludedDeclarations"):
+        merged[field] = current[field]
+    captures = merged.setdefault("runtimeCaptures", {})
+    for key, capture in current.get("runtimeCaptures", {}).items():
+        if key in captures and captures[key] != capture:
+            raise ValueError("Recorded runtime capture has conflicting provenance")
+        captures[key] = capture
+    for field in RUNTIME_CAPTURE_LISTS:
+        if field in current:
+            merged.setdefault(field, [])
+            merged[field].extend(value for value in current[field] if value not in merged[field])
+    for field in ("runtimeSnapshot", "runtimeCapture", "commandReconciliation"):
+        if field in current:
+            merged[field] = current[field]
+    if captures:
+        merged["observedArchitectures"] = sorted({capture["architecture"] for capture in captures.values()})
+    merged["operations"] = rows
+    merged["categories"] = dict(Counter(row["category"] for row in rows))
+    merged["coverageGaps"] = list(dict.fromkeys(previous["coverageGaps"] + current["coverageGaps"]))
+    if unresolved:
+        gap = "Previously inventoried source actions absent from the current scan require explicit reconciliation"
+        if gap not in merged["coverageGaps"]:
+            merged["coverageGaps"].append(gap)
+    report = {"previousManifestSha256": previous_sha256, "previousOperationCount": len(previous["operations"]),
+              "currentDiscoveredOperationCount": len(current["operations"]), "mergedOperationCount": len(rows),
+              "retainedOperationIds": retained, "unresolvedSourceIds": unresolved, "restoredSourceIds": restored, "changedSourceIds": changed_rows,
+              "invalidatedEvidenceIds": invalidated, "changedInputPaths": sorted(changed_inputs),
+              "addedInputPaths": sorted(new_inputs.keys() - old_inputs.keys()), "addedOperationIds": sorted(current_rows)}
+    changed_captures = current.get("runtimeCaptures", {}).keys() - previous.get("runtimeCaptures", {}).keys()
+    if report["changedInputPaths"] or report["addedInputPaths"] or changed_rows or current_rows or invalidated or changed_captures or newly_unresolved or restored:
+        merged.setdefault("sourceReconciliations", []).append(report)
+    validate_recorded_registry(merged)
+    return merged, report
+
+
 def write_parity_registry(path, inventory):
     fields = []
     for name, value in inventory.items():
@@ -1174,16 +1313,21 @@ def write_parity_registry(path, inventory):
     Path(path).write_text("{\n" + ",\n".join(fields) + "\n}\n", encoding="utf-8", newline="\n")
 
 
-def run_inventory(output, catalog_path, refresh, surface_paths=None):
+def run_inventory(output, catalog_path, refresh, surface_paths=None, registry_path=None):
     inventory = collect_source_inventory()
     if isinstance(surface_paths, (str, Path)):
         surface_paths = [surface_paths]
     for surface_path in surface_paths or []:
         merge_runtime_surface(inventory, surface_path)
+    registry_path = Path(registry_path) if registry_path is not None else REGISTRY_DIRECTORY / "parity-manifest.json"
+    prior_reconciliation = None
+    if registry_path.is_file():
+        previous = json.loads(registry_path.read_text(encoding="utf-8"))
+        inventory, prior_reconciliation = merge_recorded_registry(inventory, previous, file_identity(registry_path)["sha256"])
     write_json(Path(output) / "source-inventory.json", inventory)
     reconciliation = reconcile_legacy_catalog(catalog_path)
     write_json(Path(output) / "legacy-reconciliation.json", reconciliation)
     if refresh:
-        write_parity_registry(REGISTRY_DIRECTORY / "parity-manifest.json", inventory)
+        write_parity_registry(registry_path, inventory)
     return {"legacy": reconciliation, "categories": inventory["categories"],
-            "sourceInputs": len(inventory["inputs"]), "coverageGaps": inventory["coverageGaps"]}
+            "sourceInputs": len(inventory["inputs"]), "coverageGaps": inventory["coverageGaps"], "priorReconciliation": prior_reconciliation}

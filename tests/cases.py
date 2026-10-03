@@ -12,6 +12,139 @@ REQUIRED_TOOLS = {"LoadBinary", "run", "GetDebugState", "StopDebug", "SetBreakpo
                   "ExecuteDebuggerCommand", "GetEventLog"}
 
 
+def test_parity_registry_refresh(output, catalog_path):
+    import copy
+    import hashlib
+    import json
+    from collections import Counter
+    from pathlib import Path
+    import inventory
+    from wi_driver import file_identity, write_json
+    scope = Path(output) / "registry-refresh"
+    scope.mkdir()
+    original_path = inventory.REGISTRY_DIRECTORY / "parity-manifest.json"
+    original_bytes = original_path.read_bytes()
+    original = json.loads(original_bytes)
+    original_hash = hashlib.sha256(original_bytes).hexdigest()
+    source = inventory.collect_source_inventory()
+    previous = {row["id"]: row for row in original["operations"]}
+    current = {row["id"]: row for row in source["operations"]}
+    candidate = scope / "parity-manifest.json"
+    candidate.write_bytes(original_bytes)
+    first = scope / "first"
+    first.mkdir()
+    result = inventory.run_inventory(first, catalog_path, True, registry_path=candidate)
+    published_bytes = candidate.read_bytes()
+    published = json.loads(published_bytes)
+    observed = {row["id"]: row for row in published["operations"]}
+    assert set(observed) == set(previous) | set(current)
+    assert published["inputs"] == source["inputs"]
+    assert all(file_identity(inventory.ROOT / row["path"])["sha256"] == row["sha256"] for row in published["inputs"])
+    retained = set(previous) - set(current)
+    assert retained and all(observed[name] == previous[name] for name in retained if "path" not in previous[name]["source"])
+    for name, fresh in current.items():
+        for field in ("source", "category", "provider", "aliases", "stateRequirement", "architectures", "acceptanceIds", "completionPredicate"):
+            assert observed[name][field] == fresh[field]
+        for field, value in fresh["variants"].items():
+            assert observed[name]["variants"][field] == value
+        for field in ("runtimeCommandNames", "runtimeCommandObservations", "runtimeObserved", "runtimeObservations", "nativeExportObservations"):
+            if field in previous[name]["variants"]:
+                assert observed[name]["variants"][field] == previous[name]["variants"][field]
+    for field in ("runtimeCaptures", "commandReconciliations", "nativeScriptExportCaptures", "runtimeSnapshot", "runtimeCapture", "observedArchitectures"):
+        assert published[field] == original[field]
+    assert result["priorReconciliation"]["retainedOperationIds"] == [row["id"] for row in original["operations"] if row["id"] not in current]
+    assert published["categories"] == dict(Counter(row["category"] for row in published["operations"]))
+    second = scope / "second"
+    second.mkdir()
+    inventory.run_inventory(second, catalog_path, True, registry_path=candidate)
+    assert candidate.read_bytes() == published_bytes, "Repeated refresh changes an unchanged registry"
+    controlled = copy.deepcopy(published)
+    touched = next(row for row in controlled["operations"] if row["id"] == "command.inc")
+    untouched = next(row for row in controlled["operations"] if row["id"] == "setting.JIT.Old")
+    next(entry for entry in controlled["inputs"] if entry["path"] == touched["source"]["path"])["sha256"] = "0" * 64
+    for row in (touched, untouched):
+        row["status"] = "verified"
+        row["evidence"] = {"fixture": "controlled prior proof", "id": row["id"]}
+        row["agentRoute"] = "commands_execute"
+    merged, report = inventory.merge_recorded_registry(source, controlled, original_hash)
+    indexed = {row["id"]: row for row in merged["operations"]}
+    assert indexed[touched["id"]]["status"] == "planned" and indexed[touched["id"]]["evidence"] is None
+    assert indexed[touched["id"]]["invalidatedEvidence"][-1]["evidence"] == touched["evidence"]
+    assert indexed[untouched["id"]]["status"] == "verified" and indexed[untouched["id"]]["evidence"] == untouched["evidence"]
+    assert indexed[touched["id"]]["agentRoute"] == "commands_execute"
+    removed = copy.deepcopy(source)
+    removed["operations"] = [row for row in removed["operations"] if row["id"] != untouched["id"]]
+    removed["categories"][untouched["category"]] -= 1
+    merged, report = inventory.merge_recorded_registry(removed, controlled, original_hash)
+    indexed = {row["id"]: row for row in merged["operations"]}
+    assert set(indexed) == set(previous) and untouched["id"] in report["unresolvedSourceIds"]
+    assert indexed[untouched["id"]]["sourceAvailability"] == "not_found_in_current_inventory"
+    assert indexed[untouched["id"]]["status"] == "planned" and indexed[untouched["id"]]["evidence"] is None
+    unchanged_missing, repeated_report = inventory.merge_recorded_registry(removed, merged, original_hash)
+    assert unchanged_missing == merged and untouched["id"] in repeated_report["unresolvedSourceIds"]
+    restored, restored_report = inventory.merge_recorded_registry(source, merged, original_hash)
+    restored_row = next(row for row in restored["operations"] if row["id"] == untouched["id"])
+    assert "sourceAvailability" not in restored_row and restored_row["status"] == "planned"
+    assert restored_report["restoredSourceIds"] == [untouched["id"]]
+    expanded = copy.deepcopy(source)
+    new = copy.deepcopy(current["command.inc"])
+    new["id"], new["aliases"] = "fixture.new-source-action", ["fixture-new"]
+    expanded["operations"].append(new)
+    expanded["categories"][new["category"]] += 1
+    merged, report = inventory.merge_recorded_registry(expanded, original, original_hash)
+    assert {row["id"] for row in merged["operations"]} == set(previous) | {new["id"]}
+    historical = next(row for row in original["operations"] if "runtimeCaptureRef" in row["source"] and row["architectures"] == ["x32", "x64"])
+    observed_again = copy.deepcopy(source)
+    addition = copy.deepcopy(historical)
+    addition["architectures"] = ["x64"]
+    observed_again["operations"].append(addition)
+    observed_again["categories"][addition["category"]] += 1
+    observed_again["runtimeCaptures"] = copy.deepcopy(original["runtimeCaptures"])
+    merged, report = inventory.merge_recorded_registry(observed_again, original, original_hash)
+    row = next(row for row in merged["operations"] if row["id"] == historical["id"])
+    assert row["architectures"] == ["x32", "x64"] and row["runtimeObservations"] == historical["runtimeObservations"]
+    controls = []
+    def reject(name, changed_source, changed_previous):
+        try:
+            inventory.merge_recorded_registry(changed_source, changed_previous, original_hash)
+        except ValueError as error:
+            controls.append({"name": name, "rejected": True, "error": str(error)})
+        else:
+            raise AssertionError("Invalid parity reconciliation accepted: " + name)
+    for name in ("duplicate-operation", "duplicate-input", "category-total", "source-digest", "missing-capture", "schema-version"):
+        invalid = copy.deepcopy(original)
+        if name == "duplicate-operation":
+            invalid["operations"].append(copy.deepcopy(invalid["operations"][0]))
+        elif name == "duplicate-input":
+            invalid["inputs"].append(copy.deepcopy(invalid["inputs"][0]))
+        elif name == "category-total":
+            invalid["categories"]["command"] += 1
+        elif name == "source-digest":
+            invalid["inputs"][0]["sha256"] = "different"
+        elif name == "missing-capture":
+            invalid["runtimeCaptures"] = {}
+        else:
+            invalid["schemaVersion"] = 999
+        reject(name, source, invalid)
+    for field in ("category", "provider"):
+        invalid = copy.deepcopy(source)
+        row = next(row for row in invalid["operations"] if row["id"] == "command.inc")
+        row[field] = "different"
+        invalid["categories"] = dict(Counter(row["category"] for row in invalid["operations"]))
+        reject("changed-identity-" + field, invalid, original)
+    conflict = copy.deepcopy(source)
+    conflict["runtimeCaptures"] = copy.deepcopy(original["runtimeCaptures"])
+    next(iter(conflict["runtimeCaptures"].values()))["state"] = "different"
+    reject("conflicting-capture", conflict, original)
+    assert original_path.read_bytes() == original_bytes
+    assert candidate.read_bytes() == published_bytes
+    write_json(scope / "controls.json", controls)
+    return {"name": "test_parity_registry_refresh", "status": "verified", "originalOperations": len(previous),
+            "currentSourceOperations": len(current), "retainedOperations": len(retained), "publishedOperations": len(observed),
+            "currentSourceInputs": len(source["inputs"]), "idempotentPublication": True, "invalidMetadataControls": len(controls),
+            "controlledEvidenceInvalidation": True, "historicalArchitectureRetention": True, "registry": file_identity(candidate)}
+
+
 def test_echo(wi):
     assert "suite-ping-42" in wi.call("Echo", {"message": "suite-ping-42"})
 
