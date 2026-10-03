@@ -1,6 +1,126 @@
 import os
+import ctypes
+from ctypes import wintypes
+import time
 
 from wi_driver import McpError, file_identity, write_json
+
+
+class WaitLock(ctypes.Structure):
+    _fields_ = [("name", wintypes.WCHAR * 128), ("timeout", ctypes.c_int64), ("alertable", wintypes.BOOL)]
+
+
+class WaitThread(ctypes.Structure):
+    _fields_ = [("pid", wintypes.DWORD), ("tid", wintypes.DWORD), ("waitTime", wintypes.DWORD), ("switches", wintypes.DWORD)]
+
+
+class WaitPayload(ctypes.Union):
+    _fields_ = [("lock", WaitLock), ("thread", WaitThread)]
+
+
+class WaitNode(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("status", wintypes.DWORD), ("value", WaitPayload)]
+
+
+class BasicProcessInformation(ctypes.Structure):
+    _fields_ = [("reserved", ctypes.c_void_p), ("peb", ctypes.c_void_p), ("reserved2", ctypes.c_void_p * 2),
+                ("pid", ctypes.c_size_t), ("reserved3", ctypes.c_void_p)]
+
+
+def native_process_state(process):
+    from wi_driver import process_identity
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        raise McpError("The cross-architecture attach oracle requires a 64-bit Windows test host")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    native = ctypes.WinDLL("ntdll")
+    kernel.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    kernel.ReadProcessMemory.restype = wintypes.BOOL
+    kernel.CheckRemoteDebuggerPresent.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+    kernel.CheckRemoteDebuggerPresent.restype = wintypes.BOOL
+    native.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+    native.NtQueryInformationProcess.restype = wintypes.LONG
+    basic = BasicProcessInformation()
+    wow64 = ctypes.c_size_t()
+    handle = process._handle
+    if native.NtQueryInformationProcess(handle, 0, ctypes.byref(basic), ctypes.sizeof(basic), None) < 0 or basic.pid != process.pid or not basic.peb:
+        raise McpError("The owned native process identity/PEB query failed")
+    if native.NtQueryInformationProcess(handle, 26, ctypes.byref(wow64), ctypes.sizeof(wow64), None) < 0:
+        raise McpError("The owned WoW64 PEB query failed")
+    pebs = []
+    for kind, address in (("native", basic.peb), ("wow64", wow64.value)):
+        if not address:
+            continue
+        value = ctypes.c_ubyte()
+        copied = ctypes.c_size_t()
+        if not kernel.ReadProcessMemory(handle, address + 2, ctypes.byref(value), 1, ctypes.byref(copied)) or copied.value != 1 or value.value not in (0, 1):
+            raise McpError("The owned BeingDebugged byte could not be independently read")
+        pebs.append({"kind": kind, "address": f"{address:x}", "beingDebugged": value.value})
+    port = wintypes.BOOL()
+    if not kernel.CheckRemoteDebuggerPresent(handle, ctypes.byref(port)):
+        raise McpError("The owned native debug port query failed")
+    return {"identity": process_identity(process), "pebs": pebs, "debugPortPresent": bool(port.value)}
+
+
+def wait_for_blocked_thread(process, thread_id, creation_time, timeout=10):
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advanced = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenThread.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessIdOfThread.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessIdOfThread.restype = wintypes.DWORD
+    kernel.GetThreadTimes.argtypes = [wintypes.HANDLE, *([ctypes.POINTER(wintypes.FILETIME)] * 4)]
+    kernel.GetThreadTimes.restype = wintypes.BOOL
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    advanced.OpenThreadWaitChainSession.argtypes = [wintypes.DWORD, ctypes.c_void_p]
+    advanced.OpenThreadWaitChainSession.restype = wintypes.HANDLE
+    advanced.CloseThreadWaitChainSession.argtypes = [wintypes.HANDLE]
+    advanced.GetThreadWaitChain.argtypes = [wintypes.HANDLE, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD,
+                                           ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(WaitNode), ctypes.POINTER(wintypes.BOOL)]
+    advanced.GetThreadWaitChain.restype = wintypes.BOOL
+    if ctypes.sizeof(WaitNode) != 280 or not 0 < thread_id < 1 << 32:
+        raise McpError("Native wait-chain layout or thread ID is invalid")
+    handle = kernel.OpenThread(0x40 | 0x100000, False, thread_id)
+    if not handle:
+        raise McpError("The owned parked thread could not be opened")
+    session = None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if kernel.GetProcessIdOfThread(handle) != process.pid or not kernel.GetThreadTimes(handle, *[ctypes.byref(value) for value in times]):
+            raise McpError("Parked thread process/creation identity query failed")
+        actual_creation = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        if actual_creation != creation_time:
+            raise McpError("Parked thread creation identity does not match the target")
+        session = advanced.OpenThreadWaitChainSession(0, None)
+        if not session:
+            raise McpError("The native wait-chain session could not be opened")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if process.poll() is not None or kernel.WaitForSingleObject(handle, 0) != 258:
+                raise McpError("The owned parked thread exited before its wait was observed")
+            count = wintypes.DWORD(16)
+            nodes = (WaitNode * 16)()
+            cycle = wintypes.BOOL()
+            if not advanced.GetThreadWaitChain(session, 0, 0, thread_id, ctypes.byref(count), nodes, ctypes.byref(cycle)):
+                raise McpError(f"The native wait-chain query failed: {ctypes.get_last_error()}")
+            if not 1 <= count.value <= 16 or cycle.value:
+                raise McpError("The native wait-chain result is invalid or cyclic")
+            node = nodes[0]
+            if node.type != 8 or node.value.thread.pid != process.pid or node.value.thread.tid != thread_id:
+                raise McpError("The native wait-chain refers to another process/thread")
+            if node.status == 3:
+                if kernel.WaitForSingleObject(handle, 0) != 258:
+                    raise McpError("The parked thread retired during its wait observation")
+                return {"pid": process.pid, "threadId": thread_id, "creationTime": str(actual_creation),
+                        "nodeCount": count.value, "objectType": node.type, "objectStatus": node.status,
+                        "rawWaitTime": node.value.thread.waitTime, "contextSwitches": node.value.thread.switches}
+            time.sleep(0.01)
+        raise McpError("The owned thread did not enter an independently observed blocked wait")
+    finally:
+        if session:
+            advanced.CloseThreadWaitChainSession(session)
+        kernel.CloseHandle(handle)
 
 
 def thread_image_facts(binary, machine):

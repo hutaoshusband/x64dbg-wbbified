@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include "../../dbg/handle.h"
 
 static HANDLE gParkSignal;
 
@@ -13,13 +14,28 @@ static DWORD WINAPI ParkedThread(LPVOID)
     return 0;
 }
 
+static volatile LONG gWakeCount = 0;
+
+static DWORD WINAPI MarkedParkedThread(LPVOID)
+{
+    Handle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if(!event || !GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user))
+        return 21;
+    const auto time = (static_cast<unsigned long long>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+    std::printf("parked %lu %lu %llu %ld\n", GetCurrentProcessId(), GetCurrentThreadId(), time, InterlockedCompareExchange(&gWakeCount, 0, 0));
+    std::fflush(stdout);
+    const auto result = WaitForSingleObject(event, INFINITE);
+    return result == WAIT_OBJECT_0 ? 0 : 22;
+}
+
 static DWORD WINAPI SignaledParkedThread(LPVOID)
 {
     // After the driver signals (post-attach), produce a debug event so this
     // thread becomes the debugger's active thread, then block forever.
     WaitForSingleObject(gParkSignal, INFINITE);
     OutputDebugStringA("attach_pause: parking");
-    return ParkedThread(nullptr);
+    return MarkedParkedThread(nullptr);
 }
 
 int main(int argc, char** argv)
@@ -37,7 +53,11 @@ int main(int argc, char** argv)
     for(int i = 0; i < 4; i++)
         CloseHandle(CreateThread(nullptr, 0, ParkedThread, nullptr, 0, nullptr));
 
-    std::printf("ready %lu %lu\n", GetCurrentProcessId(), GetCurrentThreadId());
+    FILETIME mainCreation{}, mainExit{}, mainKernel{}, mainUser{};
+    if(!GetThreadTimes(GetCurrentThread(), &mainCreation, &mainExit, &mainKernel, &mainUser))
+        return 25;
+    const auto mainTime = (static_cast<unsigned long long>(mainCreation.dwHighDateTime) << 32) | mainCreation.dwLowDateTime;
+    std::printf("ready %lu %lu %llu\n", GetCurrentProcessId(), GetCurrentThreadId(), mainTime);
     std::fflush(stdout);
 
     if(blockMode)
@@ -50,8 +70,20 @@ int main(int argc, char** argv)
     {
         if(msg.message == WM_APP)
             SetEvent(gParkSignal);
+        if(msg.message == WM_APP + 1)
+        {
+            Handle worker(CreateThread(nullptr, 0, MarkedParkedThread, nullptr, 0, nullptr));
+            if(!worker)
+                return 23;
+        }
+        if(msg.message == WM_NULL)
+            InterlockedIncrement(&gWakeCount);
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    return 0;
+    BOOL debugPort = TRUE;
+    const auto queried = CheckRemoteDebuggerPresent(GetCurrentProcess(), &debugPort);
+    std::printf("completed %lu %ld %u %u\n", GetCurrentProcessId(), InterlockedCompareExchange(&gWakeCount, 0, 0), unsigned(queried), unsigned(debugPort));
+    std::fflush(stdout);
+    return queried && !debugPort && gWakeCount > 0 ? 0 : 24;
 }
