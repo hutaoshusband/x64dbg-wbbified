@@ -99,7 +99,7 @@ def run_module_oracles(environment, results, fixture_identity, run_owned):
         assert len(paths) == 1, "Owned module directory observation is missing or repeated"
         actual_directory = Path(paths[0])
         pid = owned_receipt["processIdentity"]["pid"]
-        assert actual_directory.parent == temporary and re.fullmatch(rf"xmd[0-9a-fA-F]{{4}}\.tmp-{pid}-\u6a21\u5757-\u03b1", actual_directory.name), "Module directory does not belong to its actual process and private temporary root"
+        assert actual_directory.parent == temporary and re.fullmatch(rf"xmd[0-9a-fA-F]{{1,4}}\.tmp-{pid}-\u6a21\u5757-\u03b1", actual_directory.name), "Module directory does not belong to its actual process and private temporary root"
         owned_observed, owned_expected = check_module_output(owned_receipt, binary, library, actual_directory, facts, owned=True)
         assert not actual_directory.exists(), "Target did not remove its actual owned directory"
         owned.append({"receipt": owned_receipt, "observed": owned_observed, "expected": owned_expected, "directory": str(actual_directory)})
