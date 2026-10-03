@@ -112,6 +112,82 @@ namespace BreakInSessions
         return true;
     }
 
+    struct PendingRetirement
+    {
+        OwnedHandle reached{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        OwnedHandle release{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        OwnedHandle entered{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        OwnedHandle completed{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        OwnedHandle thread;
+        std::thread worker;
+
+        ~PendingRetirement()
+        {
+            if(release)
+                SetEvent(release.get());
+            if(worker.joinable())
+                worker.join();
+            FixtureNativeCleanup::Reset();
+        }
+
+        bool Run(bool shutdown, bool after, OwnedSessionTarget& target)
+        {
+            if(WaitForSingleObject(reached.get(), 3000) != WAIT_OBJECT_0 || WaitForSingleObject(release.get(), 0) != WAIT_TIMEOUT)
+                return false;
+            OwnedHandle callbackThread(FixtureNativeCleanup::DuplicateCallbackThread());
+            if(!callbackThread || GetProcessIdOfThread(callbackThread.get()) != GetCurrentProcessId() || !CreationTime(callbackThread.get(), true))
+                return false;
+            std::printf("CALLBACK_NATIVE pid=%lu thread=%lu creation=%llu alive=%u\n", GetProcessIdOfThread(callbackThread.get()), GetThreadId(callbackThread.get()), CreationTime(callbackThread.get(), true), unsigned(WaitForSingleObject(callbackThread.get(), 0) == WAIT_TIMEOUT));
+            std::fflush(stdout);
+            worker = std::thread([this, shutdown]
+            {
+                SetEvent(entered.get());
+                if(shutdown)
+                    NativeBreakIn::Shutdown();
+                else
+                    NativeBreakIn::EndTarget();
+            });
+            HANDLE duplicate = nullptr;
+            if(!DuplicateHandle(GetCurrentProcess(), worker.native_handle(), GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                return false;
+            thread.reset(duplicate);
+            if(WaitForSingleObject(entered.get(), 3000) != WAIT_OBJECT_0)
+                return false;
+            const auto begin = GetTickCount64();
+            unsigned samples = 0;
+            do
+            {
+                MEMORY_BASIC_INFORMATION memory{};
+                decltype(target.originalCode) bytes{};
+                SIZE_T copied = 0;
+                if(WaitForSingleObject(thread.get(), 0) != WAIT_TIMEOUT || WaitForSingleObject(callbackThread.get(), 0) != WAIT_TIMEOUT || WaitForSingleObject(release.get(), 0) != WAIT_TIMEOUT ||
+                        WaitForSingleObject(target.process.get(), 0) != WAIT_TIMEOUT ||
+                        VirtualQueryEx(target.process.get(), target.remoteCode, &memory, sizeof(memory)) != sizeof(memory) ||
+                        memory.State != (after ? DWORD(MEM_FREE) : DWORD(MEM_COMMIT)))
+                    return false;
+                if(!after && (memory.AllocationBase != target.remoteCode || memory.Type != MEM_PRIVATE || memory.Protect != PAGE_EXECUTE_READ ||
+                              !ReadProcessMemory(target.process.get(), target.remoteCode, bytes.data(), bytes.size(), &copied) || copied != bytes.size() || bytes != target.originalCode))
+                    return false;
+                ++samples;
+                Sleep(1);
+            }
+            while(GetTickCount64() - begin < 250);
+            std::printf("CALLBACK_OWNER after=%u shutdown=%u pid=%lu thread=%lu creation=%llu entered=1 alive=1 releasePending=1 targetAlive=1 page=%08lx unchanged=%u samples=%u elapsed=%llu\n",
+                        unsigned(after), unsigned(shutdown), GetCurrentProcessId(), GetThreadId(thread.get()), CreationTime(thread.get(), true),
+                        after ? DWORD(MEM_FREE) : DWORD(MEM_COMMIT), unsigned(!after), samples, GetTickCount64() - begin);
+            std::fflush(stdout);
+            if(!SetEvent(release.get()) || WaitForSingleObject(completed.get(), 3000) != WAIT_OBJECT_0)
+                return false;
+            worker.join();
+            DWORD exit = STILL_ACTIVE;
+            if(WaitForSingleObject(thread.get(), 3000) != WAIT_OBJECT_0 || !GetExitCodeThread(thread.get(), &exit) || exit != 0)
+                return false;
+            std::printf("CALLBACK_OWNER_TERMINAL pid=%lu thread=%lu creation=%llu exit=%lu\n", GetCurrentProcessId(), GetThreadId(thread.get()), CreationTime(thread.get(), true), exit);
+            std::fflush(stdout);
+            return true;
+        }
+    };
+
     static int RunRound(const wchar_t* binary, const wchar_t* mode, const wchar_t* kind, unsigned round)
     {
         const bool partial = std::wcscmp(kind, L"partial") == 0;
@@ -119,7 +195,11 @@ namespace BreakInSessions
         const bool removal = std::wcscmp(kind, L"remove") == 0;
         const bool cleanupShutdown = std::wcscmp(kind, L"cleanup-shutdown") == 0;
         const bool cleanup = cleanupShutdown || std::wcscmp(kind, L"cleanup") == 0;
+        const bool callback = std::wcsncmp(kind, L"callback-", 9) == 0;
+        const bool callbackAfter = callback && std::wcsncmp(kind + 9, L"after-", 6) == 0;
+        const bool callbackShutdown = callback && std::wcsstr(kind, L"shutdown") != nullptr;
         const DWORD oldExit = registration ? 2u : removal ? 1u : 0u;
+        PendingRetirement pending;
         OwnedHandle cleanupCompleted(cleanup ? CreateEventW(nullptr, TRUE, FALSE, nullptr) : nullptr);
         std::array<OwnedSessionTarget, 2> targets;
         for(unsigned role = 0; role < targets.size(); ++role)
@@ -131,6 +211,14 @@ namespace BreakInSessions
         if(cleanup)
         {
             std::printf("CLEANUP_PROFILE shutdown=%u pid=%lu creation=%llu controller=%lu controllerCreation=%llu\n", unsigned(cleanupShutdown), targets[0].processId, CreationTime(targets[0].process.get(), false), GetCurrentProcessId(), CreationTime(GetCurrentProcess(), false));
+            std::fflush(stdout);
+        }
+        if(callback)
+        {
+            if(!pending.reached || !pending.release || !pending.entered || !pending.completed ||
+                    !FixtureNativeCleanup::ConfigureGateTarget(targets[0].process.get(), pending.reached.get(), pending.release.get(), pending.completed.get(), callbackAfter))
+                return 85;
+            std::printf("CALLBACK_PROFILE after=%u shutdown=%u controller=%lu controllerCreation=%llu\n", unsigned(callbackAfter), unsigned(callbackShutdown), GetCurrentProcessId(), CreationTime(GetCurrentProcess(), false));
             std::fflush(stdout);
         }
         bool requested = false, released = false;
@@ -250,6 +338,8 @@ namespace BreakInSessions
                         return 22;
                     std::printf("SESSION_THREAD_TERMINAL role=%u pid=%lu thread=%lu exit=%lu\n", role, item.processId, item.threadId, exit);
                 }
+                if(callback && !pending.Run(callbackShutdown, callbackAfter, targets[0]))
+                    return 86;
                 if(cleanup)
                 {
                     if(WaitForSingleObject(cleanupCompleted.get(), 3000) != WAIT_OBJECT_0)
@@ -269,6 +359,15 @@ namespace BreakInSessions
                     std::fflush(stdout);
                     if(rejected.created || rejected.error != ERROR_BUSY || !beginRejected || !VerifyRetainedPages(targets[0]))
                         return 84;
+                }
+                if(callback)
+                {
+                    const auto rejected = NativeBreakIn::Create(targets[1].ntdllBase);
+                    const auto begun = NativeBreakIn::BeginTarget(targets[1].process.get());
+                    std::printf("CALLBACK_REGISTRY rejected=%u error=%lu begun=%u\n", unsigned(!rejected.created), rejected.error, unsigned(begun));
+                    std::fflush(stdout);
+                    if(rejected.created || rejected.error != ERROR_BUSY || begun == callbackShutdown)
+                        return 87;
                 }
                 released = SetEvent(targets[0].completion.get()) && SetEvent(targets[1].completion.get());
                 if(!released)
@@ -840,8 +939,10 @@ namespace BreakInSessions
     int RunReplacement(const wchar_t* mode, const wchar_t* kind, unsigned rounds)
     {
         const bool cleanupShutdown = std::wcscmp(kind, L"cleanup-shutdown") == 0;
-        if(rounds == 0 || rounds > MaxReplacementRounds || (cleanupShutdown && rounds != 1) ||
-                (std::wcscmp(kind, L"normal") && std::wcscmp(kind, L"partial") && std::wcscmp(kind, L"register") && std::wcscmp(kind, L"remove") && std::wcscmp(kind, L"cleanup") && !cleanupShutdown))
+        const bool callback = !std::wcscmp(kind, L"callback-before-retire") || !std::wcscmp(kind, L"callback-after-retire") ||
+                              !std::wcscmp(kind, L"callback-before-shutdown") || !std::wcscmp(kind, L"callback-after-shutdown");
+        if(rounds == 0 || rounds > MaxReplacementRounds || ((cleanupShutdown || callback) && rounds != 1) ||
+                (std::wcscmp(kind, L"normal") && std::wcscmp(kind, L"partial") && std::wcscmp(kind, L"register") && std::wcscmp(kind, L"remove") && std::wcscmp(kind, L"cleanup") && !cleanupShutdown && !callback))
             return 31;
         if(std::wcscmp(mode, L"show") && std::wcscmp(mode, L"hide") && std::wcscmp(mode, L"both"))
             return 31;

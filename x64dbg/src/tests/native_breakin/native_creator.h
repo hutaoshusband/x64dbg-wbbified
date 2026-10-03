@@ -52,6 +52,8 @@ namespace FixtureNativeCleanup
     };
 
     bool ConfigureDeniedTarget(HANDLE process, HANDLE completed);
+    bool ConfigureGateTarget(HANDLE process, HANDLE reached, HANDLE release, HANDLE completed, bool after);
+    HANDLE DuplicateCallbackThread();
     void Reset();
     Observation Capture();
 }

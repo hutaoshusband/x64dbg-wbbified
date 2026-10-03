@@ -169,7 +169,7 @@ def check_breakin_receipt(receipt, architecture, mode, detached, failure=None):
 
 
 def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
-    assert kind in ("normal", "register", "remove", "partial", "cleanup", "cleanup-shutdown") and mode in ("show", "hide", "both")
+    assert kind in ("normal", "register", "remove", "partial", "cleanup", "cleanup-shutdown", "callback-before-retire", "callback-after-retire", "callback-before-shutdown", "callback-after-shutdown") and mode in ("show", "hide", "both")
     assert receipt["exitCode"] == 0 and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"]
     lines = receipt["stdout"].splitlines()
     headers = [index for index, line in enumerate(lines) if line.startswith("SESSION ")]
@@ -182,7 +182,10 @@ def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
     removal = kind == "remove"
     cleanup_shutdown = kind == "cleanup-shutdown"
     cleanup = cleanup_shutdown or kind == "cleanup"
-    assert not cleanup_shutdown or rounds == 1
+    callback = kind.startswith("callback-")
+    callback_after = callback and "-after-" in kind
+    callback_shutdown = callback and kind.endswith("-shutdown")
+    assert not (cleanup_shutdown or callback) or rounds == 1
     retained = partial or removal or cleanup
     for round_index, begin in enumerate(headers):
         block = lines[begin:headers[round_index + 1] if round_index + 1 < rounds else len(lines)]
@@ -267,6 +270,33 @@ def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
                 assert not any(line.startswith("CLEANUP_SHUTDOWN ") for line in block)
         else:
             assert not any(line.startswith(("CLEANUP_PROFILE ", "NATIVE_CLEANUP ", "CLEANUP_SHUTDOWN ")) for line in block)
+        callback_observation = None
+        if callback:
+            controller = receipt["processIdentity"]
+            assert one_line(block, "CALLBACK_PROFILE ") == {"after": str(int(callback_after)), "shutdown": str(int(callback_shutdown)), "controller": str(controller["pid"]), "controllerCreation": controller["creationTime"]}
+            gate = one_line(block, "CALLBACK_GATE ")
+            assert set(gate) == {"pid", "creation", "code", "after", "controller", "thread", "threadCreation", "access", "prepared", "releasePending"}
+            assert {key: gate[key] for key in ("pid", "creation", "code", "after", "controller", "access", "prepared", "releasePending")} == {
+                "pid": session["old"], "creation": session["oldCreation"], "code": helpers[0]["code"], "after": str(int(callback_after)), "controller": str(controller["pid"]), "access": "001fffff", "prepared": "1", "releasePending": "1"}
+            assert int(gate["thread"]) > 0 and int(gate["threadCreation"]) > int(controller["creationTime"])
+            native = one_line(block, "CALLBACK_NATIVE ")
+            assert native == {"pid": gate["controller"], "thread": gate["thread"], "creation": gate["threadCreation"], "alive": "1"}
+            owner = one_line(block, "CALLBACK_OWNER ")
+            assert set(owner) == {"after", "shutdown", "pid", "thread", "creation", "entered", "alive", "releasePending", "targetAlive", "page", "unchanged", "samples", "elapsed"}
+            assert {key: owner[key] for key in ("after", "shutdown", "pid", "entered", "alive", "releasePending", "targetAlive", "page", "unchanged")} == {
+                "after": str(int(callback_after)), "shutdown": str(int(callback_shutdown)), "pid": str(controller["pid"]), "entered": "1", "alive": "1", "releasePending": "1", "targetAlive": "1", "page": "00010000" if callback_after else "00001000", "unchanged": str(int(not callback_after))}
+            assert int(owner["thread"]) > 0 and owner["thread"] != gate["thread"] and int(owner["creation"]) >= int(gate["threadCreation"])
+            assert int(owner["samples"]) > 0 and 250 <= int(owner["elapsed"]) < 10000
+            freed = one_line(block, "CALLBACK_FREE ")
+            assert freed == {key: gate[key] for key in ("pid", "creation", "code", "controller", "thread", "threadCreation")} | {"result": "1", "error": "0", "freed": "1", "releaseSignaled": "1"}
+            assert one_line(block, "CALLBACK_OWNER_TERMINAL ") == {key: owner[key] for key in ("pid", "thread", "creation")} | {"exit": "0"}
+            assert one_line(block, "CALLBACK_REGISTRY ") == {"rejected": "1", "error": "170", "begun": str(int(not callback_shutdown))}
+            position = lambda prefix: next(index for index, line in enumerate(block) if line.startswith(prefix))
+            assert position("CALLBACK_PROFILE ") < position("SESSION_HELPER role=0 ") < position("CALLBACK_GATE ") < position("CALLBACK_NATIVE ") < position("CALLBACK_OWNER ") < position("CALLBACK_FREE ") < position("CALLBACK_OWNER_TERMINAL ") < position("SESSION_PAGE role=0 ") < position("CALLBACK_REGISTRY ") < position("TARGET breakpoint_returned=")
+            assert position("SESSION_THREAD_TERMINAL role=0 ") < position("CALLBACK_NATIVE ") and position("SESSION_THREAD_TERMINAL role=1 ") < position("CALLBACK_NATIVE ")
+            callback_observation = {"gate": gate, "native": native, "owner": owner, "freed": freed}
+        else:
+            assert not any(line.startswith("CALLBACK_") for line in block)
         final = [fields(line) for line in block if line.startswith("TARGET final_peb=")]
         assert len(final) == 2 and all(item == {"final_peb": str(int(mode == "show")), "final_port": "1", "detached": "0", "port_read": "1"} for item in final)
         if architecture == "x32":
@@ -284,7 +314,7 @@ def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
             held = next(index for index, line in enumerate(block) if line.startswith("SESSION_RETAIN "))
             released = next(index for index, line in enumerate(block) if line.startswith("TARGET breakpoint_returned="))
             assert page_position < held < released
-        observed.append({"session": session, "helpers": helpers, "retained": retained, "sameVirtualAddress": helpers[0]["code"] == helpers[1]["code"], "nativeCleanup": cleanup_observation})
+        observed.append({"session": session, "helpers": helpers, "retained": retained, "sameVirtualAddress": helpers[0]["code"] == helpers[1]["code"], "nativeCleanup": cleanup_observation, "callback": callback_observation})
     assert len(generations) == rounds * 2
     return {"rounds": observed, "targetGenerations": len(generations)}
 
@@ -484,6 +514,15 @@ def run_breakin_oracles(environment, results, fixture_identity, run_owned):
             observed = check_replacement_receipt(receipt, environment.architecture, mode, kind, rounds)
             assert file_identity(binary) == identity, "Native cleanup fixture changed"
             cleanups.append({"mode": mode, "kind": kind, "rounds": rounds, "receipt": file_identity(path), "observed": observed})
+    callbacks = []
+    for kind in ("callback-before-retire", "callback-after-retire", "callback-before-shutdown", "callback-after-shutdown"):
+        for mode in ("show", "hide", "both"):
+            receipt = run_owned([str(binary), mode, "replacement", kind, "1"], os.environ, 35)
+            path = environment.root / f"breakin-{kind}-{mode}.json"
+            write_json(path, receipt)
+            observed = check_replacement_receipt(receipt, environment.architecture, mode, kind, 1)
+            assert file_identity(binary) == identity, "Native callback fixture changed"
+            callbacks.append({"mode": mode, "kind": kind, "receipt": file_identity(path), "observed": observed})
     results.append({"name": "test_native_breakin_oracles", "status": "verified", "oracle": {
-        "binary": identity, "machine": machine, "observations": observations, "replacements": replacements, "inflight": inflight, "quotas": quotas, "cleanups": cleanups, "debuggerUsed": "owned Windows native controller"}})
-    print(f"[VERIFIED] Native {environment.architecture} break-in identities, hidden/detached/native creation and handler references, repeated replacement, in-flight lifetime, quota recovery and actual failed-cleanup retention/shutdown", flush=True)
+        "binary": identity, "machine": machine, "observations": observations, "replacements": replacements, "inflight": inflight, "quotas": quotas, "cleanups": cleanups, "callbacks": callbacks, "debuggerUsed": "owned Windows native controller"}})
+    print(f"[VERIFIED] Native {environment.architecture} break-in identities, hidden/detached/native creation and handler references, repeated replacement, in-flight lifetime, quota recovery and actual failed-cleanup retention/shutdown and held callback retirement/shutdown", flush=True)

@@ -287,6 +287,8 @@ namespace FixtureNativeCleanup
             DWORD processId = 0;
             unsigned long long creation = 0;
             OwnedHandle completed{nullptr, CloseHandle};
+            OwnedHandle reached{nullptr, CloseHandle}, release{nullptr, CloseHandle}, callbackThread{nullptr, CloseHandle};
+            bool after = false;
             std::mutex mutex;
             Observation observation;
         };
@@ -329,6 +331,22 @@ namespace FixtureNativeCleanup
         return true;
     }
 
+    bool ConfigureGateTarget(HANDLE process, HANDLE reached, HANDLE release, HANDLE completed, bool after)
+    {
+        if(!ConfigureDeniedTarget(process, completed))
+            return false;
+        std::lock_guard<std::mutex> guard(registryMutex);
+        HANDLE reachedCopy = nullptr, releaseCopy = nullptr;
+        if(!DuplicateHandle(GetCurrentProcess(), reached, GetCurrentProcess(), &reachedCopy, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            return false;
+        current->reached.reset(reachedCopy);
+        if(!DuplicateHandle(GetCurrentProcess(), release, GetCurrentProcess(), &releaseCopy, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            return false;
+        current->release.reset(releaseCopy);
+        current->after = after;
+        return true;
+    }
+
     void Reset()
     {
         std::lock_guard<std::mutex> guard(registryMutex);
@@ -346,6 +364,22 @@ namespace FixtureNativeCleanup
             return {};
         std::lock_guard<std::mutex> guard(session->mutex);
         return session->observation;
+    }
+
+    HANDLE DuplicateCallbackThread()
+    {
+        std::shared_ptr<CleanupSession> session;
+        {
+            std::lock_guard<std::mutex> guard(registryMutex);
+            session = current;
+        }
+        if(!session)
+            return nullptr;
+        std::lock_guard<std::mutex> guard(session->mutex);
+        HANDLE duplicate = nullptr;
+        if(!session->callbackThread || !DuplicateHandle(GetCurrentProcess(), session->callbackThread.get(), GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            return nullptr;
+        return duplicate;
     }
 
     BOOL Free(HANDLE process, void* address, SIZE_T size, DWORD type)
@@ -366,6 +400,56 @@ namespace FixtureNativeCleanup
         {
             SetLastError(incomingError);
             return native(process, address, size, type);
+        }
+        if(session->reached)
+        {
+            HANDLE callbackHandle = nullptr;
+            if(!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &callbackHandle, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                return FALSE;
+            {
+                std::lock_guard<std::mutex> guard(session->mutex);
+                session->callbackThread.reset(callbackHandle);
+            }
+            DWORD actualAccess = 0;
+            FILETIME creation{}, exit{}, kernel{}, user{};
+            MEMORY_BASIC_INFORMATION before{}, after{};
+            const auto prepared = size == 0 && type == MEM_RELEASE && Access(process, actualAccess) && (actualAccess & PROCESS_VM_OPERATION) &&
+                                  VirtualQueryEx(process, address, &before, sizeof(before)) == sizeof(before) && before.AllocationBase == address &&
+                                  before.State == MEM_COMMIT && before.Protect == PAGE_EXECUTE_READ && before.Type == MEM_PRIVATE &&
+                                  GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user);
+            const auto threadCreation = (static_cast<unsigned long long>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+            BOOL result = FALSE;
+            DWORD error = ERROR_SUCCESS;
+            if(session->after)
+            {
+                SetLastError(ERROR_SUCCESS);
+                result = native(process, address, size, type);
+                error = GetLastError();
+            }
+            std::printf("CALLBACK_GATE pid=%lu creation=%llu code=%p after=%u controller=%lu thread=%lu threadCreation=%llu access=%08lx prepared=%u releasePending=%u\n",
+                        session->processId, session->creation, address, unsigned(session->after), GetCurrentProcessId(), GetCurrentThreadId(), threadCreation,
+                        actualAccess, unsigned(prepared), unsigned(WaitForSingleObject(session->release.get(), 0) == WAIT_TIMEOUT));
+            std::fflush(stdout);
+            if(!prepared || !SetEvent(session->reached.get()) || WaitForSingleObject(session->release.get(), 10000) != WAIT_OBJECT_0)
+            {
+                SetLastError(ERROR_TIMEOUT);
+                return FALSE;
+            }
+            if(!session->after)
+            {
+                SetLastError(ERROR_SUCCESS);
+                result = native(process, address, size, type);
+                error = GetLastError();
+            }
+            const auto freed = VirtualQueryEx(process, address, &after, sizeof(after)) == sizeof(after) && after.State == MEM_FREE;
+            std::printf("CALLBACK_FREE pid=%lu creation=%llu code=%p controller=%lu thread=%lu threadCreation=%llu result=%u error=%lu freed=%u releaseSignaled=%u\n",
+                        session->processId, session->creation, address, GetCurrentProcessId(), GetCurrentThreadId(), threadCreation, unsigned(result), error,
+                        unsigned(freed), unsigned(WaitForSingleObject(session->release.get(), 0) == WAIT_OBJECT_0));
+            std::fflush(stdout);
+            if(result && freed)
+                SetEvent(session->completed.get());
+            SetLastError(error);
+            return result;
         }
         HANDLE duplicate = nullptr;
         if(!DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &duplicate, RestrictedProcessAccess, FALSE, 0))
