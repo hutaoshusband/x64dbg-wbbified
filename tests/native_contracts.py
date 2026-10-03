@@ -17,7 +17,7 @@ from wi_driver import KERNEL, McpError, OwnedJob, ROOT, compiler_environment, fi
 
 
 CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_context_roundtrip",
-              "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser",
+              "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser", "test_legacy_alias_contracts",
               "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
@@ -391,6 +391,87 @@ def registry_validators(registry, formats):
             assert schema["$id"] == f"urn:wininspect:mcp:tool:v1:{tool['name']}:{direction}"
             validators[(tool["name"], direction)] = Draft202012Validator(schema, format_checker=formats)
     return validators
+
+
+def check_legacy_alias_contracts(probe, registry):
+    from jsonschema import Draft202012Validator
+    baseline_path = ROOT / "tests/native_mcp/legacy-manifest.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    expected = {entry["legacyName"]: entry for entry in baseline["tools"]}
+    canonical = {entry["name"]: entry for entry in registry["tools"]}
+    observed = probe.call("legacy-registry")
+    assert observed["schemaVersion"] == 1 and observed["buildId"] == registry["buildId"]
+    assert observed["baselineProvider"] == baseline["baselineProvider"]
+    assert observed["baselineManifestSha256"] == file_identity(baseline_path)["sha256"]
+    assert observed["capturedCatalogSha256"] == "da94480c94bf61c048116e61303d6b6bef722e94ca345b1e52f6b2c1b4e43255"
+    assert observed["operationalAliases"] == []
+    assert [entry["name"] for entry in observed["aliases"]] == sorted(expected)
+    assert len(observed["aliases"]) == len(expected) == 80
+    compared_inputs = defaults = canonical_bindings = 0
+    for alias in observed["aliases"]:
+        name = alias["name"]
+        original = expected[name]
+        assert alias["description"] == original["description"] and alias["inputSchema"] == original["inputSchema"]
+        assert alias["capturedAnnotations"] == original["annotations"]
+        assert alias["originalRoute"] == original["canonicalRoute"] and alias["compatibilityPredicate"] == original["completionPredicate"]
+        assert alias["availability"] == "planned" and alias["operational"] is False and alias["executionAdapterInstalled"] is False
+        expected_kind = "protocol_echo" if name == "Echo" else "instance_or_target_state" if name == "GetDebugState" else "canonical"
+        expected_routes = [] if name == "Echo" else ["debugger_instances", "target_state"] if name == "GetDebugState" else [original["canonicalRoute"]]
+        assert alias["bindingKind"] == expected_kind
+        assert [binding["capabilityId"] for binding in alias["canonicalBindings"]] == expected_routes
+        for binding in alias["canonicalBindings"]:
+            definition = canonical[binding["capabilityId"]]
+            fields = ("capabilityId", "effects", "effectConditions", "executor", "stateRequirement", "architectureRequirement", "completionPredicate", "recovery", "acceptanceIds")
+            inherited = {field: definition[field] for field in fields}
+            if "effectResolution" in definition:
+                inherited["effectResolution"] = definition["effectResolution"]
+            assert binding == inherited
+            canonical_bindings += 1
+        assert probe.call("legacy-describe", argument=name) == {"valid": True, "alias": alias}
+        schema = original["inputSchema"]
+        Draft202012Validator.check_schema(schema)
+        validator = Draft202012Validator(schema)
+        supplied = {field: "Hu Tao ❤,{}\\\"" if property["type"] == "string" else 42 if property["type"] == "integer" else True
+                    for field, property in schema["properties"].items()}
+        cases = [(supplied, True), ([], False), (None, False), ({**supplied, "unregisteredField": {"preserved": [1, True, None]}}, True)]
+        minimal = {field: supplied[field] for field in schema["required"]}
+        cases.append((minimal, True))
+        for field in schema["required"]:
+            cases.append(({key: value for key, value in supplied.items() if key != field}, False))
+        for field, property in schema["properties"].items():
+            type = property["type"]
+            for value in ((False, "42", 1.5, None) if type == "integer" else (0, "true", None) if type == "boolean" else (0, True, None)):
+                cases.append(({**supplied, field: value}, False))
+            if type == "integer":
+                cases.extend(({**supplied, field: value}, True) for value in (42.0, -1, 2**64 - 1))
+            if type == "string":
+                cases.extend(({**supplied, field: value}, True) for value in ("", "embedded\0text"))
+        for arguments, valid in cases:
+            assert validator.is_valid(arguments) == valid, f"Independent legacy input differs: {name}"
+            response = probe.call("legacy-input", arguments, name, raw=b"null" if arguments is None else None)
+            assert response["valid"] == valid, f"Native legacy input differs: {name}: {arguments}"
+            if valid:
+                normalized = {**arguments}
+                for field, property in schema["properties"].items():
+                    if field not in normalized and "default" in property:
+                        normalized[field] = property["default"]
+                assert response["arguments"] == normalized
+            else:
+                assert response["error"]["code"] == "invalid_argument"
+            compared_inputs += 1
+        defaults += sum("default" in property for property in schema["properties"].values())
+        unsupported = probe.call("call", supplied, name)
+        assert not unsupported["valid"] and unsupported["error"]["code"] == "unsupported_capability"
+    for unknown in ("RUN", "echo", "loadbinary", "GetDebugstate", "UnknownAlias", ""):
+        described = probe.call("legacy-describe", argument=unknown)
+        assert not described["valid"] and described["error"]["code"] == "unsupported_capability"
+        validated = probe.call("legacy-input", {}, unknown)
+        assert not validated["valid"] and validated["error"]["code"] == "unsupported_capability"
+    assert defaults == 24
+    output = probe.output / "compiled-legacy-aliases.json"
+    write_json(output, observed)
+    return {"aliases": len(expected), "canonicalBindings": canonical_bindings, "capturedDefaults": defaults,
+            "independentInputComparisons": compared_inputs, "operationalAliases": 0, "compiledAliases": file_identity(output)}
 
 
 def check_registry_contracts(probe, registry, validators):
@@ -1756,10 +1837,11 @@ def check_native_components(probe, architecture, validators, catalog):
     expected_token, token_queries = parent_token_oracle()
     observations = []
     def verify(information, identity, binary, component):
-        assert set(information) == {"schemaVersion", "component", "buildId", "wireVersion", "process", "declaredToolCount", "implementedTransports", "operationalTools"}
+        assert set(information) == {"schemaVersion", "component", "buildId", "wireVersion", "process", "declaredToolCount", "declaredLegacyAliasCount", "implementedTransports", "operationalTools"}
         assert information["schemaVersion"] == information["wireVersion"] == 1 and information["component"] == component
         assert information["buildId"] == catalog["buildId"] and information["declaredToolCount"] == len(catalog["tools"])
         assert information["implementedTransports"] == information["operationalTools"] == []
+        assert information["declaredLegacyAliasCount"] == 80
         process = information["process"]
         assert validators["NativeProcessIdentity"].is_valid(process)
         assert {key: process[key] for key in identity} == identity and process["architecture"] == architecture
@@ -1913,6 +1995,8 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                     assert validators["DomainError"].is_valid(error) and probe.call("validate", error, "DomainError")["valid"]
             elif name == "test_registry_contracts":
                 result.update(check_registry_contracts(probe, registry, tool_validators))
+            elif name == "test_legacy_alias_contracts":
+                result.update(check_legacy_alias_contracts(probe, registry))
             elif name == "test_registry_dispatch":
                 result.update(check_registry_dispatch(probe, registry, tool_validators))
             elif name == "test_schema_references":

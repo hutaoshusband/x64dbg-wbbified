@@ -1,0 +1,9 @@
+#pragma once
+
+#include <string_view>
+
+namespace wininspect::mcp
+{
+inline constexpr std::string_view LegacyAliasSourceParts[] = {
+@MCP_LEGACY_ALIAS_CHUNKS@};
+}

@@ -1214,6 +1214,8 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/job_event_artifact_types.cpp"
 		"src/mcp/common/job_event_artifact_types.h"
 		"src/mcp/common/launch.cpp"
+		"src/mcp/common/legacy_aliases.cpp"
+		"src/mcp/common/legacy_aliases.h"
 		"src/mcp/common/library_script_tools.cpp"
 		"src/mcp/common/library_script_types.cpp"
 		"src/mcp/common/library_script_types.h"

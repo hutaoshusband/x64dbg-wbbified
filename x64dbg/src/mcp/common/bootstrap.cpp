@@ -1,6 +1,7 @@
 #include "bootstrap.h"
 #include "ipc.h"
 #include "registry.h"
+#include "legacy_aliases.h"
 #include "build_identity.h"
 #include <iostream>
 
@@ -17,7 +18,8 @@ Checked<Json> component_build_info(NativeComponent component)
         return *error;
     return Json{{"schemaVersion", ContractVersion}, {"component", names[static_cast<std::size_t>(component)]},
         {"buildId", BuildId}, {"wireVersion", IpcWireVersion}, {"process", std::move(process)},
-        {"declaredToolCount", tool_registry().size()}, {"implementedTransports", Json::array()}, {"operationalTools", Json::array()}};
+        {"declaredToolCount", tool_registry().size()}, {"declaredLegacyAliasCount", legacy_alias_registry().size()},
+        {"implementedTransports", Json::array()}, {"operationalTools", Json::array()}};
 }
 
 int native_component_main(NativeComponent component, int argc, wchar_t** argv)

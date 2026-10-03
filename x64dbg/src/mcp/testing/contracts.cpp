@@ -1,5 +1,6 @@
 #include "contracts.h"
 #include "registry.h"
+#include "legacy_aliases.h"
 #include "lifecycle.h"
 #include "ipc.h"
 #include "worker.h"
@@ -226,6 +227,14 @@ int main(int argc, char** argv)
             reply = compiled_contracts();
         else if(mode == "registry" && argc == 2)
             reply = compiled_tool_registry();
+        else if(mode == "legacy-registry" && argc == 2)
+            reply = compiled_legacy_registry();
+        else if(mode == "legacy-describe" && argc == 3)
+        {
+            const auto* alias = find_legacy_alias(argv[2]);
+            reply = alias ? Json{{"valid", true}, {"alias", legacy_alias_descriptor(*alias)}} :
+                Json{{"valid", false}, {"error", error_json({"unsupported_capability", "", "Legacy alias is not declared in the compiled registry"})}};
+        }
         else if(mode == "result-cases" && argc == 2)
             reply = result_examples();
         else if(mode == "dependencies" && argc == 2)
@@ -269,7 +278,14 @@ int main(int argc, char** argv)
                 else
                 {
                     const auto& input = std::get<Json>(parsed);
-                    if(mode == "launch-plan" && argc == 2)
+                    if(mode == "legacy-input" && argc == 3)
+                    {
+                        const auto arguments = normalize_legacy_alias_input(argv[2], input);
+                        reply = checked_reply(arguments);
+                        if(const auto* normalized = std::get_if<Json>(&arguments))
+                            reply["arguments"] = *normalized;
+                    }
+                    else if(mode == "launch-plan" && argc == 2)
                         reply = launch_plan_probe(input);
                     else if(mode == "ipc-encode" && argc == 2)
                     {
