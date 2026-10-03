@@ -177,10 +177,44 @@ namespace ScriptGuiControl
         return true;
     }
 
+    void ProbeError(void*)
+    {
+        std::unique_ptr<void, decltype(&CloseHandle)> event(OpenEventW(SYNCHRONIZE, FALSE, Variable(L"WI_REENTRY_EVENT").c_str()), CloseHandle);
+        Observe("ready");
+        if(!event || WaitForSingleObject(event.get(), 5000) != WAIT_OBJECT_0)
+        {
+            Observe("gate_failed");
+            CloseOwnedWindow();
+            return;
+        }
+        gRelease = true;
+        const auto source = Utf8(Variable(L"WI_REENTRY_QUEUED"));
+        const auto finite = Utf8(Variable(L"WI_REENTRY_FINITE"));
+        DbgScriptLoad(source.c_str());
+        DbgScriptRun(0);
+        const auto barrier = DbgScriptCmdExec("nop");
+        Observe(barrier ? "error_returned" : "barrier_failed");
+        DbgScriptCmdExec("vardel $workflow_counter");
+        DbgScriptLoad(finite.c_str());
+        Observe("reloaded");
+        const auto executed = DbgScriptCmdExec("scriptrun");
+        Observe(executed ? "reused" : "reuse_failed");
+        DbgScriptUnload();
+        Observe("finished");
+        CloseOwnedWindow();
+    }
+
+    bool QueueError(int, char**)
+    {
+        GuiExecuteOnGuiThreadEx(ProbeError, nullptr);
+        return true;
+    }
+
     bool Register(int plugin)
     {
         return _plugin_registercommand(plugin, "scriptguireentryblock", BlockWorker, false)
                && _plugin_registercommand(plugin, "scriptguireentry", QueueProbe, false)
-               && _plugin_registercommand(plugin, "scriptguireentryreload", QueueProbeReload, false);
+               && _plugin_registercommand(plugin, "scriptguireentryreload", QueueProbeReload, false)
+               && _plugin_registercommand(plugin, "scriptguierror", QueueError, false);
     }
 }

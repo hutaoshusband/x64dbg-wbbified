@@ -4,6 +4,12 @@
 
 namespace ScriptYieldControl
 {
+    enum class Termination
+    {
+        Unload,
+        AbortUser
+    };
+    const Termination gUserAbort = Termination::AbortUser;
     std::atomic<bool> gEnabled{ false };
     std::atomic<bool> gHit{ false };
     std::atomic<bool> gRelease{ false };
@@ -113,8 +119,9 @@ namespace ScriptYieldControl
                 WaitForSingleObject(process, 0), actual ? 1 : 0, exit, gExitCode.load(), gExit ? 1 : 0, gLeft ? 1 : 0, gExpired ? 1 : 0, DbgIsDebugging() ? 1 : 0, static_cast<unsigned long long>(DbgValFromString("$workflow_counter")));
     }
 
-    void Probe(void*)
+    void Probe(void* context)
     {
+        const auto termination = context ? *static_cast<const Termination*>(context) : Termination::Unload;
         if(gEnabled.exchange(true))
             return;
         ScopedProbe activation;
@@ -148,8 +155,11 @@ namespace ScriptYieldControl
             ScriptGuiControl::CloseOwnedWindow();
             return;
         }
-        DbgScriptUnload();
-        Target("unloaded", process.get());
+        if(termination == Termination::AbortUser)
+            DbgScriptAbort();
+        else
+            DbgScriptUnload();
+        Target(termination == Termination::AbortUser ? "aborted" : "unloaded", process.get());
         if(!Gate(L"WI_YIELD_AFTER"))
         {
             ScriptGuiControl::Observe("unload_gate_failed");
@@ -198,8 +208,15 @@ namespace ScriptYieldControl
         return true;
     }
 
+    bool QueueAbort(int, char**)
+    {
+        GuiExecuteOnGuiThreadEx(Probe, const_cast<Termination*>(&gUserAbort));
+        return true;
+    }
+
     bool Register(int plugin)
     {
-        return _plugin_registercommand(plugin, "scriptyieldunload", Queue, false);
+        return _plugin_registercommand(plugin, "scriptyieldunload", Queue, false)
+               && _plugin_registercommand(plugin, "scriptyieldabort", QueueAbort, false);
     }
 }

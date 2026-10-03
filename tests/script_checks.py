@@ -11,7 +11,7 @@ import time
 import uuid
 
 from wi_driver import CREATE_SUSPENDED, KERNEL, McpError, OwnedJob, ROOT, file_identity, loaded_modules, process_identity, resume_suspended_process, write_json
-from script_yield_checks import check_script_yield, observe_script_yield, read_script_observations, yield_negative_controls, yield_script, yield_target_model
+from script_yield_checks import check_script_yield, observe_script_error, observe_script_yield, read_script_observations, yield_negative_controls, yield_script, yield_target_model
 
 
 CONTROL_SCRIPT = "varnew $workflow_counter, 0\ninc $workflow_counter\ninc $workflow_counter\ninc $workflow_counter\nret\n"
@@ -209,7 +209,8 @@ def interruption_negative_controls(receipt, operations, kind):
 
 
 def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scenario="unload"):
-    assert scenario in ("unload", "reload", "yield"), "Unknown Qt script scenario"
+    assert scenario in ("unload", "reload", "yield", "yield_abort", "error"), "Unknown Qt script scenario"
+    yielded = scenario in ("yield", "yield_abort")
     KERNEL.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
     KERNEL.CreateEventW.restype = wintypes.HANDLE
     KERNEL.SetEvent.argtypes = [wintypes.HANDLE]
@@ -223,11 +224,11 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scena
     for name in ("QTDIR", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QML_IMPORT_PATH", "QML2_IMPORT_PATH", "WININSPECT_TEST_NORMAL"):
         child.pop(name, None)
     queued, finite = scope / "\u6392\u961f.txt", scope / "\u590d\u7528.txt"
-    queued.write_text(QUEUED_SCRIPT, encoding="utf-8", newline="\n")
+    queued.write_text("varnew $workflow_counter, 0\nscriptguireentryblock\ninc $workflow_counter\ninvalid\ninc $workflow_counter\nret\n" if scenario == "error" else QUEUED_SCRIPT, encoding="utf-8", newline="\n")
     finite.write_text(CONTROL_SCRIPT, encoding="utf-8", newline="\n")
     child.update(WI_REENTRY_OUTPUT=str(output_path), WI_REENTRY_EVENT=event_name, WI_REENTRY_QUEUED=str(queued), WI_REENTRY_FINITE=str(finite))
     yielded_events, yielded_capture, yielded_model, yielded_source = [], {}, None, None
-    if scenario == "yield":
+    if yielded:
         target = runtime / "tests/patch_canary.exe"
         yielded_model = yield_target_model(target)
         yielded_source = scope / "yielded.txt"
@@ -236,12 +237,12 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scena
         for name in ("WI_YIELD_BEFORE", "WI_YIELD_AFTER"):
             child[name] = "Local\\WininspectScriptYield-" + str(uuid.uuid4())
     command = [str(runtime / "wininspect.exe"), "-userdir", str(profile), "-plugin", str(plugin), "-c",
-               {"unload": "scriptguireentry", "reload": "scriptguireentryreload", "yield": "scriptyieldunload"}[scenario]]
+               {"unload": "scriptguireentry", "reload": "scriptguireentryreload", "yield": "scriptyieldunload", "yield_abort": "scriptyieldabort", "error": "scriptguierror"}[scenario]]
     engine_path = runtime / ("TitanEngine.dll" if engine == "TitanEngine" else "GleeBug/TitanEngine.dll")
     required = [file_identity(runtime / name) for name in ("wininspect.exe", "wingui.dll", "wininspect.dll", "winbridge.dll", "Qt5Widgets.dll")]
     required.extend((file_identity(plugin), file_identity(engine_path)))
     process, reader, identity, startup, event = None, None, None, None, None
-    modules, output = [], []
+    modules, output, error_capture = [], [], {}
     capture = {"bytes": 0, "truncated": False, "readerError": None}
     deadline = time.monotonic() + timeout
     failure, timed_out, observation_truncated = None, False, False
@@ -250,7 +251,7 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scena
             event = KERNEL.CreateEventW(None, True, False, event_name)
             if not event or ctypes.get_last_error() == 183:
                 raise McpError("GUI reference could not own a fresh capture gate")
-            if scenario == "yield":
+            if yielded:
                 for name in ("WI_YIELD_BEFORE", "WI_YIELD_AFTER"):
                     gate = KERNEL.CreateEventW(None, True, False, child[name])
                     if gate:
@@ -288,8 +289,10 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scena
             modules = loaded_modules(process)
             assert all(item in modules for item in required), "Qt GUI reference loaded different source-built artifacts"
             assert KERNEL.SetEvent(event), "GUI capture gate could not resume its owned probe"
-            if scenario == "yield":
-                observe_script_yield(output_path, process, yielded_events, yielded_model, deadline, yielded_capture)
+            if yielded:
+                observe_script_yield(output_path, process, yielded_events, yielded_model, deadline, yielded_capture, scenario)
+            elif scenario == "error":
+                observe_script_error(output_path, process, startup, deadline, error_capture)
             process.wait(timeout=max(0.01, deadline - time.monotonic()))
         except (TimeoutError, subprocess.TimeoutExpired) as error:
             timed_out = True
@@ -325,6 +328,7 @@ def run_gui_script_session(runtime, plugin, scope, child, timeout, engine, scena
             "observed": observed, "loadedModules": modules, "requiredModules": required,
             "queuedScript": file_identity(queued), "finiteScript": file_identity(finite),
             "yieldCapture": yielded_capture, "yieldTargetModel": yielded_model,
+            "errorCapture": error_capture,
             "yieldSource": file_identity(yielded_source) if yielded_source else None,
             "observationFile": file_identity(output_path) if output_path.is_file() else None}
 
@@ -387,6 +391,46 @@ def gui_script_negative_controls(receipt):
     return rejected
 
 
+def check_gui_script_error(receipt):
+    assert receipt["scenario"] == "error", "Captured Qt scenario is not an actual command error"
+    assert receipt["exitCode"] == 0 and receipt["terminalObserved"] and receipt["jobClosed"] and not receipt["timedOut"] and not receipt["error"] and not receipt["outputTruncated"] and not receipt["observationTruncated"], "Qt command error reference did not terminate with complete observations"
+    assert receipt["requiredModules"] and all(item in receipt["loadedModules"] for item in receipt["requiredModules"]), "Qt command error reference loaded different source-built artifacts"
+    assert not any("mcp-server" in item["path"].lower() or "agent smithers" in item["path"].lower() for item in receipt["loadedModules"]), "Qt command error loaded an external MCP dependency"
+    rows = re.findall(r"^GUI_REENTRY phase=(\w+) pid=(\d+) thread=(\d+) owner=(\d+) worker=(\d+) nestedThread=(\d+) nestedCount=(\d+) outer=([01]) counter=(\d+) line=(\d+) completed=([01])$", receipt["observed"], re.MULTILINE)
+    assert [row[0] for row in rows] == ["ready", "error_returned", "reloaded", "reused", "finished"] and len(receipt["observed"].splitlines()) == 5, "Actual command error omitted, repeated or changed an event"
+    identity, owner = receipt["processIdentity"], receipt["startupThread"]
+    assert all(int(row[1]) == identity["pid"] and int(row[2]) == owner and row[2] == row[3] for row in rows), "Actual command error ran on a different GUI owner"
+    worker = int(rows[1][4])
+    assert worker > 0 and worker != owner, "Actual failing script did not execute on a distinct worker"
+    expected = [(0, 0, 0, 0, 0, 4, 0), (worker, 0, 0, 0, 1, 0, 1), (worker, 0, 0, 0, 0, 0, 1), (worker, 0, 0, 0, 3, 0, 1), (worker, 0, 0, 0, 3, 4, 1)]
+    assert [tuple(int(value) for value in row[4:]) for row in rows] == expected, "Actual command failure resumed its next instruction, lost its map or failed finite reuse"
+    capture = receipt["errorCapture"]
+    dialog = capture["dialog"]
+    assert capture["acknowledged"] and dialog["visible"] and dialog["processIdentity"] == identity and dialog["thread"] == owner and dialog["handle"] > 0 and dialog["title"] == "Error on line 0004!" and dialog["class"] == "Qt5QWindowIcon", "Actual failed command did not retain an explicitly acknowledged owned Qt error"
+    source = Path(receipt["queuedScript"]["path"])
+    assert file_identity(source) == receipt["queuedScript"] and source.read_text(encoding="utf-8") == "varnew $workflow_counter, 0\nscriptguireentryblock\ninc $workflow_counter\ninvalid\ninc $workflow_counter\nret\n", "Actual failed command source differs"
+    return {"guiOwner": owner, "scriptWorker": worker, "errorLine": 4, "counterAfterFailure": 1, "finiteCounter": 3, "explicitAcknowledgement": True}
+
+
+def gui_error_negative_controls(receipt):
+    capture = receipt["errorCapture"]
+    candidates = [("missing_terminal", {"terminalObserved": False}), ("wrong_owner", {"startupThread": receipt["startupThread"] + 1}),
+                  ("resumed_failed_script", {"observed": receipt["observed"].replace("counter=1", "counter=2", 1)}),
+                  ("missing_command_error", {"errorCapture": {**capture, "dialog": {**capture["dialog"], "title": "wininspect"}}}),
+                  ("wrong_dialog_generation", {"errorCapture": {**capture, "dialog": {**capture["dialog"], "processIdentity": {"pid": 0, "creationTime": "0"}}}}),
+                  ("unacknowledged_error", {"errorCapture": {**capture, "acknowledged": False}}),
+                  ("wrong_finite_reuse", {"observed": receipt["observed"].replace("counter=3", "counter=2", 1)})]
+    rejected = []
+    for name, changed in candidates:
+        try:
+            check_gui_script_error({**receipt, **changed})
+        except (AssertionError, ValueError, KeyError) as error:
+            rejected.append({"name": name, "status": "rejected", "error": str(error), "scriptExecuted": False})
+        else:
+            raise AssertionError("Actual Qt error negative control was admitted: " + name)
+    return rejected
+
+
 def run_gui_script_oracles(environment, runtime, plugin, engines, timeout):
     stage = environment.root / "script-gui-runtime"
     stage.mkdir()
@@ -401,14 +445,18 @@ def run_gui_script_oracles(environment, runtime, plugin, engines, timeout):
     shutil.copy2(runtime / "tests/patch_canary.exe", stage / "tests/patch_canary.exe")
     references = []
     for engine in engines:
-        for scenario in ("unload", "reload", "yield"):
+        for scenario in ("unload", "reload", "yield", "yield_abort", "error"):
             scope = environment.root / "script-gui" / engine / scenario
             receipt = run_gui_script_session(stage, plugin, scope, os.environ, timeout, engine, scenario)
             write_json(scope / "receipt.json", receipt)
-            reference = check_script_yield(receipt) if scenario == "yield" else check_gui_script_session(receipt)
-            controls = yield_negative_controls(receipt) if scenario == "yield" else gui_script_negative_controls(receipt)
+            if scenario in ("yield", "yield_abort"):
+                reference, controls = check_script_yield(receipt), yield_negative_controls(receipt)
+            elif scenario == "error":
+                reference, controls = check_gui_script_error(receipt), gui_error_negative_controls(receipt)
+            else:
+                reference, controls = check_gui_script_session(receipt), gui_script_negative_controls(receipt)
             references.append({"engine": engine, "name": "gui_reentrant_" + scenario, "receipt": receipt, "reference": reference, "negativeControls": controls})
-            outcome = "yielded target retained unchanged before/after unload, explicit target exit 7" if scenario == "yield" else "nested " + scenario + ", canceled pending step"
+            outcome = "yielded target retained unchanged before/after " + scenario + ", explicit target exit 7" if scenario in ("yield", "yield_abort") else "actual command error and explicit acknowledgement" if scenario == "error" else "nested " + scenario + ", canceled pending step"
             print(f"[VERIFIED] Native {environment.architecture} {engine} actual Qt GUI {outcome}, finite reuse and exit 0", flush=True)
     return references
 

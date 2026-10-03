@@ -164,7 +164,7 @@ namespace
         else
             result = DbgScriptCmdExec(command);
         char output[512]{};
-        sprintf_s(output, "SCRIPT_OBSERVE command=%s result=%u counter=%llu thread=%lu\n", command, result ? 1 : 0,
+        sprintf_s(output, "\nSCRIPT_OBSERVE command=%s result=%u counter=%llu thread=%lu\n", command, result ? 1 : 0,
                   static_cast<unsigned long long>(DbgValFromString("$workflow_counter")), GetCurrentThreadId());
         GuiAddLogMessage(output);
         return true;

@@ -23,6 +23,7 @@ enum CMDRESULT
     STATUS_EXIT,
     STATUS_PAUSE,
     STATUS_CONTINUE_BRANCH,
+    STATUS_SCRIPT_INTERRUPTED,
 };
 
 struct SCRIPTBP
@@ -147,6 +148,11 @@ static bool scriptHandleInterrupt()
         }
         return scriptIsAbortReason(reason);
     }
+}
+
+static CMDRESULT scriptInterruptedResult()
+{
+    return gScriptInterruptReason.load() == ScriptInterrupt::AbortAssertion ? STATUS_ERROR : STATUS_SCRIPT_INTERRUPTED;
 }
 
 static SCRIPTBRANCHTYPE scriptGetBranchType(const String & text)
@@ -578,7 +584,7 @@ static CMDRESULT scriptInternalCmdExec(const char* cmd, bool gui, SCRIPTSTATE st
         if(scriptHandleInterrupt())
         {
             bScriptLogEnabled = false;
-            return STATUS_ERROR;
+            return res ? scriptInterruptedResult() : STATUS_ERROR;
         }
         Sleep(1);
     }
@@ -587,8 +593,10 @@ static CMDRESULT scriptInternalCmdExec(const char* cmd, bool gui, SCRIPTSTATE st
     bScriptLogEnabled = false;
     auto yieldOutcome = gScriptYieldContext.pendingOutcome.exchange(ScriptCommandOutcome::Continue);
     const auto shouldCheckInterrupt = !gScriptYieldContext.active.load();
-    if((shouldCheckInterrupt && scriptHandleInterrupt()) || yieldOutcome == ScriptCommandOutcome::Abort || !res)
+    if(yieldOutcome == ScriptCommandOutcome::Abort || !res)
         return STATUS_ERROR;
+    if(shouldCheckInterrupt && scriptHandleInterrupt())
+        return scriptInterruptedResult();
     if(yieldOutcome == ScriptCommandOutcome::Pause)
         return STATUS_PAUSE;
     return state == SCRIPT_RUNNING ? STATUS_CONTINUE : STATUS_PAUSE;
@@ -615,6 +623,9 @@ static bool scriptInternalCmd(bool gui, SCRIPTSTATE state)
             scriptIp = scriptIpOld;
             if(!gScriptUnloadRequests.load())
                 scriptError(scriptIp, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Error executing command!")), gui);
+            return false;
+        case STATUS_SCRIPT_INTERRUPTED:
+            scriptIp = scriptIpOld;
             return false;
         case STATUS_EXIT:
             return false;
@@ -862,6 +873,7 @@ static ScriptCommandOutcome scriptExecCommand(const char* command, bool gui, SCR
     switch(scriptLastError)
     {
     case STATUS_ERROR:
+    case STATUS_SCRIPT_INTERRUPTED:
         return ScriptCommandOutcome::Abort;
     case STATUS_PAUSE:
         return ScriptCommandOutcome::Pause;
