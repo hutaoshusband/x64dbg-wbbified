@@ -249,10 +249,10 @@ static bool VerifyRetainedCode(HANDLE process, void* code, const char* phase)
     return true;
 }
 
-static bool VerifyFailureShutdown(HANDLE process, void* code, std::uintptr_t provider)
+static bool VerifyFailureShutdown(HANDLE process, void* code, std::uintptr_t provider, DWORD requiredHandles = 2)
 {
     DWORD before = 0, after = 0;
-    if(!VerifyRetainedCode(process, code, "retired") || !GetProcessHandleCount(GetCurrentProcess(), &before) || before < 2)
+    if(!VerifyRetainedCode(process, code, "retired") || !GetProcessHandleCount(GetCurrentProcess(), &before) || before < requiredHandles)
         return false;
     NativeBreakIn::Shutdown();
     if(!GetProcessHandleCount(GetCurrentProcess(), &after))
@@ -261,12 +261,13 @@ static bool VerifyFailureShutdown(HANDLE process, void* code, std::uintptr_t pro
     const auto beginRejected = !NativeBreakIn::BeginTarget(process);
     std::printf("SHUTDOWN before=%lu after=%lu createRejected=%u error=%lu beginRejected=%u\n", before, after, unsigned(!rejected.created), rejected.error, unsigned(beginRejected));
     std::fflush(stdout);
-    return after <= before - 2 && !rejected.created && rejected.error == ERROR_BUSY && beginRejected && VerifyRetainedCode(process, code, "shutdown");
+    return after <= before - requiredHandles && !rejected.created && rejected.error == ERROR_BUSY && beginRejected && VerifyRetainedCode(process, code, "shutdown");
 }
 
 int wmain(int argc, wchar_t** argv)
 {
     const auto failure = FailureSelection(argc > 4 ? argv[4] : L"none");
+    const bool reducedCreation = argc > 4 && std::wcscmp(argv[4], L"reduced") == 0;
     const bool partialCreation = argc > 4 && std::wcscmp(argv[4], L"partial") == 0;
     const bool detached = argc > 3 && std::wcscmp(argv[3], L"detach") == 0;
     const bool nativeHidden = argc > 1 && std::wcscmp(argv[1], L"both") == 0;
@@ -312,7 +313,7 @@ int wmain(int argc, wchar_t** argv)
         RemoveVectoredExceptionHandler(handler);
         return failureVerified && original == 1 && portRead && bool(debugPort) == !expectedDetach && unsigned(peb[2]) == unsigned(!hidden && !expectedDetach) ? 7 : 12;
     }
-    FixtureNativeCreation::Configure(partialCreation);
+    FixtureNativeCreation::Configure(reducedCreation ? FixtureNativeCreation::Mode::ReducedAccess : partialCreation ? FixtureNativeCreation::Mode::ControlledFailure : FixtureNativeCreation::Mode::Normal);
     Identity("controller", GetCurrentProcess());
     wchar_t path[32768]{};
     if(!GetModuleFileNameW(nullptr, path, 32768))
@@ -347,7 +348,7 @@ int wmain(int argc, wchar_t** argv)
     bool codeFreed = false, codeRetained = false;
     const DWORD expectedThreadExit = failure == HandlerFailure::Registration ? NativeBreakInPayload::RegistrationFailed : failure == HandlerFailure::Removal ? NativeBreakInPayload::RemovalFailed : NativeBreakInPayload::Completed;
     std::uintptr_t ntdllBase = 0, targetImageBase = 0;
-    bool detachedNow = false;
+    bool detachedNow = false, nativeParked = false;
     DWORD remoteId = 0;
     unsigned remoteCreated = 0, remoteExited = 0, remoteBroken = 0, matched = 0;
     while(GetTickCount64() < deadline)
@@ -406,7 +407,7 @@ int wmain(int argc, wchar_t** argv)
         }
         else if(event.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT)
         {
-            if(partialCreation && requested && !remoteThread)
+            if((partialCreation || reducedCreation) && requested && !remoteThread)
             {
                 const auto creation = FixtureNativeCreation::Capture();
                 FILETIME threadCreation{}, exit{}, kernel{}, user{};
@@ -534,12 +535,63 @@ int wmain(int argc, wchar_t** argv)
                         !VerifyRetainedCode(process.hProcess, creation.start, "pending"))
                     break;
             }
+            if(reducedCreation)
+            {
+                const auto creation = FixtureNativeCreation::Capture();
+                if(!creation.threadObserved || creation.calls != 1 || creation.processId != process.dwProcessId)
+                    break;
+#ifdef _WIN64
+                if(!creation.nativeHandleValid || creation.nativeStatus != 0 || !result.created || result.status != 0 || result.error != 0 || creation.suspendBefore != 0 || creation.suspendRestored != 1)
+                    break;
+#else
+                if(creation.nativeHandleValid || creation.nativeHandleError != ERROR_INVALID_HANDLE || creation.nativeStatus != static_cast<LONG>(0xc0000022) ||
+                        result.created || result.status != creation.nativeStatus || result.error != ERROR_INVALID_HANDLE || creation.suspendBefore != 1 || creation.suspendRestored != 2)
+                    break;
+                remoteCode = creation.start;
+                remoteId = creation.threadId;
+                remoteThread = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | SYNCHRONIZE, FALSE, remoteId);
+                if(!remoteThread)
+                    break;
+                threadOwner = std::make_unique<OwnedHandle>(remoteThread);
+                nativeParked = FixtureNativeCreation::VerifyThread(remoteThread, "pending") && VerifyRetainedCode(process.hProcess, remoteCode, "pending");
+                if(!nativeParked)
+                    break;
+#endif
+            }
             const auto duplicate = NativeBreakIn::Create(ntdllBase);
             std::printf("DUPLICATE rejected=%u error=%lu\n", unsigned(!duplicate.created), duplicate.error);
             if(duplicate.created || duplicate.error != ERROR_BUSY)
                 break;
             std::printf("STUB status=%08lx error=%lu created=%u\n", result.status, result.error, unsigned(result.created));
             std::printf("BREAKIN requested=%u result=%u error=%lu\n", unsigned(requested), unsigned(breakinResult), GetLastError());
+            if(nativeParked)
+            {
+                DEBUG_EVENT unexpected{};
+                const auto noEvent = !WaitForDebugEvent(&unexpected, 250);
+                const auto waitError = GetLastError();
+                std::printf("PENDING_EVENT missing=%u error=%lu\n", unsigned(noEvent), waitError);
+                std::fflush(stdout);
+                if(!noEvent || waitError != ERROR_SEM_TIMEOUT)
+                    break;
+                NativeBreakIn::EndTarget();
+                codeRetained = VerifyFailureShutdown(process.hProcess, remoteCode, providerBase, 1) && FixtureNativeCreation::VerifyThread(remoteThread, "shutdown");
+                if(!codeRetained)
+                    break;
+                if(detached)
+                {
+                    if(!DebugActiveProcessStop(process.dwProcessId) || !FixtureNativeCreation::VerifyThread(remoteThread, "detached") || !VerifyRetainedCode(process.hProcess, remoteCode, "detached"))
+                        break;
+                    detachedNow = true;
+                }
+                if(!SetEvent(completion))
+                    break;
+                if(detached)
+                {
+                    exited = WaitForSingleObject(process.hProcess, 6000) == WAIT_OBJECT_0 && GetExitCodeProcess(process.hProcess, &exitCode);
+                    break;
+                }
+            }
+
         }
         if(remoteExited && !codeFreed && !codeRetained)
         {
@@ -582,11 +634,21 @@ int wmain(int argc, wchar_t** argv)
     NativeBreakIn::EndTarget();
     NativeBreakIn::Shutdown();
 
+    if(nativeParked)
+    {
+        DWORD threadExit = STILL_ACTIVE;
+        const auto threadTerminal = WaitForSingleObject(remoteThread, 1000) == WAIT_OBJECT_0 && GetExitCodeThread(remoteThread, &threadExit);
+        std::printf("PROCESS_CLEANUP processTerminal=%u targetExit=%lu threadTerminal=%u threadExit=%lu\n", unsigned(terminal), exitCode, unsigned(threadTerminal), threadExit);
+        if(!threadTerminal || threadExit != 7)
+            return 25;
+    }
     std::printf("REFERENCE hidden=%u strings=%u breakpoints=%u target_exit=%lu exited=%u terminal=%u\n", unsigned(hidden), strings, breakpoints, exitCode, unsigned(exited), unsigned(terminal));
     std::printf("REMOTE created=%u exited=%u broken=%u result=%u tid=%lu\n", remoteCreated, remoteExited, remoteBroken, unsigned(breakinResult), remoteId);
-    const auto allocationVerified = failure == HandlerFailure::Removal ? codeRetained : codeFreed;
+    const auto allocationVerified = failure == HandlerFailure::Removal || nativeParked ? codeRetained : codeFreed;
     const auto expectedBreaks = unsigned(failure != HandlerFailure::Registration);
-    const auto creationVerified = partialCreation ? !breakinResult : breakinResult;
+    const auto creationVerified = partialCreation || nativeParked ? !breakinResult : breakinResult;
+    if(nativeParked)
+        return exited && terminal && exitCode == 7 && remoteCreated == 0 && remoteBroken == 0 && matched == 0 && breakpoints == 2 && allocationVerified && creationVerified ? 0 : 26;
     if(detached)
         return exited && terminal && exitCode == 7 && allocationVerified && creationVerified ? 0 : 20;
     return exited && terminal && exitCode == 7 && matched == expectedBreaks && remoteCreated == 1 && remoteExited == 1 && remoteBroken == expectedBreaks && breakpoints == 2 + remoteBroken && creationVerified && allocationVerified ? 0 : 16;
