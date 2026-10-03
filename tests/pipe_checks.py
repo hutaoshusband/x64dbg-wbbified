@@ -317,3 +317,166 @@ def check_local_pipes(probe, architecture, token_oracle, file_oracle):
     return {"nativePipeCases": results, "actualPipeCaseCount": len(results), "originalWitnessValue": 7, "completedWitnessValue": 42,
             "protectedDacl": True, "anonymousAccessRefused": True, "firstInstanceCollisionRefused": True,
             "crossArchitectureChannels": sum(v["variant"].startswith("native-cross-architecture") for v in results), "ordinaryLocalHandshakeOnly": True}
+
+
+def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
+    output = probe.output / "broker-lifetime"
+    output.mkdir()
+    connector = probe.binary.parent / "wininspect-mcp-connect.exe"
+    broker = probe.binary.parent / "wininspect-mcp.exe"
+    profile = secrets.token_hex(32)
+    other_profile = secrets.token_hex(32)
+    job = OwnedJob()
+    processes, broker_handles, observations = [], [], []
+    KERNEL.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    KERNEL.OpenProcess.restype = wintypes.HANDLE
+    KERNEL.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+
+    def process_snapshot(stage):
+        class ProcessEntry(ctypes.Structure):
+            _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("pid", wintypes.DWORD), ("heap", ctypes.c_size_t),
+                        ("module", wintypes.DWORD), ("threads", wintypes.DWORD), ("parent", wintypes.DWORD),
+                        ("priority", wintypes.LONG), ("flags", wintypes.DWORD), ("image", wintypes.WCHAR * 260)]
+        KERNEL.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        KERNEL.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        KERNEL.Process32FirstW.argtypes = KERNEL.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+        handle = KERNEL.CreateToolhelp32Snapshot(2, 0)
+        assert handle and handle != ctypes.c_void_p(-1).value
+        rows = []
+        try:
+            entry = ProcessEntry(size=ctypes.sizeof(ProcessEntry))
+            assert KERNEL.Process32FirstW(handle, ctypes.byref(entry))
+            while True:
+                rows.append({"pid": entry.pid, "parentPid": entry.parent, "image": entry.image})
+                if not KERNEL.Process32NextW(handle, ctypes.byref(entry)):
+                    assert ctypes.get_last_error() == 18
+                    break
+        finally:
+            KERNEL.CloseHandle(handle)
+        assert any(v["pid"] == os.getpid() for v in rows)
+        debuggers = [v for v in rows if v["image"].casefold() in ("x64dbg.exe", "x32dbg.exe")]
+        assert not debuggers, debuggers
+        observations.append({"kind": "process-snapshot", "stage": stage, "debuggerProcesses": debuggers, "positiveControllerPid": os.getpid(), "nativeComponents": [v for v in rows if v["image"].casefold().startswith("wininspect-mcp")]})
+        return rows
+
+    def start(name, profile_id):
+        stream = (output / f"{name}.jsonl").open("wb")
+        errors = (output / f"{name}.stderr").open("wb")
+        try:
+            process = subprocess.Popen([str(connector), "--local-control", "--profile", profile_id], stdin=subprocess.PIPE, stdout=stream, stderr=errors, creationflags=subprocess.CREATE_NO_WINDOW)
+            processes.append(process)
+            try:
+                job.assign(process)
+            except BaseException:
+                process.kill()
+                process.wait(timeout=5)
+                raise
+        finally:
+            stream.close()
+            errors.close()
+        identity, queries = pipe_process_identity(process, connector, token_oracle, file_oracle)
+        observations.append({"kind": "connector", "name": name, "identity": identity, "tokenQueries": queries})
+        return process, output / f"{name}.jsonl"
+
+    def request(client, operation):
+        process, path = client
+        previous = path.stat().st_size
+        process.stdin.write(json.dumps({"operation": operation}).encode() + b"\n")
+        process.stdin.flush()
+        expires = time.monotonic() + 15
+        while time.monotonic() < expires:
+            raw = path.read_bytes()[previous:]
+            if raw.endswith(b"\n"):
+                value = json.loads(raw)
+                assert value["operation"] == operation and value["debuggerInstances"] == value["operationalTools"] == []
+                observations.append({"kind": "response", "value": value, "output": file_identity(path)})
+                return value
+            assert process.poll() is None, (process.returncode, path.with_suffix(".stderr").read_bytes())
+            time.sleep(0.01)
+        raise AssertionError("Actual native connector did not return a local-control response")
+
+    def observe_broker(response):
+        expected = response["broker"]
+        handle = KERNEL.OpenProcess(0x100000 | 0x1000, False, expected["pid"])
+        assert handle
+        broker_handles.append(handle)
+        process = SimpleNamespace(pid=expected["pid"], _handle=handle)
+        actual, queries = pipe_process_identity(process, broker, token_oracle, file_oracle)
+        assert actual == expected and actual["architecture"] == architecture and actual["integrity"] == "medium" and not actual["elevated"]
+        rows = process_snapshot("actual-broker-observation")
+        assert any(v["pid"] == actual["pid"] and v["image"].casefold() == "wininspect-mcp.exe" for v in rows)
+        observations.append({"kind": "broker", "identity": actual, "tokenQueries": queries, "binary": file_identity(broker), "processSnapshot": next(v for v in rows if v["pid"] == actual["pid"])})
+        return handle, actual
+
+    def finish(client):
+        process, path = client
+        if process.stdin and not process.stdin.closed:
+            process.stdin.close()
+        assert process.wait(timeout=10) == 0
+        observations.append({"kind": "connector-exit", "identity": process_identity(process), "exitCode": process.returncode, "output": file_identity(path)})
+
+    def terminal(handle, identity):
+        assert KERNEL.WaitForSingleObject(handle, 10000) == 0
+        code = wintypes.DWORD()
+        assert KERNEL.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value == 0
+        observations.append({"kind": "broker-exit", "identity": identity, "exitCode": code.value})
+
+    def still_live(handle, identity, stage):
+        waited = KERNEL.WaitForSingleObject(handle, 0)
+        assert waited == 258
+        observations.append({"kind": "broker-live", "stage": stage, "identity": identity, "waitResult": waited})
+
+    try:
+        process_snapshot("before-cold-start")
+        first, second = start("first", profile), start("second", profile)
+        before = request(first, "status")
+        handle, identity = observe_broker(before)
+        assert request(second, "status")["broker"] == identity
+        stdout, stderr, duplicate = probe.execute([str(broker), "--serve-local", "--profile", profile], expected_exit=1)
+        assert not stdout and json.loads(stderr)["code"] == "broker_already_running"
+        refusals = []
+        for label, arguments, payload in (
+                ("invalid-profile", ["--profile", "A" * 64], b'{"operation":"status"}\n'),
+                ("debugger-operation", ["--profile", profile], b'{"operation":"target_open"}\n'),
+                ("extra-property", ["--profile", profile], b'{"operation":"status","targetId":"absent"}\n'),
+                ("bounded-input", ["--profile", profile], b"x" * 4097)):
+            stdout, stderr, refusal = probe.execute([str(connector), "--local-control", *arguments], payload, expected_exit=1)
+            assert not stdout and json.loads(stderr)["code"] == ("payload_limit" if label == "bounded-input" else "invalid_argument")
+            refusals.append({"case": label, "observation": refusal})
+            still_live(handle, identity, label)
+        finish(first)
+        still_live(handle, identity, "first-connector-EOF")
+        assert request(second, "status")["broker"] == identity
+        finish(second)
+        still_live(handle, identity, "second-connector-EOF")
+        isolated = start("isolated", other_profile)
+        isolated_response = request(isolated, "status")
+        other_handle, other_identity = observe_broker(isolated_response)
+        assert other_identity["pid"] != identity["pid"] and isolated_response["installation"] == before["installation"] and isolated_response["profile"] != before["profile"]
+        closer = start("closer", profile)
+        assert request(closer, "shutdown")["broker"] == identity
+        finish(closer)
+        terminal(handle, identity)
+        still_live(other_handle, other_identity, "other-profile-shutdown")
+        assert request(isolated, "shutdown")["broker"] == other_identity
+        finish(isolated)
+        terminal(other_handle, other_identity)
+        restarted = start("restarted", profile)
+        restarted_response = request(restarted, "status")
+        restarted_handle, restarted_identity = observe_broker(restarted_response)
+        assert restarted_identity["creationTime"] != identity["creationTime"]
+        assert request(restarted, "shutdown")["broker"] == restarted_identity
+        finish(restarted)
+        terminal(restarted_handle, restarted_identity)
+        write_json(output / "observations.json", observations)
+        return {"nativeBrokerLifetime": observations, "normalConnectorExits": 5, "normalBrokerExits": 3,
+                "sharedGeneration": identity, "isolatedGeneration": other_identity, "restartedGeneration": restarted_identity,
+                "duplicateBrokerRefused": duplicate, "localControlRefusals": refusals, "operationalMcpTransport": False, "workerRegistrationVerified": False}
+    finally:
+        job.close()
+        for process in processes:
+            if process.poll() is None:
+                process.wait(timeout=5)
+        for handle in broker_handles:
+            KERNEL.CloseHandle(handle)
+        write_json(output / "observations.json", observations)

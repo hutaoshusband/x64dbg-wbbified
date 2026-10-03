@@ -1201,6 +1201,8 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/bootstrap.cpp"
 		"src/mcp/common/bootstrap.h"
 		"src/mcp/common/breakpoint_trace_tools.cpp"
+		"src/mcp/common/broker_runtime.cpp"
+		"src/mcp/common/broker_runtime.h"
 		"src/mcp/common/contracts.cpp"
 		"src/mcp/common/contracts.h"
 		"src/mcp/common/database_settings_tools.cpp"
