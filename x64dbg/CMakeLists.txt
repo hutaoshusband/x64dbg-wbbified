@@ -1221,6 +1221,8 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/lifecycle.h"
 		"src/mcp/common/memory_tools.cpp"
 		"src/mcp/common/module_analysis_tools.cpp"
+		"src/mcp/common/patch_transaction.cpp"
+		"src/mcp/common/patch_transaction.h"
 		"src/mcp/common/patch_types.cpp"
 		"src/mcp/common/patch_types.h"
 		"src/mcp/common/platform.cpp"

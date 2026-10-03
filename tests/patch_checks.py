@@ -110,11 +110,83 @@ def check_patch_restore(receipt, facts, image_base):
     return {"allocation": hex(allocation), "scenarios": 2, "preservedFailedBytes": 4, "independentlyVerifiedPageBytes": 12288, "partialRangeRestoration": True}
 
 
-def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine", file_exports=False, single_shot=False, hardware_slot=0, restore_failure=False):
+def check_patch_transactions(receipt, facts, image_base, code_address, pid, creation):
+    output = receipt["stdout"]
+    done = re.findall(r"PATCH_TX_DONE allocation=([0-9a-f]+) scenarios=9 paused=1 epoch=(\d+)", output)
+    code_epochs = re.findall(r"PATCH_TX_RESULT name=code operation=(apply|undo) .*? epoch=(\d+) paused=1", output)
+    assert len(done) == 1 and [row[0] for row in code_epochs] == ["apply", "undo"], "Transaction contexts are missing or duplicated"
+    allocation, epoch = int(done[0][0], 16), int(done[0][1])
+    apply_epoch, undo_epoch = [int(row[1]) for row in code_epochs]
+    assert 0 < epoch < apply_epoch < undo_epoch < 1 << 64, "Actual apply and undo must use later distinct paused contexts"
+    assert allocation > 0 and allocation % 0x1000 == 0 and allocation + 0x2000 < 1 << (64 if facts["machine"] == 0x8664 else 32)
+    assert allocation + 0x2000 <= image_base or image_base + facts["size"] <= allocation, "Private transaction allocation overlaps its source image"
+    first, second = allocation + 0x80, allocation + 0x100
+    expected = []
+
+    def result(name, operation, outcome, ranges, context=epoch):
+        status, error, failure, resume, patches, restores, flushes = outcome
+        expected.append(f"PATCH_TX_RESULT name={name} operation={operation} status={status} error={error} failure={failure} resume={resume} ranges=2 patches={patches} restores={restores} flushes={flushes} pid={pid} creation={creation} epoch={context} paused=1")
+        for index, (address, size, state, attempted, restored, observed, records) in enumerate(ranges):
+            expected.append(f"PATCH_TX_RANGE name={name} operation={operation} index={index} address={address:x} size={size} state={state} attempted={attempted} restored={restored} observed={observed} records={records}")
+
+    def private_ranges(state, attempted, restored, first_bytes, first_records, second_bytes="5a5a", second_records="--------"):
+        return [(first, 2, state, attempted, restored, first_bytes, first_records), (second, 2, state, attempted, restored, second_bytes, second_records)]
+
+    def bytes_observed(name, value="5a5a", records="--------", total=0, other=False):
+        expected.append(f"PATCH_TX_BYTES name={name} address={first:x} logical={value} raw={value} records={records} total={total} state=1000 protection=20 paused=1")
+        other_value, other_records = ("5d5e", "5a5d5a5e") if other else ("5a5a", "--------")
+        expected.append(f"PATCH_TX_OTHER name={name} address={second:x} logical={other_value} raw={other_value} records={other_records} paused=1")
+
+    planned = private_ranges(0, 0, 0, "unknown", "unknown", "unknown", "unknown")
+    preflight = private_ranges(0, 0, 0, "5a5a", "--------")
+    preflight[1] = (second, 2, 3, 0, 0, "5a5a", "--------")
+    result("preflight", "apply", (0, 4, 1, 1, 0, 0, 0), preflight)
+    bytes_observed("preflight")
+    for name, location, outcome in [("overlap", first + 1, (0, 1, -1, 1, 0, 0, 0)), ("overflow", (1 << 64) - 1, (0, 1, -1, 1, 0, 0, 0)), ("stale", second, (0, 2, 0, 1, 0, 0, 0))]:
+        rejected = [planned[0], (location, *planned[1][1:])]
+        result(name, "apply", outcome, rejected)
+        bytes_observed(name)
+    restored = private_ranges(2, 1, 1, "5a5a", "--------")
+    for name, fault, native_error, outcome in [("rollback", 1, 5, (2, 6, 1, 1, 2, 1, 3)), ("rollback_conflict", 3, 5, (3, 6, 1, 0, 2, 0, 2)), ("partial", 2, 998, (3, 6, 1, 0, 2, 0, 1))]:
+        expected.append(f"PATCH_TX_NATIVE fault={fault} pid={pid} address={second:x} requested=2 written=0 success=0 error={native_error} paused=1")
+        ranges = restored if fault == 1 else [(first, 2, 3, 1, 0, "5f5c", "5a5b5a5c"), restored[1]] if fault == 3 else private_ranges(4, 1, 0, "unknown", "unknown", "unknown", "unknown")
+        result(name, "apply", outcome, ranges)
+        if fault == 2:
+            expected.append(f"PATCH_TX_PARTIAL allocation={allocation:x} address={first:x} state=2000 read=0 count=0 error=299 old=5a new=5b paused=1")
+        elif fault == 3:
+            bytes_observed(name, "5f5c", "5a5b5a5c", 2)
+        else:
+            bytes_observed(name)
+        bytes_observed("recovered")
+    installed = private_ranges(1, 1, 0, "5b5c", "5a5b5a5c", "5d5e", "5a5d5a5e")
+    for name in ("undo_conflict", "amendment"):
+        result(name, "apply", (1, 0, -1, 1, 2, 0, 2), installed)
+        bytes_observed(name, "5b5c", "5a5b5a5c", 4, True)
+        if name == "undo_conflict":
+            result(name, "conflict", (5, 4, 0, 0, 2, 0, 2), [(first, 2, 3, 1, 0, "5f5c", "5a5b5a5c"), installed[1]])
+            bytes_observed(name, "5f5c", "5a5b5a5c", 4, True)
+        previous_bytes, previous_records = ("5958", "5a595a58") if name == "amendment" else ("5a5a", "--------")
+        result(name, "undo", (4, 0, -1, 1, 2, 2, 4), private_ranges(2, 1, 1, previous_bytes, previous_records))
+        bytes_observed(name, previous_bytes, previous_records, 2 if name == "amendment" else 0)
+    bytes_observed("done")
+    expected.extend([f"PATCH_TX_PAGE allocation={allocation:x} read=4096 content=5a reserved=2000 paused=1", f"PATCH_TX_DONE allocation={allocation:x} scenarios=9 paused=1 epoch={epoch}"])
+    result("code", "apply", (1, 0, -1, 1, 2, 0, 2), [(code_address, 4, 1, 1, 0, "66b82a00", "b86607b8002a----"), (code_address + 4, 2, 1, 1, 0, "90c3", "0090----")], apply_epoch)
+    result("code", "undo", (4, 0, -1, 1, 2, 2, 4), [(code_address, 4, 2, 1, 1, "b8070000", "----------------"), (code_address + 4, 2, 2, 1, 1, "00c3", "--------")], undo_epoch)
+    actual = [line for line in output.splitlines() if line.startswith("PATCH_TX")]
+    assert actual == expected, "Actual transaction identities, addresses, bytes, tracking, native effects, restoration or resume policy differ"
+    stages = ["PATCH_LAYOUT ", "PATCH_TX_RESULT name=preflight ", "PATCH_TX_DONE ", "PATCH_HIT index=0 ", "PATCH_TX_RESULT name=code operation=apply ", "PATCH_HIT index=1 ", "PATCH_TX_RESULT name=code operation=undo ", "PATCH_HIT index=2 ", "PATCH_EXIT "]
+    positions = [output.index(stage) for stage in stages]
+    assert positions == sorted(positions), "Transaction code apply and undo do not precede their genuine execution outcomes"
+    return {"allocation": hex(allocation), "scenarios": 9, "resultCount": 14, "privateEpoch": epoch, "applyEpoch": apply_epoch, "undoEpoch": undo_epoch,
+            "independentlyVerifiedPageBytes": 4096, "compareBeforeUndo": True, "oldestOriginalPreserved": True, "partialFailureResumeAllowed": False}
+
+
+def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine", file_exports=False, single_shot=False, hardware_slot=0, restore_failure=False, transaction=False):
     assert kind in ("software", "hardware", "memory") and engine in ("TitanEngine", "GleeBug"), "Unknown patch reference variant"
     assert not file_exports or kind == "software", "File reference requires its declared software breakpoint"
     assert not single_shot or kind == "hardware", "Single-shot reference requires its declared hardware breakpoint"
     assert not restore_failure or (kind == "software" and not file_exports and not single_shot), "Restore failure requires its declared software reference"
+    assert not transaction or (kind == "software" and not file_exports and not single_shot and not restore_failure), "Transaction requires its declared software reference"
     assert hardware_slot in range(4), "Unknown independently requested hardware slot"
     output = receipt["stdout"]
     finals = re.findall(r"\[wi-test\] FINAL status=(pass|fail) asserts=(\d+)(?: reason=(\w+))?", output)
@@ -223,14 +295,16 @@ def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine",
     assert exits == [("56", "1", "0")], "Patch target exit event was not actually observed after termination"
     restore = check_patch_restore(receipt, facts, base) if restore_failure else None
     assert restore_failure or "PATCH_RESTORE_" not in output, "Unexpected restoration reference evidence"
+    transactions = check_patch_transactions(receipt, facts, base, address, pid, creation) if transaction else None
+    assert transaction or "PATCH_TX" not in output, "Unexpected transaction reference evidence"
     return {"targetIdentity": {"pid": int(pid), "thread": int(thread), "creationTime": creation, "imageBase": hex(base)}, "origin": hex(address),
             "values": [7, 42, 7], "markers": ["original", "patched", "original"], "exitCode": 56,
             "original": facts["original"], "patched": facts["patched"], "changedOffsets": facts["changedOffsets"], "breakpointKind": kind,
             "pageProtection": hex(protection), "cpuStepCount": len(steps), "partialFailedWrite": {"written": int(failures[0][3]), "requested": 4097} if failures else None,
-            "oversizedNativeErrorPresent": assembly[0][1] == "1", "singleShot": single_shot, "hardwareSlot": hardware_slot if single_shot else None, "restoreFailure": restore}
+            "oversizedNativeErrorPresent": assembly[0][1] == "1", "singleShot": single_shot, "hardwareSlot": hardware_slot if single_shot else None, "restoreFailure": restore, "transaction": transactions}
 
 
-def check_patch_negative_controls(receipt, facts, kind="software", engine="TitanEngine", file_exports=False, single_shot=False, hardware_slot=0, restore_failure=False):
+def check_patch_negative_controls(receipt, facts, kind="software", engine="TitanEngine", file_exports=False, single_shot=False, hardware_slot=0, restore_failure=False, transaction=False):
     output = receipt["stdout"]
     changes = [("wrong_executed_value", "values=7/42/7", "values=7/43/7"), ("wrong_marker", "markers=original/patched/original", "markers=original/original/original"),
                ("wrong_original_byte", "old=b8 new=66", "old=90 new=66"), ("wrong_raw_opcode", "raw=cc07000000c3" if kind == "software" else "raw=b807000000c3", "raw=9007000000c3"),
@@ -251,6 +325,12 @@ def check_patch_negative_controls(receipt, facts, kind="software", engine="Titan
     if restore_failure:
         changes.extend([("false_restore_success", "phase=failure api=byte", "phase=retry api=byte"), ("lost_restore_record", "phase=failed index=0", "phase=restored index=0"),
                         ("missing_native_retry", "PATCH_RESTORE_CALL scenario=1 phase=retry", "IGNORED_RESTORE_CALL scenario=1 phase=retry"), ("unverified_full_page", "read=4096 content=5a", "read=4095 content=5a")])
+    if transaction:
+        changes.extend([("false_rollback_success", "name=partial operation=apply status=3", "name=partial operation=apply status=2"),
+                        ("false_resume_permission", "status=3 error=6 failure=1 resume=0", "status=3 error=6 failure=1 resume=1"),
+                        ("lost_manual_change", "observed=5f5c", "observed=5b5c"), ("lost_oldest_original", "records=5a595a58", "records=5b595c58"),
+                        ("missing_second_native_range", "PATCH_TX_OTHER ", "IGNORED_TX_OTHER "), ("false_native_write_count", "requested=2 written=0", "requested=2 written=2"),
+                        ("unverified_transaction_page", "read=4096 content=5a", "read=4095 content=5a"), ("missing_transaction_undo", "name=code operation=undo", "name=code operation=apply")])
     controls = []
     for name, old, new in changes:
         assert old in output, f"Patch negative control has no predicate: {name}"
@@ -259,7 +339,7 @@ def check_patch_negative_controls(receipt, facts, kind="software", engine="Titan
     observed = []
     for name, candidate in controls:
         try:
-            check_patch_reference(candidate, facts, kind, engine, file_exports, single_shot, hardware_slot, restore_failure)
+            check_patch_reference(candidate, facts, kind, engine, file_exports, single_shot, hardware_slot, restore_failure, transaction)
         except (AssertionError, ValueError, KeyError) as error:
             observed.append({"name": name, "status": "rejected", "error": str(error), "targetExecuted": False})
         else:
@@ -303,10 +383,10 @@ def run_patch_oracles(environment, results, selected_engine, timeout, fixture_id
     child.pop("WININSPECT_TEST_PATCH_MODE", None)
     observations = []
     for engine in engines:
-        for kind, single_shot, hardware_slot, restore_failure in (("software", False, 0, False), ("hardware", False, 0, False), ("memory", False, 0, False), *(("hardware", True, slot, False) for slot in range(4)), ("software", False, 0, True)):
+        for kind, single_shot, hardware_slot, restore_failure, transaction in (("software", False, 0, False, False), ("hardware", False, 0, False, False), ("memory", False, 0, False, False), *(("hardware", True, slot, False, False) for slot in range(4)), ("software", False, 0, True, False), ("software", False, 0, False, True)):
             source = plugin.parent / ("test.txt" if kind == "software" else f"test.{kind}.txt")
             assert source.is_file(), "Native patch variant script is missing"
-            scope = environment.root / "patch" / engine / ("software-restore" if restore_failure else f"hardware-single-{hardware_slot}" if single_shot else kind)
+            scope = environment.root / "patch" / engine / ("software-transaction" if transaction else "software-restore" if restore_failure else f"hardware-single-{hardware_slot}" if single_shot else kind)
             profile = scope / "userdir"
             profile.mkdir(parents=True)
             engine_id = 0 if engine == "TitanEngine" else 1
@@ -314,21 +394,21 @@ def run_patch_oracles(environment, results, selected_engine, timeout, fixture_id
             (profile / "headless.ini").write_text(f"[Engine]\nDebugEngine={engine_id}\nNoConsoleWindow=1\n", encoding="utf-8")
             script = scope / "reference.txt"
             text = patch_reference_script(source.read_text(encoding="utf-8"), single_shot, hardware_slot)
-            if restore_failure:
+            if restore_failure or transaction:
                 assert text.count("patchprepare\n") == 1
-                text = text.replace("patchprepare\n", "patchprepare\npatchrestorefailure\n")
+                text = text.replace("patchprepare\n", "patchprepare\n" + ("patchtransactionchecks\n" if transaction else "patchrestorefailure\n"))
             assert text.count("init tests/patch_canary.exe") == 1, "Patch reference script template differs"
             script.write_text(text.replace("init tests/patch_canary.exe", f'init "{binary}"'), encoding="utf-8", newline="\n")
             receipt = run_owned([str(required[0]), "-testing", "-userdir", str(profile), "-plugin", str(plugin), "-cf", str(script)], child, timeout,
                                 required_modules=[*required, engine_path])
             write_json(scope / "receipt.json", receipt)
-            reference = check_patch_reference(receipt, facts, kind, engine, single_shot=single_shot, hardware_slot=hardware_slot, restore_failure=restore_failure)
+            reference = check_patch_reference(receipt, facts, kind, engine, single_shot=single_shot, hardware_slot=hardware_slot, restore_failure=restore_failure, transaction=transaction)
             assert receipt["loadedModules"] and not any("mcp-server" in item["path"].lower() or "agent smithers" in item["path"].lower() for item in receipt["loadedModules"]), "Patch reference loaded an external MCP dependency"
-            controls = check_patch_negative_controls(receipt, facts, kind, engine, single_shot=single_shot, hardware_slot=hardware_slot, restore_failure=restore_failure)
+            controls = check_patch_negative_controls(receipt, facts, kind, engine, single_shot=single_shot, hardware_slot=hardware_slot, restore_failure=restore_failure, transaction=transaction)
             write_json(scope / "independent-patch.json", reference)
             write_json(scope / "negative-controls.json", controls)
-            observations.append({"engine": engine, "breakpointKind": kind, "singleShot": single_shot, "hardwareSlot": hardware_slot if single_shot else None, "restoreFailure": restore_failure, "receipt": receipt, "reference": reference, "negativeControls": controls, "script": file_identity(script), "sourceScript": file_identity(source)})
-            print(f"[VERIFIED] Native {environment.architecture} {engine} {'failed-native-restore/retry' if restore_failure else f'single-shot hardware slot {hardware_slot}' if single_shot else kind}-breakpoint patch execution 7/42/7, seven OS-verified CPU steps, undo and actual exit 56", flush=True)
+            observations.append({"engine": engine, "breakpointKind": kind, "singleShot": single_shot, "hardwareSlot": hardware_slot if single_shot else None, "restoreFailure": restore_failure, "transaction": transaction, "receipt": receipt, "reference": reference, "negativeControls": controls, "script": file_identity(script), "sourceScript": file_identity(source)})
+            print(f"[VERIFIED] Native {environment.architecture} {engine} {'transaction/preflight/rollback/conflict' if transaction else 'failed-native-restore/retry' if restore_failure else f'single-shot hardware slot {hardware_slot}' if single_shot else kind}-breakpoint patch execution 7/42/7, seven OS-verified CPU steps, undo and actual exit 56", flush=True)
     assert file_identity(binary) == identity, "Runtime patch reference changed its source executable"
     results.append({"name": "test_native_patch_oracles", "status": "verified", "oracle": {
         "binary": identity, "plugin": file_identity(plugin), "sourcePeFacts": facts, "normal": normals, "observations": observations}})

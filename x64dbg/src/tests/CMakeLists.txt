@@ -179,6 +179,8 @@ foreach(test_name IN LISTS X64DBG_STANDARD_TESTS)
     x64dbg_add_test(NAME "${test_name}")
 endforeach()
 
+target_sources(test_patch_canary_plugin PRIVATE "${PROJECT_SOURCE_DIR}/src/mcp/common/patch_transaction.cpp")
+
 enable_language(ASM_MASM)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_sources(test_issue3803_target PRIVATE "issue3803/register_context64.asm")

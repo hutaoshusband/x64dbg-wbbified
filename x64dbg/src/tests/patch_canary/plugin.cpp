@@ -1,8 +1,12 @@
 #include <windows.h>
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <string>
 #include <vector>
+#include <memory>
+#include <limits>
+#include "../../mcp/common/patch_transaction.h"
 #include "_plugins.h"
 #include "bridgemain.h"
 #include "_dbgfunctions.h"
@@ -19,6 +23,7 @@ namespace
     std::atomic<duint> gAddress{0};
     std::atomic<DWORD> gPid{0}, gThread{0}, gExit{0};
     std::atomic<unsigned> gHitCount{0};
+    std::atomic<std::uint64_t> gPauseEpoch{0};
     std::atomic<bool> gOverflow{false}, gExited{false};
     struct Hit { duint address; DWORD pid, thread; BPXTYPE type; bool enabled, singleshoot; };
     std::array<Hit, 8> gHits{};
@@ -73,12 +78,17 @@ namespace
         const auto address = FieldAddress(name);
         return _plugin_testassert(address && DbgMemRead(address, &value, sizeof(value)), "read patch fixture field %s", name);
     }
+    void ResetTransactions();
     void cbPatchEvent(CBTYPE type, void* callbackInfo)
     {
         if(type == CB_INITDEBUG)
         {
+            ResetTransactions();
+            gPauseEpoch.store(0, std::memory_order_release);
             gAddress = 0; gPid = 0; gThread = 0; gExit = 0; gHitCount = 0; gOverflow = false; gExited = false; gBreakpointType = bp_normal; gOriginalProtection = 0; gStepCount = 0; gFailureAddress = 0; gFailureWritten = 0; gArmCount = 0; gHardwareSlot = MAXDWORD; gSingleShot = false;
         }
+        else if(type == CB_PAUSEDEBUG)
+            gPauseEpoch.fetch_add(1, std::memory_order_release);
         else if(type == CB_DEBUGEVENT)
         {
             const auto info = static_cast<PLUG_CB_DEBUGEVENT*>(callbackInfo);
@@ -401,6 +411,8 @@ namespace
         return true;
     }
 
+#include "transaction_reference.h"
+
     bool cbSingleArm(int, char**)
     {
         const auto address = FieldAddress("PatchValue");
@@ -454,7 +466,11 @@ namespace
         if(!_plugin_testassert(!DbgFunctions()->AssembleAtEx(address, oversized.c_str(), error, true), "oversized native assembly text rejects before writing")) return false;
         if(!CheckBytes(false, true) || !CheckTracking(false)) return false;
         _plugin_logprintf("PATCH_ASSEMBLY origin=%llx instruction=mov_ax_0x2a encoded=66b82a00 fill=90 invalidRejected=1 oversizedTextRejected=1 oversizedHasError=%u\n", static_cast<unsigned long long>(address), error[0] ? 1 : 0);
-        if(!_plugin_testassert(DbgFunctions()->AssembleAtEx(address, "mov ax,0x2a", error, true), "requested assembly installs with explicit native NOP fill")) return false;
+        if(gTransactionsEnabled)
+        {
+            if(!ApplyCodeTransaction(address)) return false;
+        }
+        else if(!_plugin_testassert(DbgFunctions()->AssembleAtEx(address, "mov ax,0x2a", error, true), "requested assembly installs with explicit native NOP fill")) return false;
         return CheckBytes(true, true) && CheckTracking(true);
     }
     bool cbWriteFailure(int, char**)
@@ -629,7 +645,12 @@ namespace
     {
         if(!CheckPhase(3, {7, 42, 0}) || !CheckBytes(true, true) || !CheckTracking(true)) return false;
         const auto address = FieldAddress("PatchValue");
-        DbgFunctions()->PatchRestoreRange(address, address + 4);
+        if(gTransactionsEnabled)
+        {
+            if(!UndoCodeTransaction()) return false;
+        }
+        else
+            DbgFunctions()->PatchRestoreRange(address, address + 4);
         return CheckBytes(false, true) && CheckTracking(false);
     }
     bool cbHit(int argc, char** argv)
@@ -706,9 +727,10 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* init)
     init->sdkVersion = PLUG_SDKVERSION;
     strcpy_s(init->pluginName, "patch-execution-reference");
     gPluginHandle = init->pluginHandle;
-    for(const auto type : {CB_INITDEBUG, CB_DEBUGEVENT, CB_BREAKPOINT, CB_EXITPROCESS})
+    for(const auto type : {CB_INITDEBUG, CB_DEBUGEVENT, CB_BREAKPOINT, CB_EXITPROCESS, CB_PAUSEDEBUG})
         _plugin_registercallback(gPluginHandle, type, cbPatchEvent);
-    return _plugin_registercommand(gPluginHandle, "patchrestorefailure", cbRestoreFailure, true)
+    return _plugin_registercommand(gPluginHandle, "patchtransactionchecks", cbTransactionChecks, true)
+           && _plugin_registercommand(gPluginHandle, "patchrestorefailure", cbRestoreFailure, true)
            && _plugin_registercommand(gPluginHandle, "patchsinglearm", cbSingleArm, true)
            && _plugin_registercommand(gPluginHandle, "patchstep", cbStep, true)
            && _plugin_registercommand(gPluginHandle, "patchselect", cbSelect, true)
