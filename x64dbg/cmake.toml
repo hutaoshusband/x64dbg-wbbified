@@ -350,7 +350,7 @@ EXCLUDE_FROM_ALL = true
 type = "executable"
 condition = "mcp"
 sources = ["src/mcp/testing/launch_reference.cpp"]
-link-libraries = ["mcp_json"]
+link-libraries = ["::mcp_common", "mcp_json"]
 compile-features = ["cxx_std_17"]
 msvc.link-options = ["/MANIFESTUAC:level='asInvoker' uiAccess='false'"]
 

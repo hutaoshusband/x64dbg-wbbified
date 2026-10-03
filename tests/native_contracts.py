@@ -1115,6 +1115,7 @@ def run_launch_reference(plan, binary, output, expected_bits):
         startup.startup.stdout = startup.startup.stderr = output_handle
         startup.attributes = ctypes.cast(attribute_buffer, ctypes.c_void_p)
         command = ctypes.create_unicode_buffer(plan["commandLine"])
+        submitted_command = command.value
         environment = ctypes.create_string_buffer(environment_bytes)
         create_suspended = 4
         extended_startup = 0x00080000
@@ -1124,6 +1125,9 @@ def run_launch_reference(plan, binary, output, expected_bits):
             raise ctypes.WinError(ctypes.get_last_error())
         process = SimpleNamespace(pid=information.pid, _handle=information.process)
         identity = process_identity(process)
+        child_token, token_queries = process_token_oracle(information.process)
+        parent_token, parent_queries = parent_token_oracle()
+        assert child_token == parent_token, "Ordinary reference child token differs from its actual controller"
         job.assign(process)
         if KERNEL.ResumeThread(information.thread) == 0xffffffff:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -1134,8 +1138,18 @@ def run_launch_reference(plan, binary, output, expected_bits):
             raise ctypes.WinError(ctypes.get_last_error())
         assert exit_code.value == 17, f"Reference exit {exit_code.value}: {output.read_bytes()[:500]!r}"
         observed = json.loads(output.read_bytes())
+        assert observed["rawCommandLine"] == submitted_command, "Reference raw command line differs from the exact native CreateProcess input"
         assert observed["pid"] == identity["pid"] and observed["pointerBits"] == expected_bits
-        return {"processIdentity": identity, "exitCode": exit_code.value, "binary": file_identity(binary), "output": file_identity(output), "observed": observed}
+        native_identity = observed["identity"]
+        image = file_identity(binary)
+        actual_file = file_handle_oracle(binary)
+        expected_identity = {**identity, **child_token, "architecture": "x64" if expected_bits == 64 else "x32",
+                             "image": {"path": str(binary.resolve()), "sha256": image["sha256"], "size": str(image["size"]),
+                                       "volumeSerial": actual_file["volumeSerial"], "fileIndex": actual_file["fileIndex"]}}
+        assert native_identity == expected_identity, "Reference child identity/rights differ from independent process/token/file observations"
+        return {"processIdentity": identity, "exitCode": exit_code.value, "binary": image, "output": file_identity(output),
+                "observed": observed, "submittedCommandLine": submitted_command, "expectedIdentity": expected_identity, "childToken": child_token,
+                "childTokenQueries": token_queries, "parentToken": parent_token, "parentTokenQueries": parent_queries}
     finally:
         if job is not None:
             job.close()
@@ -1752,7 +1766,7 @@ class NativeFileInformation(ctypes.Structure):
                 ("sizeLow", wintypes.DWORD), ("links", wintypes.DWORD), ("indexHigh", wintypes.DWORD), ("indexLow", wintypes.DWORD)]
 
 
-def parent_token_oracle():
+def process_token_oracle(process_handle=None):
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
     advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
     advapi.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
@@ -1761,7 +1775,7 @@ def parent_token_oracle():
     KERNEL.LocalFree.argtypes = [ctypes.c_void_p]
     KERNEL.LocalFree.restype = ctypes.c_void_p
     token = wintypes.HANDLE()
-    if not advapi.OpenProcessToken(KERNEL.GetCurrentProcess(), 8, ctypes.byref(token)):
+    if not advapi.OpenProcessToken(KERNEL.GetCurrentProcess() if process_handle is None else process_handle, 8, ctypes.byref(token)):
         raise ctypes.WinError(ctypes.get_last_error())
     queries = []
     try:
@@ -1803,6 +1817,10 @@ def parent_token_oracle():
         return observed, queries
     finally:
         KERNEL.CloseHandle(token)
+
+
+def parent_token_oracle():
+    return process_token_oracle()
 
 
 def file_handle_oracle(binary):

@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include <Windows.h>
 #include <nlohmann/json.hpp>
+#include "platform.h"
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -47,7 +48,10 @@ int wmain(int argc, wchar_t** argv)
         std::vector<wchar_t> directory(needed);
         if(!needed || !GetCurrentDirectoryW(needed, directory.data()))
             throw std::runtime_error("Reference current directory read failed");
-        const nlohmann::json result = {{"argv", arguments}, {"rawCommandLine", utf8(GetCommandLineW())}, {"cwd", utf8(directory.data())},
+        const auto identity = wininspect::mcp::capture_current_process();
+        if(const auto* failure = std::get_if<wininspect::mcp::ContractError>(&identity))
+            throw std::runtime_error(failure->message);
+        const nlohmann::json result = {{"identity", wininspect::mcp::native_process_json(std::get<wininspect::mcp::NativeProcessIdentity>(identity))}, {"argv", arguments}, {"rawCommandLine", utf8(GetCommandLineW())}, {"cwd", utf8(directory.data())},
             {"pointerBits", sizeof(void*) * 8}, {"pid", GetCurrentProcessId()}, {"environment", {
                 {"WI_KEEP", environment_value(L"WI_KEEP")}, {"WI_DELETE", environment_value(L"WI_DELETE")},
                 {"WI_EMPTY", environment_value(L"WI_EMPTY")}, {"WI_UNICODE", environment_value(L"WI_UNICODE")}}}};

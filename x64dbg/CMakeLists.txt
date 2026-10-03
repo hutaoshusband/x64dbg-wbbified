@@ -1460,7 +1460,12 @@ if(X64DBG_BUILD_MCP) # mcp
 		cxx_std_17
 	)
 
+	if(NOT TARGET mcp_common)
+		message(FATAL_ERROR "Target \"mcp_common\" referenced by \"mcp_launch_reference\" does not exist!")
+	endif()
+
 	target_link_libraries(mcp_launch_reference PRIVATE
+		mcp_common
 		mcp_json
 	)
 
