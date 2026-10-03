@@ -197,6 +197,21 @@ def main() -> int:
             raise RuntimeError("The native SDK context observation has invalid fields")
         return values
 
+    def observe_status_boundary():
+        cursor = headless.mark()
+        headless.send("attachobserve boundary")
+        emitted = headless.wait_for_line(lambda line: line == "ATTACH_BOUNDARY emitted=1", 10, cursor)
+        with headless.lock:
+            records = headless.lines[cursor:]
+        observations["statusBoundary"] = {"acknowledged": emitted is not None, "records": records}
+        try:
+            prefix_index = records.index("ATTACH_STATE_PREFIX")
+            state_index = records.index("[STATE] paused", prefix_index + 1)
+            emitted_index = records.index("ATTACH_BOUNDARY emitted=1", state_index + 1)
+        except ValueError:
+            return False
+        return emitted is not None and prefix_index < state_index < emitted_index
+
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if args.no_console_window else 0
     target = subprocess.Popen(
         [str(debuggee)] + (["block"] if breakin_mode else []),
@@ -274,6 +289,8 @@ def main() -> int:
             if headless.wait_for_line(lambda line: line == "[STATE] paused", 10, cursor) is None:
                 return fail("breakin_no_effect", "repeated pause request did not break in")
 
+            if not observe_status_boundary():
+                return fail("state_record_boundary", "native paused status merged with an unterminated log fragment")
             if not shutdown_headless():
                 return fail("detach_failed", "the blocked-target debugger did not detach and exit normally")
             append_log(log_path, '[x64dbg-test] ASSERT PASS source=driver message="first pause request did not pause the blocked debuggee"')
@@ -316,6 +333,8 @@ def main() -> int:
         observations["selectedAtPause"] = paused
         if paused["pid"] != str(pid) or paused["tid"] != str(main_tid) or paused["creation"] != str(main_creation) or paused["running"] != "0" or paused["sdk"] != "1" or paused["native"] != "1" or int(paused["ip"], 16) == 0 or paused["ip"] != paused["nativeIp"]:
             return fail("wrong_pause_context", "the native OS/main-thread stop does not match the debugger context")
+        if not observe_status_boundary():
+            return fail("state_record_boundary", "native paused status merged with an unterminated log fragment")
         if not shutdown_headless():
             return fail("detach_failed", "the owned debugger did not detach and exit normally")
         observations["detached"] = native_process_state(target)

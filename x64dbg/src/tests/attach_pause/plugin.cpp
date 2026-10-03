@@ -7,6 +7,15 @@
 
 static bool Observe(int argc, char* argv[])
 {
+    if(argc == 2 && strcmp(argv[1], "boundary") == 0)
+    {
+        if(!DbgIsDebugging() || DbgIsRunning())
+            return false;
+        GuiAddLogMessage("\nATTACH_STATE_PREFIX");
+        GuiSetDebugState(paused);
+        GuiAddLogMessage("ATTACH_BOUNDARY emitted=1\n");
+        return true;
+    }
     if(argc != 2 || (strcmp(argv[1], "before") != 0 && strcmp(argv[1], "paused") != 0))
         return false;
     const auto pid = DbgGetProcessId();

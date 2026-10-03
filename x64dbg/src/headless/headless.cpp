@@ -319,7 +319,7 @@ extern "C" __declspec(dllexport) void* _gui_sendmessage(GUIMSG type, void* param
     case GUI_SET_DEBUG_STATE:
     {
         auto s = DBGSTATE(duint(param1));
-        printf("[STATE] %s\n", dbgstate2str(s));
+        printf("\n[STATE] %s\n", dbgstate2str(s));
     }
     break;
 
