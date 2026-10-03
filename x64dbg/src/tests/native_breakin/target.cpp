@@ -2,6 +2,7 @@
 #include "../../dbg/native_breakin.h"
 #include "../../dbg/native_breakin_payload.h"
 #include "native_creator.h"
+#include "session.h"
 #include <intrin.h>
 #include <cstdio>
 #include <cwchar>
@@ -266,6 +267,16 @@ static bool VerifyFailureShutdown(HANDLE process, void* code, std::uintptr_t pro
 
 int wmain(int argc, wchar_t** argv)
 {
+    if(argc > 2 && std::wcscmp(argv[2], L"replacement") == 0)
+    {
+        if(argc != 5)
+            return 27;
+        wchar_t* end = nullptr;
+        const auto rounds = std::wcstoul(argv[4], &end, 10);
+        if(!end || *end || rounds == 0 || rounds > BreakInSessions::MaxReplacementRounds)
+            return 27;
+        return BreakInSessions::RunReplacement(argv[1], argv[3], static_cast<unsigned>(rounds));
+    }
     const auto failure = FailureSelection(argc > 4 ? argv[4] : L"none");
     const bool reducedCreation = argc > 4 && std::wcscmp(argv[4], L"reduced") == 0;
     const bool partialCreation = argc > 4 && std::wcscmp(argv[4], L"partial") == 0;

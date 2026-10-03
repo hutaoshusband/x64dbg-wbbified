@@ -168,6 +168,98 @@ def check_breakin_receipt(receipt, architecture, mode, detached, failure=None):
             "failure": failure, "handler": handler if handler_failure else None, "retention": retention if failure in ("remove", "partial", "reduced") else None, "creator": creator, "provider": provider}
 
 
+def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
+    assert kind in ("normal", "register", "remove", "partial") and mode in ("show", "hide", "both")
+    assert receipt["exitCode"] == 0 and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"]
+    lines = receipt["stdout"].splitlines()
+    headers = [index for index, line in enumerate(lines) if line.startswith("SESSION ")]
+    assert len(headers) == rounds
+    assert one_line(lines, "SESSION_FINISH ") == {"rounds": str(rounds), "createRejected": "1", "error": "170"}
+    observed = []
+    generations = set()
+    partial = kind == "partial"
+    registration = kind == "register"
+    removal = kind == "remove"
+    retained = partial or removal
+    for round_index, begin in enumerate(headers):
+        block = lines[begin:headers[round_index + 1] if round_index + 1 < rounds else len(lines)]
+        session = one_line(block, "SESSION ")
+        assert set(session) == {"round", "old", "oldCreation", "next", "nextCreation", "partial", "registration", "removal"}
+        assert {key: session[key] for key in ("round", "partial", "registration", "removal")} == {
+            "round": str(round_index), "partial": str(int(partial)), "registration": str(int(registration)), "removal": str(int(removal))}
+        assert int(session["old"]) > 0 and int(session["next"]) > 0 and session["old"] != session["next"]
+        assert int(session["oldCreation"]) > int(receipt["processIdentity"]["creationTime"]) and int(session["nextCreation"]) >= int(session["oldCreation"])
+        identities = [fields(line) for line in block if line.startswith("IDENTITY ")]
+        assert len(identities) == 2 and {item["role"] for item in identities} == {"target"}
+        expected_identities = {(session["old"], session["oldCreation"]), (session["next"], session["nextCreation"])}
+        assert {(item["pid"], item["creation"]) for item in identities} == expected_identities and not generations.intersection(expected_identities)
+        generations.update(expected_identities)
+        assert one_line(block, "SESSION_REQUEST ") == {"oldStatus": "c0000022" if partial else "00000000", "oldCreated": str(int(not partial)), "nextStatus": "00000000", "nextCreated": "1"}
+        assert one_line(block, "SESSION_DUPLICATE ") == {"rejected": "1", "error": "170"}
+        helpers = [one_line(block, f"SESSION_HELPER role={role} ") for role in range(2)]
+        for role, helper in enumerate(helpers):
+            target_role = "old" if role == 0 else "next"
+            assert set(helper) == {"role", "pid", "thread", "creation", "code"} and helper["role"] == str(role) and helper["pid"] == session[target_role]
+            assert int(helper["thread"]) > 0 and int(helper["creation"]) > int(session[target_role + "Creation"]) and int(helper["code"], 16) > 0
+            expected_breaks = int(role == 1 or not registration)
+            if expected_breaks:
+                assert one_line(block, f"SESSION_CONSUME role={role} ") == {"role": str(role), "pid": helper["pid"], "thread": helper["thread"], "consumed": str(role), "repeated": "0"}
+            else:
+                assert not any(line.startswith(f"SESSION_CONSUME role={role} ") for line in block)
+            exit_code = "2" if role == 0 and registration else "1" if role == 0 and removal else "0"
+            assert one_line(block, f"SESSION_THREAD_TERMINAL role={role} ") == {"role": str(role), "pid": helper["pid"], "thread": helper["thread"], "exit": exit_code}
+            freed = role == 1 or not retained
+            assert one_line(block, f"SESSION_PAGE role={role} ") == {"role": str(role), "pid": helper["pid"], "code": helper["code"], "freed": str(int(freed)), "state": "00010000" if freed else "00001000"}
+            assert one_line(block, f"SESSION_TARGET_TERMINAL role={role} ") == {"role": str(role), "pid": helper["pid"], "exit": "7", "breaks": "2", "helperBreaks": str(expected_breaks), "helperExits": "1"}
+        assert helpers[0]["thread"] != helpers[1]["thread"]
+        for prefix in ("SESSION_HELPER ", "SESSION_THREAD_TERMINAL ", "SESSION_PAGE ", "SESSION_TARGET_TERMINAL "):
+            assert len([line for line in block if line.startswith(prefix)]) == 2
+        assert len([line for line in block if line.startswith("SESSION_CONSUME ")]) == (1 if registration else 2)
+        if retained:
+            retention = one_line(block, "SESSION_RETAIN ")
+            assert {key: retention[key] for key in ("pid", "code", "alive", "executable", "data", "unchanged")} == {
+                "pid": helpers[0]["pid"], "code": helpers[0]["code"], "alive": "1", "executable": "00000020", "data": "00000004", "unchanged": "1"}
+            assert int(retention["samples"]) > 0 and 250 <= int(retention["elapsed"]) < 10000
+        else:
+            assert not any(line.startswith("SESSION_RETAIN ") for line in block)
+        if partial:
+            creator = one_line(block, "CREATOR ")
+            assert {key: creator[key] for key in ("nativeStatus", "returnedStatus", "error", "requestedAccess", "actualAccess", "flags", "nativeCreated", "handleClosed", "calls")} == {
+                "nativeStatus": "00000000", "returnedStatus": "c0000022", "error": "5", "requestedAccess": "001fffff", "actualAccess": "001fffff", "flags": "2", "nativeCreated": "1", "handleClosed": "1", "calls": str(round_index + 1)}
+            assert {key: creator[key] for key in ("pid", "thread", "creation")} == {key: helpers[0][key] for key in ("pid", "thread", "creation")} and creator["start"] == helpers[0]["code"]
+        else:
+            assert not any(line.startswith("CREATOR ") for line in block)
+        if registration or removal:
+            handler = one_line(block, "HANDLER ")
+            assert {key: handler[key] for key in ("registrationCalls", "removalCalls", "nativeRegistration", "removalMatches", "active", "lateRemoved", "code", "queried", "state")} == {
+                "registrationCalls": "1", "removalCalls": str(int(removal)), "nativeRegistration": str(int(removal)), "removalMatches": str(int(removal)), "active": str(int(removal)), "lateRemoved": str(int(removal)),
+                "code": helpers[0]["code"], "queried": "1", "state": "00001000" if removal else "00010000"}
+            if removal:
+                assert handler["protection"] == "00000020"
+        else:
+            assert not any(line.startswith("HANDLER ") for line in block)
+        final = [fields(line) for line in block if line.startswith("TARGET final_peb=")]
+        assert len(final) == 2 and all(item == {"final_peb": str(int(mode == "show")), "final_port": "1", "detached": "0", "port_read": "1"} for item in final)
+        if architecture == "x32":
+            native = [fields(line) for line in block if line.startswith("NATIVE_PEB ")]
+            assert len(native) == 2 and all(item["original"] == "1" and item["observed"] == str(int(mode != "both")) and int(item["address"], 16) > 0 for item in native)
+        assert one_line(block, "SESSION_ROUND ") == {"round": str(round_index), "completed": "1"}
+        request = next(index for index, line in enumerate(block) if line.startswith("SESSION_REQUEST "))
+        for role in range(2):
+            helper_position = next(index for index, line in enumerate(block) if line.startswith(f"SESSION_HELPER role={role} "))
+            thread_position = next(index for index, line in enumerate(block) if line.startswith(f"SESSION_THREAD_TERMINAL role={role} "))
+            page_position = next(index for index, line in enumerate(block) if line.startswith(f"SESSION_PAGE role={role} "))
+            target_position = next(index for index, line in enumerate(block) if line.startswith(f"SESSION_TARGET_TERMINAL role={role} "))
+            assert request < helper_position < thread_position < page_position < target_position
+        if retained:
+            held = next(index for index, line in enumerate(block) if line.startswith("SESSION_RETAIN "))
+            released = next(index for index, line in enumerate(block) if line.startswith("TARGET breakpoint_returned="))
+            assert page_position < held < released
+        observed.append({"session": session, "helpers": helpers, "retained": retained, "sameVirtualAddress": helpers[0]["code"] == helpers[1]["code"]})
+    assert len(generations) == rounds * 2
+    return {"rounds": observed, "targetGenerations": len(generations)}
+
+
 def run_breakin_oracles(environment, results, fixture_identity, run_owned):
     binary, identity, machine = fixture_identity(environment, "native_breakin")
     observations = []
@@ -183,6 +275,15 @@ def run_breakin_oracles(environment, results, fixture_identity, run_owned):
                 observed = check_breakin_receipt(receipt, environment.architecture, mode, detached, failure)
                 assert file_identity(binary) == identity, "Native break-in fixture changed"
                 observations.append({"mode": mode, "detached": detached, "failure": failure, "receipt": file_identity(path), "observed": observed})
+    replacements = []
+    for kind in ("normal", "register", "remove", "partial"):
+        for mode in ("show", "hide", "both"):
+            receipt = run_owned([str(binary), mode, "replacement", kind, "8"], os.environ, 35)
+            path = environment.root / f"breakin-replacement-{mode}-{kind}.json"
+            write_json(path, receipt)
+            observed = check_replacement_receipt(receipt, environment.architecture, mode, kind)
+            assert file_identity(binary) == identity, "Native replacement fixture changed"
+            replacements.append({"mode": mode, "kind": kind, "receipt": file_identity(path), "observed": observed})
     results.append({"name": "test_native_breakin_oracles", "status": "verified", "oracle": {
-        "binary": identity, "machine": machine, "observations": observations, "debuggerUsed": "owned Windows native controller"}})
-    print(f"[VERIFIED] Native {environment.architecture} hidden/unhidden break-in, identity rejection, detach, thread exit, page release, failed-handler retention, late-thread binding and actual native reduced-access creation", flush=True)
+        "binary": identity, "machine": machine, "observations": observations, "replacements": replacements, "debuggerUsed": "owned Windows native controller"}})
+    print(f"[VERIFIED] Native {environment.architecture} hidden/unhidden break-in, identity rejection, detach, thread exit, page release, failed-handler retention, late-thread binding and actual native reduced-access creation, and repeated target replacement", flush=True)

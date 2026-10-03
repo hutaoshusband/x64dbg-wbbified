@@ -144,6 +144,9 @@ namespace FixtureNativeCreation
 
         LONG NTAPI Create(HANDLE* handle, ACCESS_MASK access, void* attributes, HANDLE process, void* start, void* argument, ULONG flags, SIZE_T zero, SIZE_T commit, SIZE_T reserve, void* list)
         {
+            const auto calls = observation.calls + 1;
+            observation = {};
+            observation.calls = calls;
             const auto mode = creationMode.load();
             const auto reduced = mode == Mode::ReducedAccess;
             std::vector<ThreadIdentity> before;
@@ -155,7 +158,6 @@ namespace FixtureNativeCreation
             const auto error = GetLastError();
             observation.nativeStatus = status;
             observation.start = start;
-            ++observation.calls;
             DWORD handleFlags = 0;
             observation.nativeHandleValid = *handle && GetHandleInformation(*handle, &handleFlags) != FALSE;
             observation.nativeHandleError = observation.nativeHandleValid ? ERROR_SUCCESS : GetLastError();
