@@ -7,6 +7,110 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <atomic>
+#include <array>
+
+enum class HandlerFailure
+{
+    None,
+    Registration,
+    Removal
+};
+
+static std::atomic<HandlerFailure> gHandlerFailure{HandlerFailure::None};
+static std::atomic<LONG> gRegistrationCalls{0};
+static std::atomic<LONG> gRemovalCalls{0};
+static std::atomic<bool> gNativeRegistration{false};
+static std::atomic<bool> gRemovalArgumentMatches{false};
+static std::atomic<void*> gRegisteredHandler{nullptr};
+static std::atomic<void*> gRegisteredCode{nullptr};
+
+static HandlerFailure FailureSelection(const wchar_t* value)
+{
+    if(std::wcscmp(value, L"register") == 0)
+        return HandlerFailure::Registration;
+    if(std::wcscmp(value, L"remove") == 0)
+        return HandlerFailure::Removal;
+    return HandlerFailure::None;
+}
+
+#ifdef _WIN64
+extern "C" BOOLEAN NTAPI TestRegisterFunctionTable(PRUNTIME_FUNCTION table, DWORD entries, DWORD64 base)
+{
+    gRegistrationCalls.fetch_add(1);
+    gRegisteredCode = reinterpret_cast<void*>(base);
+    if(gHandlerFailure == HandlerFailure::Registration)
+        return FALSE;
+    const auto registered = RtlAddFunctionTable(table, entries, base);
+    gNativeRegistration = registered != FALSE;
+    gRegisteredHandler = registered ? table : nullptr;
+    return registered;
+}
+
+extern "C" BOOLEAN NTAPI TestRemoveFunctionTable(PRUNTIME_FUNCTION table)
+{
+    gRemovalCalls.fetch_add(1);
+    gRemovalArgumentMatches = table == gRegisteredHandler.load();
+    if(gHandlerFailure == HandlerFailure::Removal)
+        return FALSE;
+    return RtlDeleteFunctionTable(table);
+}
+#else
+extern "C" PVOID WINAPI TestRegisterHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER handler)
+{
+    gRegistrationCalls.fetch_add(1);
+    MEMORY_BASIC_INFORMATION memory{};
+    if(VirtualQuery(reinterpret_cast<void*>(handler), &memory, sizeof(memory)) != sizeof(memory))
+        return nullptr;
+    gRegisteredCode = memory.AllocationBase;
+    if(gHandlerFailure == HandlerFailure::Registration)
+        return nullptr;
+    const auto registered = AddVectoredExceptionHandler(first, handler);
+    gNativeRegistration = registered != nullptr;
+    gRegisteredHandler = registered;
+    return registered;
+}
+
+extern "C" ULONG WINAPI TestRemoveHandler(PVOID handler)
+{
+    gRemovalCalls.fetch_add(1);
+    gRemovalArgumentMatches = handler == gRegisteredHandler.load();
+    if(gHandlerFailure == HandlerFailure::Removal)
+        return 0;
+    return RemoveVectoredExceptionHandler(handler);
+}
+#endif
+
+static bool VerifyHandlerFailure()
+{
+    const auto registrationCalls = gRegistrationCalls.load();
+    const auto removalCalls = gRemovalCalls.load();
+    const auto registeredHandler = gRegisteredHandler.load();
+    const auto registeredCode = gRegisteredCode.load();
+    MEMORY_BASIC_INFORMATION memory{};
+    const auto queried = VirtualQuery(registeredCode, &memory, sizeof(memory)) == sizeof(memory);
+    bool active = false, lateRemoved = false;
+    if(gHandlerFailure == HandlerFailure::Removal && gNativeRegistration.load() && registeredHandler)
+    {
+#ifdef _WIN64
+        DWORD64 base = 0;
+        const auto entry = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(registeredCode) + 1, &base, nullptr);
+        active = entry == registeredHandler && base == reinterpret_cast<DWORD64>(registeredCode);
+        lateRemoved = RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(registeredHandler)) != FALSE;
+#else
+        lateRemoved = RemoveVectoredExceptionHandler(registeredHandler) != 0;
+        active = lateRemoved;
+#endif
+    }
+    std::printf("HANDLER registrationCalls=%ld removalCalls=%ld nativeRegistration=%u removalMatches=%u active=%u lateRemoved=%u code=%p queried=%u state=%08lx protection=%08lx\n",
+                registrationCalls, removalCalls, unsigned(gNativeRegistration.load()), unsigned(gRemovalArgumentMatches.load()), unsigned(active), unsigned(lateRemoved),
+                registeredCode, unsigned(queried), memory.State, memory.Protect);
+    std::fflush(stdout);
+    if(gHandlerFailure == HandlerFailure::Registration)
+        return queried && registrationCalls == 1 && removalCalls == 0 && !gNativeRegistration.load() && !registeredHandler && memory.State == MEM_FREE;
+    return queried && registrationCalls == 1 && removalCalls == 1 && gNativeRegistration.load() && gRemovalArgumentMatches.load() && active && lateRemoved &&
+           memory.State == MEM_COMMIT && memory.Protect == PAGE_EXECUTE_READ && memory.Type == MEM_PRIVATE;
+}
 
 struct OwnedHandle
 {
@@ -117,15 +221,59 @@ static LONG CALLBACK ObserveException(EXCEPTION_POINTERS* pointers)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+static bool VerifyRetainedCode(HANDLE process, void* code, const char* phase)
+{
+    const auto start = GetTickCount64();
+    unsigned samples = 0;
+    std::array<unsigned char, 64> original{}, current{};
+    SIZE_T read = 0;
+    if(!ReadProcessMemory(process, code, original.data(), original.size(), &read) || read != original.size())
+        return false;
+    do
+    {
+        MEMORY_BASIC_INFORMATION executable{}, data{};
+        if(WaitForSingleObject(process, 0) != WAIT_TIMEOUT ||
+                VirtualQueryEx(process, code, &executable, sizeof(executable)) != sizeof(executable) ||
+                VirtualQueryEx(process, static_cast<unsigned char*>(code) + NativeBreakInPayload::CodePageSize, &data, sizeof(data)) != sizeof(data) ||
+                executable.AllocationBase != code || data.AllocationBase != code || executable.State != MEM_COMMIT || data.State != MEM_COMMIT ||
+                executable.Type != MEM_PRIVATE || data.Type != MEM_PRIVATE || executable.Protect != PAGE_EXECUTE_READ || data.Protect != PAGE_READWRITE ||
+                !ReadProcessMemory(process, code, current.data(), current.size(), &read) || read != current.size() || current != original)
+            return false;
+        ++samples;
+        Sleep(1);
+    }
+    while(GetTickCount64() - start < 250);
+    std::printf("RETENTION phase=%s samples=%u elapsed=%llu alive=1 code=%p executable=00000020 data=00000004 unchanged=1\n", phase, samples, GetTickCount64() - start, code);
+    std::fflush(stdout);
+    return true;
+}
+
+static bool VerifyFailureShutdown(HANDLE process, void* code, std::uintptr_t provider)
+{
+    DWORD before = 0, after = 0;
+    if(!VerifyRetainedCode(process, code, "retired") || !GetProcessHandleCount(GetCurrentProcess(), &before) || before < 2)
+        return false;
+    NativeBreakIn::Shutdown();
+    if(!GetProcessHandleCount(GetCurrentProcess(), &after))
+        return false;
+    const auto rejected = NativeBreakIn::Create(provider);
+    const auto beginRejected = !NativeBreakIn::BeginTarget(process);
+    std::printf("SHUTDOWN before=%lu after=%lu createRejected=%u error=%lu beginRejected=%u\n", before, after, unsigned(!rejected.created), rejected.error, unsigned(beginRejected));
+    std::fflush(stdout);
+    return after <= before - 2 && !rejected.created && rejected.error == ERROR_BUSY && beginRejected && VerifyRetainedCode(process, code, "shutdown");
+}
+
 int wmain(int argc, wchar_t** argv)
 {
+    const auto failure = FailureSelection(argc > 4 ? argv[4] : L"none");
     const bool detached = argc > 3 && std::wcscmp(argv[3], L"detach") == 0;
     const bool nativeHidden = argc > 1 && std::wcscmp(argv[1], L"both") == 0;
     const bool hidden = nativeHidden || (argc > 1 && std::wcscmp(argv[1], L"hide") == 0);
     if(argc > 2 && std::wcscmp(argv[2], L"target") == 0)
     {
-        if(argc != 5)
+        if(argc != 5 && argc != 6)
             return 24;
+        gHandlerFailure = FailureSelection(argc > 5 ? argv[5] : L"none");
 #ifdef _WIN64
         auto peb = reinterpret_cast<volatile unsigned char*>(__readgsqword(0x60));
 #else
@@ -149,7 +297,7 @@ int wmain(int argc, wchar_t** argv)
         __debugbreak();
         const auto completion = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(std::wcstoull(argv[3], nullptr, 10)));
         OwnedHandle completionOwner(completion);
-        if(argc != 5 || WaitForSingleObject(completion, 20000) != WAIT_OBJECT_0)
+        if(WaitForSingleObject(completion, 20000) != WAIT_OBJECT_0)
             return 21;
         std::printf("TARGET breakpoint_returned=1\n");
         std::fflush(stdout);
@@ -158,8 +306,9 @@ int wmain(int argc, wchar_t** argv)
         const auto portRead = CheckRemoteDebuggerPresent(GetCurrentProcess(), &debugPort);
         std::printf("TARGET final_peb=%u final_port=%u detached=%u port_read=%u\n", unsigned(peb[2]), unsigned(debugPort), unsigned(expectedDetach), unsigned(portRead));
         std::fflush(stdout);
+        const auto failureVerified = gHandlerFailure == HandlerFailure::None || VerifyHandlerFailure();
         RemoveVectoredExceptionHandler(handler);
-        return original == 1 && portRead && bool(debugPort) == !expectedDetach && unsigned(peb[2]) == unsigned(!hidden && !expectedDetach) ? 7 : 12;
+        return failureVerified && original == 1 && portRead && bool(debugPort) == !expectedDetach && unsigned(peb[2]) == unsigned(!hidden && !expectedDetach) ? 7 : 12;
     }
     Identity("controller", GetCurrentProcess());
     wchar_t path[32768]{};
@@ -172,6 +321,8 @@ int wmain(int argc, wchar_t** argv)
         return 22;
     OwnedHandle completionOwner(completion);
     command += L" " + std::to_wstring(reinterpret_cast<std::uintptr_t>(completion)) + (detached ? L" detached" : L" attached");
+    if(failure != HandlerFailure::None)
+        command += std::wstring(L" ") + argv[4];
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     startup.dwFlags = STARTF_USESTDHANDLES;
@@ -190,8 +341,9 @@ int wmain(int argc, wchar_t** argv)
     void* remoteCode = nullptr;
     HANDLE remoteThread = nullptr;
     std::unique_ptr<OwnedHandle> threadOwner;
-    bool codeFreed = false;
-    std::uintptr_t ntdllBase = 0;
+    bool codeFreed = false, codeRetained = false;
+    const DWORD expectedThreadExit = failure == HandlerFailure::Registration ? NativeBreakInPayload::RegistrationFailed : failure == HandlerFailure::Removal ? NativeBreakInPayload::RemovalFailed : NativeBreakInPayload::Completed;
+    std::uintptr_t ntdllBase = 0, targetImageBase = 0;
     bool detachedNow = false;
     DWORD remoteId = 0;
     unsigned remoteCreated = 0, remoteExited = 0, remoteBroken = 0, matched = 0;
@@ -275,6 +427,7 @@ int wmain(int argc, wchar_t** argv)
         }
         else if(event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT)
         {
+            targetImageBase = reinterpret_cast<std::uintptr_t>(event.u.CreateProcessInfo.lpBaseOfImage);
             if(event.u.CreateProcessInfo.hFile)
                 CloseHandle(event.u.CreateProcessInfo.hFile);
         }
@@ -308,21 +461,25 @@ int wmain(int argc, wchar_t** argv)
             if(ResumeThread(remoteThread) != 1 || WaitForSingleObject(remoteThread, 3000) != WAIT_OBJECT_0)
                 break;
             DWORD threadExit = 0;
-            if(!GetExitCodeThread(remoteThread, &threadExit) || threadExit != 0)
+            if(!GetExitCodeThread(remoteThread, &threadExit) || threadExit != expectedThreadExit)
                 break;
             MEMORY_BASIC_INFORMATION memory{};
             const auto cleanupDeadline = GetTickCount64() + 3000;
             while(GetTickCount64() < cleanupDeadline)
             {
-                if(VirtualQueryEx(process.hProcess, remoteCode, &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_FREE)
+                if(VirtualQueryEx(process.hProcess, remoteCode, &memory, sizeof(memory)) == sizeof(memory))
                 {
-                    codeFreed = true;
-                    break;
+                    codeFreed = memory.State == MEM_FREE;
+                    codeRetained = failure == HandlerFailure::Removal && memory.State == MEM_COMMIT && memory.Protect == PAGE_EXECUTE_READ && memory.Type == MEM_PRIVATE;
+                    if(codeFreed || codeRetained)
+                        break;
                 }
                 Sleep(1);
             }
+            if(codeRetained)
+                codeRetained = VerifyFailureShutdown(process.hProcess, remoteCode, targetImageBase);
             std::printf("DETACHED thread=%lu exit=%lu freed=%u state=%08lx\n", remoteId, threadExit, unsigned(codeFreed), memory.State);
-            if(!codeFreed || !SetEvent(completion) || WaitForSingleObject(process.hProcess, 6000) != WAIT_OBJECT_0 || !GetExitCodeProcess(process.hProcess, &exitCode))
+            if((failure == HandlerFailure::Removal ? !codeRetained : !codeFreed) || !SetEvent(completion) || WaitForSingleObject(process.hProcess, 6000) != WAIT_OBJECT_0 || !GetExitCodeProcess(process.hProcess, &exitCode))
                 break;
             exited = true;
             break;
@@ -350,7 +507,9 @@ int wmain(int argc, wchar_t** argv)
             const auto missingRemoval = NativeBreakInPayload::Build(0x10000, 1, 0);
             if(!requestImage.bytes.empty() || !overflowImage.bytes.empty() || !missingRegistration.bytes.empty() || !missingRemoval.bytes.empty())
                 break;
-            const auto result = NativeBreakIn::Create(ntdllBase);
+            const auto providerBase = failure == HandlerFailure::None ? ntdllBase : targetImageBase;
+            std::printf("HANDLER_PROVIDER base=%p controlled=%u\n", reinterpret_cast<void*>(providerBase), unsigned(failure != HandlerFailure::None));
+            const auto result = NativeBreakIn::Create(providerBase);
             breakinResult = result.created;
             const auto duplicate = NativeBreakIn::Create(ntdllBase);
             std::printf("DUPLICATE rejected=%u error=%lu\n", unsigned(!duplicate.created), duplicate.error);
@@ -359,26 +518,33 @@ int wmain(int argc, wchar_t** argv)
             std::printf("STUB status=%08lx error=%lu created=%u\n", result.status, result.error, unsigned(result.created));
             std::printf("BREAKIN requested=%u result=%u error=%lu\n", unsigned(requested), unsigned(breakinResult), GetLastError());
         }
-        if(remoteExited && !codeFreed)
+        if(remoteExited && !codeFreed && !codeRetained)
         {
             MEMORY_BASIC_INFORMATION allocation{};
             DWORD threadExit = 0;
             const auto wait = WaitForSingleObject(remoteThread, 3000);
-            const auto terminal = wait == WAIT_OBJECT_0 && GetExitCodeThread(remoteThread, &threadExit) && threadExit == 0;
+            const auto terminal = wait == WAIT_OBJECT_0 && GetExitCodeThread(remoteThread, &threadExit) && threadExit == expectedThreadExit;
             const auto cleanupDeadline = GetTickCount64() + 3000;
             while(terminal && GetTickCount64() < cleanupDeadline)
             {
-                if(VirtualQueryEx(process.hProcess, remoteCode, &allocation, sizeof(allocation)) == sizeof(allocation) && allocation.State == MEM_FREE)
+                if(VirtualQueryEx(process.hProcess, remoteCode, &allocation, sizeof(allocation)) == sizeof(allocation))
                 {
-                    codeFreed = true;
-                    break;
+                    codeFreed = allocation.State == MEM_FREE;
+                    codeRetained = failure == HandlerFailure::Removal && allocation.State == MEM_COMMIT && allocation.Protect == PAGE_EXECUTE_READ && allocation.Type == MEM_PRIVATE;
+                    if(codeFreed || codeRetained)
+                        break;
                 }
                 Sleep(1);
             }
+            if(codeRetained)
+            {
+                NativeBreakIn::EndTarget();
+                codeRetained = VerifyFailureShutdown(process.hProcess, remoteCode, targetImageBase);
+            }
             std::printf("STUB_CLEANUP terminal=%u exit=%lu freed=%u state=%08lx\n", unsigned(terminal), threadExit, unsigned(codeFreed), allocation.State);
-            if(codeFreed)
+            if(codeFreed || codeRetained)
                 SetEvent(completion);
-            if(!codeFreed)
+            if(failure == HandlerFailure::Removal ? !codeRetained : !codeFreed)
                 break;
         }
         if(exited)
@@ -395,7 +561,9 @@ int wmain(int argc, wchar_t** argv)
 
     std::printf("REFERENCE hidden=%u strings=%u breakpoints=%u target_exit=%lu exited=%u terminal=%u\n", unsigned(hidden), strings, breakpoints, exitCode, unsigned(exited), unsigned(terminal));
     std::printf("REMOTE created=%u exited=%u broken=%u result=%u tid=%lu\n", remoteCreated, remoteExited, remoteBroken, unsigned(breakinResult), remoteId);
+    const auto allocationVerified = failure == HandlerFailure::Removal ? codeRetained : codeFreed;
+    const auto expectedBreaks = unsigned(failure != HandlerFailure::Registration);
     if(detached)
-        return exited && terminal && exitCode == 7 && codeFreed && breakinResult ? 0 : 20;
-    return exited && terminal && exitCode == 7 && matched == 1 && remoteCreated == 1 && remoteExited == 1 && remoteBroken == 1 && breakpoints == 2 + remoteBroken && breakinResult && codeFreed ? 0 : 16;
+        return exited && terminal && exitCode == 7 && allocationVerified && breakinResult ? 0 : 20;
+    return exited && terminal && exitCode == 7 && matched == expectedBreaks && remoteCreated == 1 && remoteExited == 1 && remoteBroken == expectedBreaks && breakpoints == 2 + remoteBroken && breakinResult && allocationVerified ? 0 : 16;
 }

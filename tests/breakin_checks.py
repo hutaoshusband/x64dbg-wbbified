@@ -16,7 +16,8 @@ def one_line(lines, prefix):
     return fields(selected[0])
 
 
-def check_breakin_receipt(receipt, architecture, mode, detached):
+def check_breakin_receipt(receipt, architecture, mode, detached, failure=None):
+    assert failure in (None, "register", "remove")
     assert receipt["exitCode"] == 0 and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"], "Native controller did not complete normally"
     lines = receipt["stdout"].splitlines()
     identities = [fields(line) for line in lines if line.startswith("IDENTITY ")]
@@ -28,7 +29,11 @@ def check_breakin_receipt(receipt, architecture, mode, detached):
     assert identities["target"]["pid"] != identities["controller"]["pid"] and int(identities["target"]["creation"]) >= int(identities["controller"]["creation"])
     reference = one_line(lines, "REFERENCE ")
     strings = 0 if mode == "both" or architecture == "x64" and mode == "hide" else 1
-    assert reference == {"hidden": str(int(mode != "show")), "strings": str(strings), "breakpoints": "2" if detached else "3", "target_exit": "7", "exited": "1", "terminal": "1"}
+    breaks = int(failure != "register" and not detached)
+    thread_exit = "2" if failure == "register" else "1" if failure == "remove" else "0"
+    freed = failure != "remove"
+    allocation_state = "00010000" if freed else "00001000"
+    assert reference == {"hidden": str(int(mode != "show")), "strings": str(strings), "breakpoints": str(2 + breaks), "target_exit": "7", "exited": "1", "terminal": "1"}
     final = one_line(lines, "TARGET final_peb=")
     assert final == {"final_peb": str(int(mode == "show" and not detached)), "final_port": str(int(not detached)), "detached": str(int(detached)), "port_read": "1"}
     assert one_line(lines, "READONLY ") == {"rejected": "1", "error": "5"}
@@ -37,31 +42,67 @@ def check_breakin_receipt(receipt, architecture, mode, detached):
     assert one_line(lines, "STUB ") == {"status": "00000000", "error": "0", "created": "1"}
     remote = one_line(lines, "REMOTE ")
     assert remote["created"] == remote["result"] == "1" and int(remote["tid"]) > 0
-    assert remote["exited"] == remote["broken"] == str(int(not detached))
+    assert remote["exited"] == str(int(not detached)) and remote["broken"] == str(breaks)
     if detached:
         cleanup = one_line(lines, "DETACHED ")
-        assert cleanup == {"thread": remote["tid"], "exit": "0", "freed": "1", "state": "00010000"}
+        assert cleanup == {"thread": remote["tid"], "exit": thread_exit, "freed": str(int(freed)), "state": allocation_state}
         assert not any(line.startswith("MATCH ") for line in lines)
     else:
-        assert one_line(lines, "MATCH ") == {"actual": "1", "wrongAddress": "0", "wrongChance": "0", "wrongCode": "0", "wrongProcess": "0", "wrongThread": "0", "repeated": "0"}
-        assert one_line(lines, "STUB_CLEANUP ") == {"terminal": "1", "exit": "0", "freed": "1", "state": "00010000"}
+        if failure == "register":
+            assert not any(line.startswith("MATCH ") for line in lines)
+        else:
+            assert one_line(lines, "MATCH ") == {"actual": "1", "wrongAddress": "0", "wrongChance": "0", "wrongCode": "0", "wrongProcess": "0", "wrongThread": "0", "repeated": "0"}
+        assert one_line(lines, "STUB_CLEANUP ") == {"terminal": "1", "exit": thread_exit, "freed": str(int(freed)), "state": allocation_state}
+    provider = one_line(lines, "HANDLER_PROVIDER ")
+    assert provider["controlled"] == str(int(failure is not None)) and int(provider["base"], 16) > 0
+    if failure is not None:
+        handler = one_line(lines, "HANDLER ")
+        created = one_line(lines, "CREATE_THREAD ")
+        assert handler["code"] == created["start"] and created["thread"] == remote["tid"] and created["pid"] == identities["target"]["pid"]
+        assert set(handler) == {"registrationCalls", "removalCalls", "nativeRegistration", "removalMatches", "active", "lateRemoved", "code", "queried", "state", "protection"}
+        assert {key: value for key, value in handler.items() if key != "protection"} == {"registrationCalls": "1", "removalCalls": str(int(failure == "remove")), "nativeRegistration": str(int(failure == "remove")),
+                           "removalMatches": str(int(failure == "remove")), "active": str(int(failure == "remove")), "lateRemoved": str(int(failure == "remove")),
+                           "code": created["start"], "queried": "1", "state": allocation_state}
+        if not freed:
+            assert handler["protection"] == "00000020"
+        if failure == "remove":
+            retention = []
+            for phase in ("retired", "shutdown"):
+                observation = one_line(lines, f"RETENTION phase={phase} ")
+                assert 0 < int(observation["samples"]) and 250 <= int(observation["elapsed"]) < 10000
+                assert {key: observation[key] for key in ("phase", "alive", "code", "executable", "data", "unchanged")} == {
+                    "phase": phase, "alive": "1", "code": created["start"], "executable": "00000020", "data": "00000004", "unchanged": "1"}
+                retention.append(observation)
+            assert len([line for line in lines if line.startswith("RETENTION ")]) == 2
+            shutdown = one_line(lines, "SHUTDOWN ")
+            assert int(shutdown["before"]) >= int(shutdown["after"]) + 2
+            assert {key: shutdown[key] for key in ("createRejected", "error", "beginRejected")} == {"createRejected": "1", "error": "170", "beginRejected": "1"}
+        else:
+            assert not any(line.startswith("RETENTION ") for line in lines)
+    else:
+        assert not any(line.startswith(("HANDLER ", "RETENTION ")) for line in lines)
     if architecture == "x32":
         native = one_line(lines, "NATIVE_PEB ")
         assert native["original"] == "1" and native["observed"] == str(int(mode != "both")) and int(native["address"], 16) > 0
-    return {"identities": identities, "reference": reference, "final": final, "remote": remote, "cleanup": cleanup if detached else one_line(lines, "STUB_CLEANUP ")}
+    return {"identities": identities, "reference": reference, "final": final, "remote": remote, "cleanup": cleanup if detached else one_line(lines, "STUB_CLEANUP "),
+            "failure": failure, "handler": handler if failure else None, "retention": retention if failure == "remove" else None, "provider": provider}
 
 
 def run_breakin_oracles(environment, results, fixture_identity, run_owned):
     binary, identity, machine = fixture_identity(environment, "native_breakin")
     observations = []
-    for mode in ("show", "hide", "both"):
-        for detached in (False, True):
-            receipt = run_owned([str(binary), mode, "controller", "detach" if detached else "stub"], os.environ, 35)
-            path = environment.root / f"breakin-{mode}-{'detach' if detached else 'attached'}.json"
-            write_json(path, receipt)
-            observed = check_breakin_receipt(receipt, environment.architecture, mode, detached)
-            assert file_identity(binary) == identity, "Native break-in fixture changed"
-            observations.append({"mode": mode, "detached": detached, "receipt": file_identity(path), "observed": observed})
+    for failure in (None, "register", "remove"):
+        for mode in ("show", "hide", "both"):
+            for detached in (False, True):
+                command = [str(binary), mode, "controller", "detach" if detached else "stub"]
+                if failure:
+                    command.append(failure)
+                receipt = run_owned(command, os.environ, 35)
+                path = environment.root / f"breakin-{mode}-{'detach' if detached else 'attached'}-{failure or 'normal'}.json"
+                write_json(path, receipt)
+                observed = check_breakin_receipt(receipt, environment.architecture, mode, detached, failure)
+                assert file_identity(binary) == identity, "Native break-in fixture changed"
+                observations.append({"mode": mode, "detached": detached, "failure": failure, "receipt": file_identity(path), "observed": observed})
     results.append({"name": "test_native_breakin_oracles", "status": "verified", "oracle": {
         "binary": identity, "machine": machine, "observations": observations, "debuggerUsed": "owned Windows native controller"}})
-    print(f"[VERIFIED] Native {environment.architecture} hidden/unhidden break-in, identity rejection, detach, thread exit and page release", flush=True)
+    print(f"[VERIFIED] Native {environment.architecture} hidden/unhidden break-in, identity rejection, detach, thread exit, page release and failed-handler retention", flush=True)

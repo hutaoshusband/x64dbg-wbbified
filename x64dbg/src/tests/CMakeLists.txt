@@ -235,3 +235,9 @@ add_dependencies(test_random_dll_target test_random_dll_library)
 
 x64dbg_add_test(NAME native_breakin TARGET_COMPILE_DEFINITIONS WINVER=0x0601 _WIN32_WINNT=0x0601)
 target_sources(test_native_breakin_target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../dbg/native_breakin.cpp")
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    target_link_options(test_native_breakin_target PRIVATE "LINKER:/EXPORT:RtlAddFunctionTable=TestRegisterFunctionTable" "LINKER:/EXPORT:RtlDeleteFunctionTable=TestRemoveFunctionTable")
+else()
+    target_link_options(test_native_breakin_target PRIVATE "LINKER:/EXPORT:RtlAddVectoredExceptionHandler=_TestRegisterHandler@8" "LINKER:/EXPORT:RtlRemoveVectoredExceptionHandler=_TestRemoveHandler@4")
+endif()
