@@ -299,6 +299,9 @@ link-libraries = ["mcp_json", "advapi32", "bcrypt"]
 compile-features = ["cxx_std_17"]
 compile-definitions = ["WIN32_LEAN_AND_MEAN", "NOMINMAX", "_WIN32_WINNT=0x0601"]
 
+[target.mcp_common.properties]
+UNITY_BUILD = false
+
 [target.mcp_broker]
 type = "executable"
 condition = "mcp"

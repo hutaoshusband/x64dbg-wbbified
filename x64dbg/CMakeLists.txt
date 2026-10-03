@@ -1261,6 +1261,11 @@ if(X64DBG_BUILD_MCP) # mcp
 		bcrypt
 	)
 
+	set_target_properties(mcp_common PROPERTIES
+		UNITY_BUILD
+			OFF
+	)
+
 endif()
 # Target: mcp_broker
 if(X64DBG_BUILD_MCP) # mcp

@@ -314,6 +314,7 @@ def parse_arguments():
     parser.add_argument("--engine", choices=("TitanEngine", "GleeBug", "StaticEngine", "all"), default="TitanEngine")
     parser.add_argument("--cmake", type=Path, help="CMake executable for the mcp-contracts source build")
     parser.add_argument("--msvc-toolset", help="Exact installed MSVC toolset version for the mcp-contracts source build")
+    parser.add_argument("--unity-build", action="store_true", help="Enable global CMake unity compilation for the mcp-contracts source build")
     arguments = parser.parse_args()
     if not 1 <= arguments.timeout <= 60:
         parser.error("--timeout must be between 1 and 60 seconds")
@@ -336,6 +337,8 @@ def parse_arguments():
             parser.error("--msvc-toolset requires --phase mcp-contracts")
         if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", arguments.msvc_toolset):
             parser.error("--msvc-toolset must be an exact numeric version")
+    if arguments.unity_build and arguments.phase != "mcp-contracts":
+        parser.error("--unity-build requires --phase mcp-contracts")
     return arguments
 
 
@@ -474,7 +477,7 @@ def main():
         catalogs = []
         for architecture in architectures:
             try:
-                binary = build_contract_fixture(run_root, architecture, arguments.cmake, arguments.msvc_toolset)
+                binary = build_contract_fixture(run_root, architecture, arguments.cmake, arguments.msvc_toolset, arguments.unity_build)
                 checks, catalog = run_contract_checks(binary, run_root / architecture, architecture, arguments.case, arguments.timeout)
                 results.extend(checks)
                 catalogs.append(catalog)

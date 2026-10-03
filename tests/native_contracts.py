@@ -53,7 +53,7 @@ JOB_EVENT_ARTIFACT_TOOLS = ("jobs_list", "job_get", "job_wait", "job_cancel", "o
 JOB_NATIVE_EFFECT_TOOLS = ("job_cancel",)
 
 
-def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None):
+def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None, unity_build=False):
     build = Path(output) / f"build-{architecture}"
     build.mkdir()
     source = ROOT / "x64dbg"
@@ -69,7 +69,7 @@ def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None):
                              creationflags=subprocess.CREATE_NO_WINDOW)
     toolchain = {"cmake": file_identity(cmake_path), "compiler": file_identity(compiler_path),
                  "cmakeVersion": version.stdout.strip(), "versionExitCode": version.returncode, "versionStderr": version.stderr,
-                 "requestedMsvcToolset": msvc_toolset,
+                 "requestedMsvcToolset": msvc_toolset, "requestedUnityBuild": unity_build,
                  "msvcToolset": next((value.rstrip("\\/") for key, value in environment.items() if key.lower() == "vctoolsversion"), None)}
     write_json(build / "toolchain.json", toolchain)
     if version.returncode or not version.stdout.startswith("cmake version "):
@@ -77,6 +77,7 @@ def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None):
     qt = source / ("build64" if architecture == "x64" else "build32") / "_deps/qt5-src/lib/cmake/Qt5"
     configure = [str(cmake_path), "-S", str(source), "-B", str(build), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
                  "-DX64DBG_BUILD_IN_TREE=OFF", "-DX64DBG_BUILD_MCP=ON", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "-DCMKR_SKIP_GENERATION=ON",
+                 "-DCMAKE_UNITY_BUILD=" + ("ON" if unity_build else "OFF"),
                  f"-DCMAKE_C_COMPILER={compiler_path.as_posix()}", f"-DCMAKE_CXX_COMPILER={compiler_path.as_posix()}"]
     if qt.is_dir():
         configure.append(f"-DQt5_DIR={qt}")
