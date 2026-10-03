@@ -345,6 +345,12 @@ def parse_arguments():
 def run_owned_native_command(command, environment, timeout, required_modules=()):
     timed_out = False
     process = None
+    identity = None
+    startup_thread = None
+    startup_observation = {}
+    assigned = False
+    failure = None
+    stdout = ""
     modules = []
     deadline = time.monotonic() + timeout
     expected_modules = {str(Path(path).resolve()).lower() for path in required_modules}
@@ -355,7 +361,8 @@ def run_owned_native_command(command, environment, timeout, required_modules=())
                                        creationflags=subprocess.CREATE_NO_WINDOW | CREATE_SUSPENDED)
             identity = process_identity(process)
             ownership.assign(process)
-            startup_thread = resume_suspended_process(process)
+            assigned = True
+            startup_thread = resume_suspended_process(process, startup_observation)
             try:
                 while expected_modules and not modules and process.poll() is None:
                     if time.monotonic() >= deadline:
@@ -375,13 +382,28 @@ def run_owned_native_command(command, environment, timeout, required_modules=())
                 process.kill()
                 stdout, _ = process.communicate()
                 stdout += "\n[NATIVE RUNNER TIMEOUT]\n"
+        except Exception as error:
+            failure = error
         finally:
-            if process is not None and process.poll() is None:
+            if failure is not None:
+                ownership.close()
+                if process is not None:
+                    if process.poll() is None:
+                        process.kill()
+                    stdout, _ = process.communicate()
+            elif process is not None and process.poll() is None:
                 ownership.close()
                 process.kill()
-                process.communicate()
-    receipt = {"command": command, "processIdentity": identity, "startupThread": startup_thread, "exitCode": process.returncode,
-               "stdout": stdout, "timedOut": timed_out, "terminalObserved": process.poll() is not None, "jobClosed": True}
+                stdout, _ = process.communicate()
+    receipt = {"command": command, "processIdentity": identity, "startupThread": startup_thread,
+               "startupObservation": startup_observation, "jobAssigned": assigned,
+               "exitCode": process.returncode if process is not None else None,
+               "stdout": stdout, "timedOut": timed_out,
+               "terminalObserved": process is not None and process.poll() is not None, "jobClosed": True}
+    if failure is not None:
+        receipt["error"] = str(failure)
+        failure.runnerReceipt = receipt
+        raise failure
     if expected_modules:
         receipt["loadedModules"] = modules
     return receipt
@@ -402,18 +424,30 @@ def run_native_suite(arguments, run_root):
                        "--arch", architecture, "--engine", engine, "--timeout", str(int(arguments.timeout)),
                        "--artifacts-dir", str(run_root / architecture / engine)]
             command.extend(arguments.case)
-            discovery = run_owned_native_command([*command, "--list"], environment, min(arguments.timeout, 30))
-            if discovery["exitCode"] or discovery["timedOut"]:
-                result = {**discovery, "stage": "discovery"}
-            else:
-                selected_cases = discovery["stdout"].splitlines()
-                result = run_owned_native_command(command, environment, arguments.timeout * len(selected_cases) + 30)
-                result.update({"stage": "execution", "selectedCases": selected_cases, "discovery": discovery})
+            stage = "discovery"
+            discovery = None
+            try:
+                discovery = run_owned_native_command([*command, "--list"], environment, min(arguments.timeout, 30))
+                if discovery["exitCode"] or discovery["timedOut"]:
+                    result = {**discovery, "stage": stage}
+                else:
+                    selected_cases = discovery["stdout"].splitlines()
+                    stage = "execution"
+                    result = run_owned_native_command(command, environment, arguments.timeout * len(selected_cases) + 30)
+                    result.update({"stage": stage, "selectedCases": selected_cases, "discovery": discovery})
+            except Exception as error:
+                if not hasattr(error, "runnerReceipt"):
+                    raise
+                result = {**error.runnerReceipt, "stage": stage}
+                if discovery is not None:
+                    result.update(discovery=discovery, selectedCases=selected_cases)
             print(result["stdout"], flush=True)
+            if result.get("error"):
+                print(f"[FAILED] {architecture} {engine} {stage}: {result['error']}", flush=True)
             results.append({"architecture": architecture, "engine": engine, **result})
             write_json(run_root / "native-summary.json", results)
     write_json(run_root / "native-summary.json", results)
-    return int(any(result["exitCode"] or result["timedOut"] for result in results))
+    return int(any(result.get("error") or result["exitCode"] or result["timedOut"] for result in results))
 
 
 def main():
@@ -462,7 +496,7 @@ def main():
     print(f"Private evidence: {run_root}", flush=True)
     if arguments.phase == "runner":
         from runner_checks import run_runner_checks
-        results = run_runner_checks(run_owned_native_command, run_root)
+        results = run_runner_checks(run_owned_native_command, run_root, run_native_suite)
         write_json(run_root / "summary.json", {"phase": arguments.phase, "results": results})
         return int(any(result["status"] != "verified" for result in results))
     if arguments.phase == "native":

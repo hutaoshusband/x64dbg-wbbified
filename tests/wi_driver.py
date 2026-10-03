@@ -85,7 +85,9 @@ KERNEL.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
 KERNEL.Thread32Next.restype = wintypes.BOOL
 
 
-def resume_suspended_process(process):
+def resume_suspended_process(process, observation=None):
+    observation = {} if observation is None else observation
+    observation.update(processIdentity=process_identity(process), stage="thread-snapshot")
     snapshot = KERNEL.CreateToolhelp32Snapshot(THREAD_SNAPSHOT, 0)
     if snapshot == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
@@ -103,22 +105,29 @@ def resume_suspended_process(process):
             raise ctypes.WinError(ctypes.get_last_error())
     finally:
         KERNEL.CloseHandle(snapshot)
+    observation.update(threadIds=thread_ids, stage="open-thread")
     if len(thread_ids) != 1:
-        raise McpError("Suspended runner does not have exactly one startup thread")
+        raise McpError(f"Suspended runner does not have exactly one startup thread: {thread_ids}")
+    observation["threadId"] = thread_ids[0]
     thread = KERNEL.OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, False, thread_ids[0])
     if not thread:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
+        observation["stage"] = "thread-owner"
         owner = KERNEL.GetProcessIdOfThread(thread)
+        observation["ownerPid"] = owner
         if not owner:
             raise ctypes.WinError(ctypes.get_last_error())
         if owner != process.pid:
             raise McpError("Suspended runner thread belongs to a different process")
+        observation["stage"] = "resume-thread"
         count = KERNEL.ResumeThread(thread)
+        observation["previousSuspendCount"] = count
         if count == 0xffffffff:
             raise ctypes.WinError(ctypes.get_last_error())
         if count != 1:
-            raise McpError("Runner startup thread was not suspended exactly once")
+            raise McpError(f"Runner startup thread was not suspended exactly once: observed {count}")
+        observation["stage"] = "complete"
     finally:
         KERNEL.CloseHandle(thread)
     return thread_ids[0]
