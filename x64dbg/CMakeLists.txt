@@ -1235,6 +1235,7 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/pe_file_patch.h"
 		"src/mcp/common/platform.cpp"
 		"src/mcp/common/platform.h"
+		"src/mcp/common/process_peer.h"
 		"src/mcp/common/provider_ui_tools.cpp"
 		"src/mcp/common/provider_ui_types.cpp"
 		"src/mcp/common/provider_ui_types.h"

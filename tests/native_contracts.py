@@ -22,7 +22,7 @@ CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_
               "test_new_file_publication", "test_native_library_fault_oracles", "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
-              "test_provider_ui_contracts", "test_library_script_contracts", "test_job_event_artifact_contracts", "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
+              "test_provider_ui_contracts", "test_library_script_contracts", "test_job_event_artifact_contracts", "test_native_launch_arguments", "test_native_peer_identity", "test_native_component_builds", "test_ipc_wire_codec")
 
 EXECUTION_TOOLS = ("execution_resume", "execution_pause", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to",
                    "execution_skip_instruction", "execution_wait", "threads_list", "threads_select", "threads_suspend", "threads_resume", "threads_context",
@@ -1823,6 +1823,78 @@ def parent_token_oracle():
     return process_token_oracle()
 
 
+def check_native_peer_identity(probe, architecture):
+    import os
+    KERNEL.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(StartupInfoEx), ctypes.POINTER(ProcessInformation)]
+    KERNEL.CreateProcessW.restype = wintypes.BOOL
+    KERNEL.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    KERNEL.IsWow64Process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+    KERNEL.ResumeThread.argtypes = [wintypes.HANDLE]
+    KERNEL.ResumeThread.restype = wintypes.DWORD
+    KERNEL.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    KERNEL.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    records = []
+    for target_architecture, directory in (("x64", "System32"), ("x32", "SysWOW64")):
+        binary = Path(os.environ["SystemRoot"]) / directory / "cmd.exe"
+        image = file_identity(binary)
+        image_bytes = binary.read_bytes()
+        pe_offset = struct.unpack_from("<I", image_bytes, 0x3c)[0]
+        assert struct.unpack_from("<H", image_bytes, pe_offset + 4)[0] == (0x8664 if target_architecture == "x64" else 0x14c)
+        actual_file = file_handle_oracle(binary)
+        startup = StartupInfoEx()
+        startup.startup.cb = ctypes.sizeof(startup.startup)
+        information = ProcessInformation()
+        command = ctypes.create_unicode_buffer(subprocess.list2cmdline([str(binary), "/d", "/c", "exit 23"]))
+        job = OwnedJob()
+        try:
+            if not KERNEL.CreateProcessW(str(binary), command, None, None, False, subprocess.CREATE_NO_WINDOW | 4, None, None, ctypes.byref(startup), ctypes.byref(information)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            process = SimpleNamespace(pid=information.pid, _handle=information.process)
+            job.assign(process)
+            identity = process_identity(process)
+            token, token_queries = process_token_oracle(information.process)
+            path = ctypes.create_unicode_buffer(32768)
+            length = wintypes.DWORD(len(path))
+            if not KERNEL.QueryFullProcessImageNameW(information.process, 0, path, ctypes.byref(length)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            wow64 = wintypes.BOOL()
+            if not KERNEL.IsWow64Process(information.process, ctypes.byref(wow64)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            assert bool(wow64.value) == (target_architecture == "x32")
+            expected = {**identity, **token, "architecture": target_architecture,
+                        "image": {"path": path.value, "sha256": image["sha256"], **actual_file}}
+            request = {"pid": information.pid, "handle": "process"}
+            observed = probe.call("process-peer", request)
+            assert observed == {"valid": True, "identity": expected}, (expected, observed)
+            refusals = []
+            for kind in ("query", "synchronize", "null", "event"):
+                response = probe.call("process-peer", {**request, "handle": kind})
+                assert not response["valid"] and response["error"]["code"] == "process_identity_unavailable", response
+                assert KERNEL.WaitForSingleObject(information.process, 0) == 258
+                refusals.append({"handle": kind, "response": response})
+            assert KERNEL.ResumeThread(information.thread) == 1
+            assert KERNEL.WaitForSingleObject(information.process, 10000) == 0
+            exit_code = wintypes.DWORD()
+            if not KERNEL.GetExitCodeProcess(information.process, ctypes.byref(exit_code)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            assert exit_code.value == 23
+            terminal = probe.call("process-peer", request)
+            assert not terminal["valid"] and terminal["error"]["code"] == "process_identity_unavailable", terminal
+            assert file_identity(binary) == image
+            records.append({"observerArchitecture": architecture, "processIdentity": identity, "targetArchitecture": target_architecture,
+                            "image": image, "expectedIdentity": expected, "observed": observed, "tokenQueries": token_queries,
+                            "refusals": refusals, "exitCode": exit_code.value, "terminalRefusal": terminal})
+        finally:
+            job.close()
+            if information.process:
+                KERNEL.WaitForSingleObject(information.process, 5000)
+                KERNEL.CloseHandle(information.process)
+            if information.thread:
+                KERNEL.CloseHandle(information.thread)
+    assert records[0]["image"]["sha256"] != records[1]["image"]["sha256"]
+    return {"nativePeers": records, "crossArchitectureObserved": True, "normalExitOutcomes": len(records)}
+
+
 def file_handle_oracle(binary):
     KERNEL.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
     KERNEL.CreateFileW.restype = wintypes.HANDLE
@@ -2156,6 +2228,8 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_job_event_artifact_contracts(probe, registry, tool_validators))
             elif name == "test_native_launch_arguments":
                 result.update(check_native_launch(probe, architecture))
+            elif name == "test_native_peer_identity":
+                result.update(check_native_peer_identity(probe, architecture))
             elif name == "test_native_component_builds":
                 result.update(check_native_components(probe, architecture, validators, catalog))
             elif name == "test_ipc_wire_codec":

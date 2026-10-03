@@ -1,8 +1,10 @@
 #include "platform.h"
+#include "process_peer.h"
 #include "lifecycle.h"
 #include <Windows.h>
 #include <bcrypt.h>
 #include <sddl.h>
+#include <winternl.h>
 #include <algorithm>
 #include <array>
 #include <memory>
@@ -133,23 +135,63 @@ private:
     std::vector<unsigned char> object_;
 };
 
-NativeImageIdentity current_image()
+Architecture process_architecture(HANDLE process)
+{
+    using QueryMachines = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
+    const auto query = reinterpret_cast<QueryMachines>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2"));
+    if(query)
+    {
+        USHORT process_machine = 0, native_machine = 0;
+        require_win32(query(process, &process_machine, &native_machine), "IsWow64Process2");
+        const auto machine = process_machine == IMAGE_FILE_MACHINE_UNKNOWN ? native_machine : process_machine;
+        if(machine == IMAGE_FILE_MACHINE_I386) return Architecture::X32;
+        if(machine == IMAGE_FILE_MACHINE_AMD64) return Architecture::X64;
+        throw NativeFailure("Process machine is unsupported");
+    }
+    BOOL wow64 = FALSE;
+    require_win32(IsWow64Process(process, &wow64), "IsWow64Process");
+    SYSTEM_INFO system{};
+    GetNativeSystemInfo(&system);
+    if(system.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL) return Architecture::X32;
+    if(system.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) return wow64 ? Architecture::X32 : Architecture::X64;
+    throw NativeFailure("Native process architecture is unsupported");
+}
+
+std::wstring process_image_path(HANDLE process, DWORD flags)
 {
     std::vector<wchar_t> path(32768);
     DWORD length = static_cast<DWORD>(path.size());
-    require_win32(QueryFullProcessImageNameW(GetCurrentProcess(), 0, path.data(), &length), "QueryFullProcessImageNameW");
+    require_win32(QueryFullProcessImageNameW(process, flags, path.data(), &length), "QueryFullProcessImageNameW");
     if(!length || length >= path.size())
-        throw NativeFailure("Current executable path exceeds its bound");
-    const Handle file(CreateFileW(path.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
-    require_win32(file.get() != INVALID_HANDLE_VALUE, "CreateFileW");
+        throw NativeFailure("Process executable path exceeds its bound");
+    return std::wstring(path.data(), length);
+}
+
+NativeImageIdentity process_image(HANDLE process)
+{
+    const auto path = process_image_path(process, 0);
+    auto native_path = process_image_path(process, PROCESS_NAME_NATIVE);
+    if(native_path.size() > 32766 || native_path.front() != L'\\')
+        throw NativeFailure("Native process executable path is invalid");
+    UNICODE_STRING name{static_cast<USHORT>(native_path.size() * sizeof(wchar_t)), static_cast<USHORT>((native_path.size() + 1) * sizeof(wchar_t)), native_path.data()};
+    OBJECT_ATTRIBUTES attributes{sizeof(OBJECT_ATTRIBUTES), nullptr, &name, OBJ_CASE_INSENSITIVE, nullptr, nullptr};
+    IO_STATUS_BLOCK io{};
+    const auto open = reinterpret_cast<decltype(&NtOpenFile)>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtOpenFile"));
+    if(!open) throw NativeFailure("Native executable file opening is unavailable");
+    HANDLE raw_file = nullptr;
+    const auto status = open(&raw_file, FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attributes, &io, FILE_SHARE_READ,
+                             FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+    const Handle file(raw_file);
+    require_status(status, "NtOpenFile");
+    if(!file.get() || file.get() == INVALID_HANDLE_VALUE) throw NativeFailure("Native executable file handle is invalid");
     BY_HANDLE_FILE_INFORMATION before{};
     require_win32(GetFileInformationByHandle(file.get(), &before), "GetFileInformationByHandle");
     if(before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-        throw NativeFailure("Current executable resolves to a directory");
+        throw NativeFailure("Process executable resolves to a directory");
     const auto size = (static_cast<std::uint64_t>(before.nFileSizeHigh) << 32) | before.nFileSizeLow;
     constexpr std::uint64_t maximum_image_size = 512ull * 1024 * 1024;
     if(!size || size > maximum_image_size)
-        throw NativeFailure("Current executable exceeds the identity hash bound");
+        throw NativeFailure("Process executable exceeds the identity hash bound");
     std::array<unsigned char, 65536> block{};
     std::uint64_t observed = 0;
     Sha256 digest;
@@ -160,7 +202,7 @@ NativeImageIdentity current_image()
         if(!read)
             break;
         if(read > size - observed)
-            throw NativeFailure("Current executable changed size during hashing");
+            throw NativeFailure("Process executable changed size during hashing");
         observed += read;
         digest.add(block.data(), read);
     }
@@ -169,8 +211,10 @@ NativeImageIdentity current_image()
     if(observed != size || after.nFileSizeHigh != before.nFileSizeHigh || after.nFileSizeLow != before.nFileSizeLow ||
        after.dwVolumeSerialNumber != before.dwVolumeSerialNumber || after.nFileIndexHigh != before.nFileIndexHigh || after.nFileIndexLow != before.nFileIndexLow ||
        file_time(after.ftLastWriteTime) != file_time(before.ftLastWriteTime))
-        throw NativeFailure("Current executable identity changed during hashing");
-    return {utf8(std::wstring_view(path.data(), length)), digest.finish(), size, before.dwVolumeSerialNumber,
+        throw NativeFailure("Process executable identity changed during hashing");
+    if(path != process_image_path(process, 0) || native_path != process_image_path(process, PROCESS_NAME_NATIVE))
+        throw NativeFailure("Process executable path changed during capture");
+    return {utf8(path), digest.finish(), size, before.dwVolumeSerialNumber,
         (static_cast<std::uint64_t>(before.nFileIndexHigh) << 32) | before.nFileIndexLow};
 }
 }
@@ -218,14 +262,18 @@ Checked<std::string> sha256_file_bytes(std::string_view bytes)
     }
 }
 
-Checked<NativeProcessIdentity> capture_current_process()
+Checked<NativeProcessIdentity> capture_held_process(HANDLE process)
 {
     try
     {
+        const auto pid = GetProcessId(process);
+        require_win32(pid != 0, "GetProcessId");
+        if(WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
+            throw NativeFailure("Process is terminal or its handle cannot establish liveness");
         FILETIME created{}, exited{}, kernel{}, user{};
-        require_win32(GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user), "GetProcessTimes");
+        require_win32(GetProcessTimes(process, &created, &exited, &kernel, &user), "GetProcessTimes");
         HANDLE raw_token = nullptr;
-        require_win32(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token), "OpenProcessToken");
+        require_win32(OpenProcessToken(process, TOKEN_QUERY, &raw_token), "OpenProcessToken");
         const Handle token(raw_token);
         const auto user_data = token_information(token.get(), TokenUser);
         if(user_data.size() < sizeof(TOKEN_USER))
@@ -262,14 +310,24 @@ Checked<NativeProcessIdentity> capture_current_process()
         const auto elevation_data = token_information(token.get(), TokenElevation);
         if(session_data.size() != sizeof(DWORD) || elevation_data.size() != sizeof(TOKEN_ELEVATION) || user_data.size() < sizeof(TOKEN_USER) || integrity_data.size() < sizeof(TOKEN_MANDATORY_LABEL))
             throw NativeFailure("Process token data size is invalid");
-        return NativeProcessIdentity{GetCurrentProcessId(), file_time(created), *reinterpret_cast<const DWORD*>(session_data.data()), user_sid, logon_sid, integrity,
+        NativeProcessIdentity identity{pid, file_time(created), *reinterpret_cast<const DWORD*>(session_data.data()), user_sid, logon_sid, integrity,
             reinterpret_cast<const TOKEN_ELEVATION*>(elevation_data.data())->TokenIsElevated != 0,
-            sizeof(void*) == 8 ? Architecture::X64 : Architecture::X32, current_image()};
+            process_architecture(process), process_image(process)};
+        FILETIME checked_created{};
+        require_win32(GetProcessTimes(process, &checked_created, &exited, &kernel, &user), "GetProcessTimes");
+        if(GetProcessId(process) != pid || file_time(checked_created) != identity.creationTime || WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
+            throw NativeFailure("Process generation retired during identity capture");
+        return identity;
     }
     catch(const NativeFailure& error)
     {
         return ContractError{"process_identity_unavailable", "", error.what()};
     }
+}
+
+Checked<NativeProcessIdentity> capture_current_process()
+{
+    return capture_held_process(GetCurrentProcess());
 }
 
 Json native_process_json(const NativeProcessIdentity& identity)

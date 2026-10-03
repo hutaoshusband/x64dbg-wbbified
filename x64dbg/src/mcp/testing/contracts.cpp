@@ -3,6 +3,7 @@
 #include "legacy_aliases.h"
 #include "parity_catalog.h"
 #include "platform.h"
+#include "process_peer.h"
 #include "pe_file_patch.h"
 #include "new_file_publish.h"
 #include "lifecycle.h"
@@ -49,6 +50,23 @@ Json checked_reply(const Checked<Value>& value)
     if(const auto error = std::get_if<ContractError>(&value))
         return {{"valid", false}, {"error", error_json(*error)}};
     return {{"valid", true}};
+}
+
+Json process_peer_probe(const Json& input)
+{
+    const auto schema = closed_object_schema({{"pid", bounded_integer_schema(1, 0xffffffffull)},
+        {"handle", enum_schema({"process", "query", "synchronize", "null", "event"})}}, {"pid", "handle"});
+    if(const auto error = validate_schema(schema, input))
+        return {{"valid", false}, {"error", error_json(*error)}};
+    const auto kind = input.at("handle").get<std::string>();
+    const auto rights = kind == "query" ? PROCESS_QUERY_LIMITED_INFORMATION : kind == "synchronize" ? SYNCHRONIZE : PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+    const auto close = [](void* value) { if(value) CloseHandle(value); };
+    const std::unique_ptr<void, decltype(close)> process(kind == "null" ? nullptr : kind == "event" ? CreateEventW(nullptr, TRUE, FALSE, nullptr) :
+        OpenProcess(rights, FALSE, input.at("pid").get<DWORD>()), close);
+    const auto identity = capture_held_process(process.get());
+    auto reply = checked_reply(identity);
+    if(const auto* value = std::get_if<NativeProcessIdentity>(&identity)) reply["identity"] = native_process_json(*value);
+    return reply;
 }
 
 Json dependency_probe()
@@ -494,7 +512,9 @@ int main(int argc, char** argv)
                 else
                 {
                     const auto& input = std::get<Json>(parsed);
-                    if(mode == "pe-plan" && argc == 2)
+                    if(mode == "process-peer" && argc == 2)
+                        reply = process_peer_probe(input);
+                    else if(mode == "pe-plan" && argc == 2)
                         reply = pe_plan_probe(input);
                     else if(mode == "publish-new" && argc == 2)
                         reply = publication_probe(input);
