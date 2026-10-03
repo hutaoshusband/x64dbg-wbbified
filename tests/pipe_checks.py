@@ -63,14 +63,14 @@ def collect_pipe_process(process):
     return json.loads(output)
 
 
-def independent_pipe_dacl(handle):
+def independent_pipe_dacl(handle, object_type=6, include_owner=False):
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
     advapi.GetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
     advapi.GetSecurityDescriptorControl.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)]
     advapi.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
     advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    acl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
-    error = advapi.GetSecurityInfo(handle, 6, 4, None, None, ctypes.byref(acl), None, ctypes.byref(descriptor))
+    acl, descriptor, owner = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    error = advapi.GetSecurityInfo(handle, object_type, 5 if include_owner else 4, ctypes.byref(owner) if include_owner else None, None, ctypes.byref(acl), None, ctypes.byref(descriptor))
     assert error == 0 and acl.value
     try:
         control, revision = wintypes.WORD(), wintypes.DWORD()
@@ -88,7 +88,15 @@ def independent_pipe_dacl(handle):
                 rows.append({"type": data[0], "flags": data[1], "mask": struct.unpack_from("<I", data, 4)[0], "sid": text.value})
             finally:
                 KERNEL.LocalFree(ctypes.cast(text, ctypes.c_void_p))
-        return {"protected": bool(control.value & 0x1000), "aces": rows}
+        result = {"protected": bool(control.value & 0x1000), "aces": rows}
+        if include_owner:
+            text = wintypes.LPWSTR()
+            assert advapi.ConvertSidToStringSidW(owner, ctypes.byref(text))
+            try:
+                result["ownerSid"] = text.value
+            finally:
+                KERNEL.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+        return result
     finally:
         KERNEL.LocalFree(descriptor)
 
@@ -322,6 +330,8 @@ def check_local_pipes(probe, architecture, token_oracle, file_oracle):
 def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
     output = probe.output / "broker-lifetime"
     output.mkdir()
+    profile_root = output / "Hu Tao ❤ profiles with spaces"
+    profile_root.mkdir()
     connector = probe.binary.parent / "wininspect-mcp-connect.exe"
     broker = probe.binary.parent / "wininspect-mcp.exe"
     profile = secrets.token_hex(32)
@@ -331,6 +341,20 @@ def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
     KERNEL.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     KERNEL.OpenProcess.restype = wintypes.HANDLE
     KERNEL.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    KERNEL.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    KERNEL.CreateFileW.restype = wintypes.HANDLE
+
+    def canonical_directory(path, volume):
+        opened = KERNEL.CreateFileW(str(path), 0x120080, 3, None, 3, 0x02200000, None)
+        assert opened and opened != ctypes.c_void_p(-1).value
+        try:
+            KERNEL.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+            buffer = ctypes.create_unicode_buffer(32768)
+            count = KERNEL.GetFinalPathNameByHandleW(opened, buffer, len(buffer), volume)
+            assert 0 < count < len(buffer)
+            return buffer.value
+        finally:
+            KERNEL.CloseHandle(opened)
 
     def process_snapshot(stage):
         class ProcessEntry(ctypes.Structure):
@@ -359,11 +383,12 @@ def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
         observations.append({"kind": "process-snapshot", "stage": stage, "debuggerProcesses": debuggers, "positiveControllerPid": os.getpid(), "nativeComponents": [v for v in rows if v["image"].casefold().startswith("wininspect-mcp")]})
         return rows
 
-    def start(name, profile_id):
+    def start(name, profile_id, root=profile_root):
         stream = (output / f"{name}.jsonl").open("wb")
         errors = (output / f"{name}.stderr").open("wb")
         try:
-            process = subprocess.Popen([str(connector), "--local-control", "--profile", profile_id], stdin=subprocess.PIPE, stdout=stream, stderr=errors, creationflags=subprocess.CREATE_NO_WINDOW)
+            process = subprocess.Popen([str(connector), "--local-control", "--profile", profile_id, "--profile-root", str(root)], stdin=subprocess.PIPE, stdout=stream, stderr=errors, creationflags=subprocess.CREATE_NO_WINDOW)
+            process.native_profile_id = profile_id
             processes.append(process)
             try:
                 job.assign(process)
@@ -389,13 +414,14 @@ def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
             if raw.endswith(b"\n"):
                 value = json.loads(raw)
                 assert value["operation"] == operation and value["debuggerInstances"] == value["operationalTools"] == []
+                assert value["profile"] == process.native_profile_id
                 observations.append({"kind": "response", "value": value, "output": file_identity(path)})
                 return value
             assert process.poll() is None, (process.returncode, path.with_suffix(".stderr").read_bytes())
             time.sleep(0.01)
         raise AssertionError("Actual native connector did not return a local-control response")
 
-    def observe_broker(response):
+    def observe_broker(response, root=profile_root):
         expected = response["broker"]
         handle = KERNEL.OpenProcess(0x100000 | 0x1000, False, expected["pid"])
         assert handle
@@ -406,6 +432,39 @@ def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
         rows = process_snapshot("actual-broker-observation")
         assert any(v["pid"] == actual["pid"] and v["image"].casefold() == "wininspect-mcp.exe" for v in rows)
         observations.append({"kind": "broker", "identity": actual, "tokenQueries": queries, "binary": file_identity(broker), "processSnapshot": next(v for v in rows if v["pid"] == actual["pid"])})
+        directory = root / response["profile"]
+        config_path = directory / "profile.json"
+        config = json.loads(config_path.read_bytes())
+        installation = hashlib.sha256(canonical_directory(broker.parent, 0).encode()).hexdigest()
+        assert response["installation"] == installation
+        expected_config = {"schemaVersion": 1, "installation": installation, "profile": response["profile"], "ownerSid": actual["userSid"], "httpPort": 9094}
+        assert config == response["configuration"] == expected_config
+        records = [path for path in directory.glob("registration-*.json") if path.name.endswith(f"-{actual['pid']}-{actual['creationTime']}.json")]
+        assert len(records) == 1
+        record_path = records[0]
+        endpoint_profile = hashlib.sha256(json.dumps({"profile": response["profile"], "root": canonical_directory(root, 1)}, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+        namespace = {"installation": installation, "profile": endpoint_profile, "userSid": actual["userSid"], "logonSid": actual["logonSid"], "sessionId": actual["sessionId"], "wireVersion": 1}
+        key = hashlib.sha256(json.dumps(namespace, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+        assert record_path.name == f"registration-{key}-{actual['pid']}-{actual['creationTime']}.json"
+        expected_record = {"schemaVersion": 1, "installation": response["installation"], "profile": response["profile"], "buildId": response["buildId"], "wireVersion": 1,
+                           "process": actual, "configuredHttpPort": 9094, "port": None}
+        assert json.loads(record_path.read_bytes()) == response["registration"] == expected_record
+        security = []
+        for path in (directory, config_path, record_path):
+            object_handle = KERNEL.CreateFileW(str(path), 0x120080, 3, None, 3, 0x02200000, None)
+            assert object_handle and object_handle != ctypes.c_void_p(-1).value
+            try:
+                descriptor = independent_pipe_dacl(object_handle, 1, True)
+                assert descriptor["ownerSid"] == actual["userSid"] and len(descriptor["aces"]) == 1
+                ace = descriptor["aces"][0]
+                assert ace["type"] == 0 and ace["mask"] == 0x1f01ff and ace["sid"] == actual["userSid"]
+                if path == directory:
+                    assert descriptor["protected"] and ace["flags"] == 3
+                security.append({"path": str(path), "actualSecurity": descriptor})
+            finally:
+                KERNEL.CloseHandle(object_handle)
+        observations.append({"kind": "profile-storage", "configuration": file_identity(config_path), "registration": file_identity(record_path), "actualSecurity": security,
+                             "configurationValue": config, "registrationValue": expected_record})
         return handle, actual
 
     def finish(client):
@@ -426,13 +485,82 @@ def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
         assert waited == 258
         observations.append({"kind": "broker-live", "stage": stage, "identity": identity, "waitResult": waited})
 
+    def profile_faults(handle, identity):
+        original = next(v for v in observations if v["kind"] == "profile-storage")
+        config_path = Path(original["configuration"]["path"])
+        record_path = Path(original["registration"]["path"])
+        controls = []
+        changed_install = {**original["configurationValue"], "installation": "0" * 64}
+        changed_version = {**original["configurationValue"], "schemaVersion": 2}
+        changed_generation = copy.deepcopy(original["registrationValue"])
+        changed_generation["process"]["creationTime"] = str(int(identity["creationTime"]) + 1)
+        changed_image = copy.deepcopy(original["registrationValue"])
+        changed_image["process"]["image"]["sha256"] = "0" * 64
+        cases = [("invalid-configuration-json", config_path, b'{"schemaVersion":', "invalid_json"),
+                 ("wrong-configuration-installation", config_path, json.dumps(changed_install).encode(), "profile_identity_mismatch"),
+                 ("unsupported-configuration-version", config_path, json.dumps(changed_version).encode(), "invalid_argument"),
+                 ("stale-registration-generation", record_path, json.dumps(changed_generation).encode(), "profile_registration_mismatch"),
+                 ("wrong-registration-image", record_path, json.dumps(changed_image).encode(), "profile_registration_mismatch"),
+                 ("extra-registration-field", record_path, json.dumps({**original["registrationValue"], "unexpected": True}).encode(), "profile_registration_mismatch")]
+        command = [str(connector), "--local-control", "--profile", profile, "--profile-root", str(profile_root)]
+        for name, path, changed, code in cases:
+            retained = path.read_bytes()
+            retained_identity = file_identity(path)
+            try:
+                path.write_bytes(changed)
+                before = file_identity(path)
+                stdout, stderr, receipt = probe.execute(command, b'{"operation":"status"}\n', expected_exit=1)
+                assert not stdout and json.loads(stderr)["code"] == code
+                assert file_identity(path) == before
+                still_live(handle, identity, name)
+                controls.append({"case": name, "nativeRefusal": receipt, "before": before, "after": file_identity(path)})
+            finally:
+                path.write_bytes(retained)
+            assert file_identity(path) == retained_identity
+            controls[-1]["restored"] = retained_identity
+        link = output / "controlled-profile-hardlink.json"
+        os.link(config_path, link)
+        try:
+            before = file_identity(config_path)
+            stdout, stderr, receipt = probe.execute(command, b'{"operation":"status"}\n', expected_exit=1)
+            assert not stdout and json.loads(stderr)["code"] == "profile_record_invalid"
+            assert file_identity(config_path) == before
+            still_live(handle, identity, "hardlinked-configuration")
+            controls.append({"case": "hardlinked-configuration", "nativeRefusal": receipt, "before": before, "after": file_identity(config_path), "actualLinkCount": config_path.stat().st_nlink})
+            assert controls[-1]["actualLinkCount"] == 2
+        finally:
+            link.unlink()
+        foreign_profile = secrets.token_hex(32)
+        foreign = profile_root / foreign_profile
+        foreign.mkdir()
+        sentinel = foreign / "profile.json"
+        sentinel.write_bytes(b'{"sentinel":7}')
+        before = file_identity(sentinel)
+        stdout, stderr, receipt = probe.execute([str(broker), "--serve-local", "--profile", foreign_profile, "--profile-root", str(profile_root)], expected_exit=1)
+        assert not stdout and json.loads(stderr)["code"] == "profile_security_invalid"
+        assert file_identity(sentinel) == before
+        still_live(handle, identity, "foreign-profile-security")
+        controls.append({"case": "foreign-profile-security", "nativeRefusal": receipt, "before": before, "after": file_identity(sentinel)})
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        advapi.ImpersonateAnonymousToken.argtypes = [wintypes.HANDLE]
+        assert advapi.ImpersonateAnonymousToken(ctypes.c_void_p(-2))
+        try:
+            denied = KERNEL.CreateFileW(str(config_path), 1, 3, None, 3, 0, None)
+            error = ctypes.get_last_error()
+            if denied and denied != ctypes.c_void_p(-1).value:
+                KERNEL.CloseHandle(denied)
+            assert denied == ctypes.c_void_p(-1).value and error == 5
+        finally:
+            assert advapi.RevertToSelf()
+        observations.append({"kind": "profile-faults", "actualNativeRefusals": controls, "anonymousReadError": error})
+
     try:
         process_snapshot("before-cold-start")
         first, second = start("first", profile), start("second", profile)
         before = request(first, "status")
         handle, identity = observe_broker(before)
         assert request(second, "status")["broker"] == identity
-        stdout, stderr, duplicate = probe.execute([str(broker), "--serve-local", "--profile", profile], expected_exit=1)
+        stdout, stderr, duplicate = probe.execute([str(broker), "--serve-local", "--profile", profile, "--profile-root", str(profile_root)], expected_exit=1)
         assert not stdout and json.loads(stderr)["code"] == "broker_already_running"
         refusals = []
         for label, arguments, payload in (
@@ -440,7 +568,7 @@ def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
                 ("debugger-operation", ["--profile", profile], b'{"operation":"target_open"}\n'),
                 ("extra-property", ["--profile", profile], b'{"operation":"status","targetId":"absent"}\n'),
                 ("bounded-input", ["--profile", profile], b"x" * 4097)):
-            stdout, stderr, refusal = probe.execute([str(connector), "--local-control", *arguments], payload, expected_exit=1)
+            stdout, stderr, refusal = probe.execute([str(connector), "--local-control", *arguments, "--profile-root", str(profile_root)], payload, expected_exit=1)
             assert not stdout and json.loads(stderr)["code"] == ("payload_limit" if label == "bounded-input" else "invalid_argument")
             refusals.append({"case": label, "observation": refusal})
             still_live(handle, identity, label)
@@ -449,15 +577,40 @@ def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
         assert request(second, "status")["broker"] == identity
         finish(second)
         still_live(handle, identity, "second-connector-EOF")
+        profile_faults(handle, identity)
         isolated = start("isolated", other_profile)
         isolated_response = request(isolated, "status")
         other_handle, other_identity = observe_broker(isolated_response)
         assert other_identity["pid"] != identity["pid"] and isolated_response["installation"] == before["installation"] and isolated_response["profile"] != before["profile"]
+        alternate_root = output / "Furina 💙 second root"
+        alternate_root.mkdir()
+        root_twin = start("separate-root", profile, alternate_root)
+        root_response = request(root_twin, "status")
+        root_handle, root_identity = observe_broker(root_response, alternate_root)
+        assert root_identity["pid"] not in (identity["pid"], other_identity["pid"]) and root_response["profile"] == before["profile"]
+        assert request(root_twin, "shutdown")["broker"] == root_identity
+        finish(root_twin)
+        terminal(root_handle, root_identity)
+        still_live(handle, identity, "separate-root-shutdown")
         closer = start("closer", profile)
         assert request(closer, "shutdown")["broker"] == identity
         finish(closer)
         terminal(handle, identity)
         still_live(other_handle, other_identity, "other-profile-shutdown")
+        original_store = next(v for v in observations if v["kind"] == "profile-storage")
+        config_path = Path(original_store["configuration"]["path"])
+        original_bytes = config_path.read_bytes()
+        registrations_before = [file_identity(path) for path in sorted(config_path.parent.glob("registration-*.json"))]
+        try:
+            config_path.write_bytes(json.dumps({**json.loads(original_bytes), "schemaVersion": 2}).encode())
+            bad_identity = file_identity(config_path)
+            stdout, stderr, cold_refusal = probe.execute([str(connector), "--local-control", "--profile", profile, "--profile-root", str(profile_root)], b'{"operation":"status"}\n', expected_exit=1)
+            assert not stdout and json.loads(stderr)["code"] == "invalid_argument"
+            assert file_identity(config_path) == bad_identity
+            assert [file_identity(path) for path in sorted(config_path.parent.glob("registration-*.json"))] == registrations_before
+            observations.append({"kind": "cold-profile-refusal", "nativeRefusal": cold_refusal, "before": bad_identity, "after": file_identity(config_path), "registrationsUnchanged": registrations_before})
+        finally:
+            config_path.write_bytes(original_bytes)
         assert request(isolated, "shutdown")["broker"] == other_identity
         finish(isolated)
         terminal(other_handle, other_identity)
@@ -465,13 +618,18 @@ def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
         restarted_response = request(restarted, "status")
         restarted_handle, restarted_identity = observe_broker(restarted_response)
         assert restarted_identity["creationTime"] != identity["creationTime"]
+        stored = [v for v in observations if v["kind"] == "profile-storage"]
+        assert stored[0]["configuration"] == stored[-1]["configuration"]
+        assert file_identity(stored[0]["registration"]["path"]) == stored[0]["registration"]
+        assert stored[0]["registration"]["path"] != stored[-1]["registration"]["path"]
         assert request(restarted, "shutdown")["broker"] == restarted_identity
         finish(restarted)
         terminal(restarted_handle, restarted_identity)
         write_json(output / "observations.json", observations)
-        return {"nativeBrokerLifetime": observations, "normalConnectorExits": 5, "normalBrokerExits": 3,
-                "sharedGeneration": identity, "isolatedGeneration": other_identity, "restartedGeneration": restarted_identity,
-                "duplicateBrokerRefused": duplicate, "localControlRefusals": refusals, "operationalMcpTransport": False, "workerRegistrationVerified": False}
+        return {"nativeBrokerLifetime": observations, "normalConnectorExits": 6, "normalBrokerExits": 4,
+                "sharedGeneration": identity, "isolatedGeneration": other_identity, "separateRootGeneration": root_identity, "restartedGeneration": restarted_identity,
+                "duplicateBrokerRefused": duplicate, "localControlRefusals": refusals, "profilePersistenceVerified": True,
+                "profileRoot": str(profile_root), "operationalMcpTransport": False, "workerRegistrationVerified": False}
     finally:
         job.close()
         for process in processes:

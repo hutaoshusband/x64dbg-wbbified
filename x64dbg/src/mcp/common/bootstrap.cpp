@@ -29,10 +29,11 @@ int native_component_main(NativeComponent component, int argc, wchar_t** argv)
 {
     try
     {
-        if(argc == 4 && std::wstring_view(argv[2]) == L"--profile")
+        if((argc == 4 || (argc == 6 && std::wstring_view(argv[4]) == L"--profile-root")) && std::wstring_view(argv[2]) == L"--profile")
         {
-            if(component == NativeComponent::Broker && std::wstring_view(argv[1]) == L"--serve-local") return serve_local_broker(argv[3]);
-            if(component == NativeComponent::Connector && std::wstring_view(argv[1]) == L"--local-control") return connect_local_control(argv[3]);
+            const std::wstring_view root = argc == 6 ? argv[5] : L"";
+            if(component == NativeComponent::Broker && std::wstring_view(argv[1]) == L"--serve-local") return serve_local_broker(argv[3], root);
+            if(component == NativeComponent::Connector && std::wstring_view(argv[1]) == L"--local-control") return connect_local_control(argv[3], root);
         }
         if(argc == 2 && std::wstring_view(argv[1]) == L"--build-info")
         {

@@ -295,7 +295,7 @@ condition = "mcp"
 sources = ["src/mcp/common/*.cpp", "src/mcp/common/*.h"]
 include-before = ["src/mcp/dependencies.cmake"]
 include-directories = ["src/mcp/common"]
-link-libraries = ["mcp_json", "advapi32", "bcrypt"]
+link-libraries = ["mcp_json", "advapi32", "bcrypt", "shell32", "ole32", "uuid"]
 compile-features = ["cxx_std_17"]
 compile-definitions = ["WIN32_LEAN_AND_MEAN", "NOMINMAX", "_WIN32_WINNT=0x0601"]
 

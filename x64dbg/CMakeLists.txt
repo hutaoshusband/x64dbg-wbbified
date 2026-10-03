@@ -1201,6 +1201,8 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/bootstrap.cpp"
 		"src/mcp/common/bootstrap.h"
 		"src/mcp/common/breakpoint_trace_tools.cpp"
+		"src/mcp/common/broker_profile.cpp"
+		"src/mcp/common/broker_profile.h"
 		"src/mcp/common/broker_runtime.cpp"
 		"src/mcp/common/broker_runtime.h"
 		"src/mcp/common/contracts.cpp"
@@ -1272,6 +1274,9 @@ if(X64DBG_BUILD_MCP) # mcp
 		mcp_json
 		advapi32
 		bcrypt
+		shell32
+		ole32
+		uuid
 	)
 
 	set_target_properties(mcp_common PROPERTIES

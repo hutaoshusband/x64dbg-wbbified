@@ -1,4 +1,5 @@
 #include "broker_runtime.h"
+#include "broker_profile.h"
 #include "local_pipe.h"
 #include "build_identity.h"
 #include "lifecycle.h"
@@ -33,10 +34,11 @@ struct RuntimeProfile
 {
     NativeProcessIdentity owner;
     std::filesystem::path directory;
-    std::string installation, profile, channel, lockKey;
+    std::string installation, profile, endpointProfile, channel, lockKey;
+    std::unique_ptr<BrokerProfile> storage;
 };
 
-RuntimeProfile runtime_profile(std::wstring_view profile)
+RuntimeProfile runtime_profile(std::wstring_view profile, std::wstring_view root)
 {
     auto owner = checked_value(capture_current_process());
     if(owner.integrity != "medium" || owner.elevated) throw ContractError{"permission_denied", "", "Local broker controls require ordinary user rights"};
@@ -53,10 +55,12 @@ RuntimeProfile runtime_profile(std::wstring_view profile)
     final_path.resize(length);
     directory = final_path;
     const auto installation = checked_value(sha256_bytes(checked_value(launch_utf8(final_path))));
-    const Json key = {{"installation", installation}, {"profile", profile_id}, {"userSid", owner.userSid},
+    auto storage = checked_value(BrokerProfile::open(owner, profile_id, root));
+    const auto endpoint_profile = checked_value(sha256_bytes(Json{{"profile", profile_id}, {"root", checked_value(launch_utf8(storage->root()))}}.dump()));
+    const Json key = {{"installation", installation}, {"profile", endpoint_profile}, {"userSid", owner.userSid},
         {"logonSid", owner.logonSid}, {"sessionId", owner.sessionId}, {"wireVersion", IpcWireVersion}};
-    return {std::move(owner), std::move(directory), installation, profile_id,
-        checked_value(sha256_bytes("ordinary-local-control-v1")), checked_value(sha256_bytes(key.dump()))};
+    return {std::move(owner), std::move(directory), installation, profile_id, endpoint_profile,
+        checked_value(sha256_bytes("ordinary-local-control-v1")), checked_value(sha256_bytes(key.dump())), std::move(storage)};
 }
 
 class BrokerLock
@@ -127,12 +131,16 @@ void validate_control_frame(const IpcFrame& frame, IpcMessageKind kind, std::uin
 void start_broker(const RuntimeProfile& profile)
 {
     const auto application = (profile.directory / L"wininspect-mcp.exe").wstring();
-    const auto profile_id = checked_value(launch_utf16(profile.profile));
-    std::wstring command = L"\"" + application + L"\" --serve-local --profile " + profile_id;
+    const auto application_text = checked_value(launch_utf8(application));
+    TargetLaunchRequest launch;
+    launch.instanceId = {"broker-bootstrap"};
+    launch.file = AbsoluteFile{application_text};
+    launch.arguments = std::vector<std::string>{"--serve-local", "--profile", profile.profile, "--profile-root", checked_value(launch_utf8(profile.storage->root()))};
+    auto plan = checked_value(prepare_windows_launch(launch, application_text, {}));
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
-    if(!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+    if(!CreateProcessW(application.c_str(), plan.commandLine.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
         nullptr, profile.directory.c_str(), &startup, &process)) throw runtime_error("Start ordinary broker");
     const Handle thread(process.hThread), child(process.hProcess);
 }
@@ -143,7 +151,7 @@ std::unique_ptr<LocalPipe> broker_channel(const RuntimeProfile& profile)
     bool started = false;
     for(;;)
     {
-        auto result = LocalPipe::connect(profile.installation, profile.profile, profile.channel, 500);
+        auto result = LocalPipe::connect(profile.installation, profile.endpointProfile, profile.channel, 500);
         if(auto* pipe = std::get_if<std::unique_ptr<LocalPipe>>(&result))
         {
             admit_component(**pipe, profile, L"wininspect-mcp.exe");
@@ -158,14 +166,21 @@ std::unique_ptr<LocalPipe> broker_channel(const RuntimeProfile& profile)
 Json control_request(const RuntimeProfile& profile, const Json& request)
 {
     if(auto error = validate_schema(closed_object_schema({{"operation", enum_schema({"status", "shutdown"})}}, {"operation"}), request)) throw *error;
+    const auto existing_configuration = profile.storage->configuration(profile.installation, false);
+    if(const auto* error = std::get_if<ContractError>(&existing_configuration); error && error->code != "profile_record_missing") throw *error;
     auto pipe = broker_channel(profile);
     const auto peer = checked_value(pipe->observe_peer());
+    const auto configuration = checked_value(profile.storage->configuration(profile.installation, false));
+    const Json expected_registration = {{"schemaVersion", 1}, {"installation", profile.installation}, {"profile", profile.profile}, {"buildId", BuildId},
+        {"wireVersion", IpcWireVersion}, {"process", native_process_json(peer)}, {"configuredHttpPort", configuration.at("httpPort")}, {"port", nullptr}};
+    const auto registration = checked_value(profile.storage->registration(profile.lockKey, peer));
+    if(registration != expected_registration) throw ContractError{"profile_registration_mismatch", "", "Durable broker registration does not match the actual live pipe generation"};
     checked_value(pipe->send(IpcMessageKind::Request, 2, control_envelope(peer.creationTime, request), 5000));
     const auto response = checked_value(pipe->receive(5000));
     validate_control_frame(response, IpcMessageKind::Response, peer.creationTime);
     const auto& payload = response.envelope.at("payload");
     if(payload.at("broker") != native_process_json(peer) || payload.at("installation") != profile.installation || payload.at("profile") != profile.profile ||
-        payload.at("buildId") != BuildId || payload.at("operation") != request.at("operation"))
+        payload.at("buildId") != BuildId || payload.at("operation") != request.at("operation") || payload.at("configuration") != configuration || payload.at("registration") != registration)
         throw ContractError{"ipc_peer_mismatch", "", "Broker registration does not match its retained physical endpoint"};
     Handle shutdown_process;
     if(request.at("operation") == "shutdown")
@@ -188,11 +203,15 @@ Json control_request(const RuntimeProfile& profile, const Json& request)
 }
 }
 
-int serve_local_broker(std::wstring_view profile_id)
+int serve_local_broker(std::wstring_view profile_id, std::wstring_view root)
 {
-    const auto profile = runtime_profile(profile_id);
+    const auto profile = runtime_profile(profile_id, root);
     const BrokerLock lock(profile);
-    auto pipe = checked_value(LocalPipe::create_first(profile.installation, profile.profile, profile.channel));
+    const auto configuration = checked_value(profile.storage->configuration(profile.installation, true));
+    auto pipe = checked_value(LocalPipe::create_first(profile.installation, profile.endpointProfile, profile.channel));
+    const Json registration = {{"schemaVersion", 1}, {"installation", profile.installation}, {"profile", profile.profile}, {"buildId", BuildId}, {"wireVersion", IpcWireVersion},
+        {"process", native_process_json(profile.owner)}, {"configuredHttpPort", configuration.at("httpPort")}, {"port", nullptr}};
+    checked_value(profile.storage->publish_registration(profile.lockKey, profile.owner, registration));
     bool stopping = false;
     while(!stopping)
     {
@@ -205,7 +224,8 @@ int serve_local_broker(std::wstring_view profile_id)
             const auto& request = frame.envelope.at("payload");
             if(auto error = validate_schema(closed_object_schema({{"operation", enum_schema({"status", "shutdown"})}}, {"operation"}), request)) throw *error;
             const Json response = {{"broker", native_process_json(profile.owner)}, {"installation", profile.installation}, {"profile", profile.profile},
-                {"buildId", BuildId}, {"operation", request.at("operation")}, {"debuggerInstances", Json::array()}, {"operationalTools", Json::array()}};
+                {"buildId", BuildId}, {"operation", request.at("operation")}, {"debuggerInstances", Json::array()}, {"operationalTools", Json::array()},
+                {"configuration", configuration}, {"registration", registration}};
             checked_value(pipe->send(IpcMessageKind::Response, 2, control_envelope(profile.owner.creationTime, response), 5000));
             const auto acknowledgment = checked_value(pipe->receive(5000));
             validate_control_frame(acknowledgment, IpcMessageKind::Request, profile.owner.creationTime);
@@ -217,14 +237,14 @@ int serve_local_broker(std::wstring_view profile_id)
             std::cerr << Json{{"code", error.code}, {"message", error.message}}.dump() << '\n';
         }
         pipe.reset();
-        if(!stopping) pipe = checked_value(LocalPipe::create_first(profile.installation, profile.profile, profile.channel));
+        if(!stopping) pipe = checked_value(LocalPipe::create_first(profile.installation, profile.endpointProfile, profile.channel));
     }
     return 0;
 }
 
-int connect_local_control(std::wstring_view profile_id)
+int connect_local_control(std::wstring_view profile_id, std::wstring_view root)
 {
-    const auto profile = runtime_profile(profile_id);
+    const auto profile = runtime_profile(profile_id, root);
     if(_setmode(_fileno(stdin), _O_BINARY) == -1 || _setmode(_fileno(stdout), _O_BINARY) == -1)
         throw ContractError{"ipc_failure", "", "Cannot select UTF-8 local-control byte streams"};
     std::string line;
