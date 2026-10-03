@@ -37,6 +37,7 @@
 #include "debugger_cookie.h"
 #include "debugger_tracing.h"
 #include "handles.h"
+#include "native_breakin.h"
 #include <shellapi.h>
 #include <tlhelp32.h>
 
@@ -54,9 +55,6 @@ static bool bIsAttached = false;
 static bool bPauseAtAttach = false;
 static INIT_STRUCT* activeDebugLoopInit = nullptr;
 static std::atomic<DWORD> dwAttachMainThread{ 0 };
-static std::atomic_bool bBreakInExpected{ false };
-static std::atomic<DWORD> dwBreakInThreadId{ 0 };
-static std::atomic<duint> breakInThreadStartAddress{ 0 };
 static volatile long DbgEventsTotal = 0;
 static bool bSkipExceptions = false;
 static duint skipExceptionCount = 0;
@@ -377,30 +375,12 @@ duint dbggetdbgeventcount()
     return (duint)InterlockedCompareExchange(&DbgEventsTotal, 0, 0);
 }
 
-static duint getBreakInThreadStartAddress()
-{
-    auto localNtdll = GetModuleHandleW(L"ntdll.dll");
-    auto localStart = localNtdll ? GetProcAddress(localNtdll, "DbgUiRemoteBreakin") : nullptr;
-    auto remoteNtdll = ModBaseFromName("ntdll.dll");
-    if(!localStart || !remoteNtdll)
-        return 0;
-    return remoteNtdll + (duint)localStart - (duint)localNtdll;
-}
-
 bool dbgspawnbreakinthread()
 {
-    if(bBreakInExpected.exchange(true))
-        return true;
-
-    // Record the remote entry point before creating the thread, because its
-    // debug events can arrive before DebugBreakProcess returns.
-    breakInThreadStartAddress = getBreakInThreadStartAddress();
-    dwBreakInThreadId = 0;
-    if(!DebugBreakProcess(fdProcessInfo->hProcess))
+    const auto result = NativeBreakIn::Create(ModBaseFromName("ntdll.dll"));
+    if(!result.created)
     {
-        bBreakInExpected = false;
-        breakInThreadStartAddress = 0;
-        dputs(QT_TRANSLATE_NOOP("DBG", "Failed to create a break-in thread (DebugBreakProcess)"));
+        dprintf(QT_TRANSLATE_NOOP("DBG", "Failed to create a break-in thread (status %08X, error %u)\n"), result.status, result.error);
         return false;
     }
     dputs(QT_TRANSLATE_NOOP("DBG", "Created a break-in thread to pause the debuggee"));
@@ -1570,6 +1550,8 @@ static void cbCreateProcess(CREATE_PROCESS_DEBUG_INFO* CreateProcessInfo)
     hActiveThread = CreateProcessInfo->hThread;
     fdProcessInfo->hProcess = CreateProcessInfo->hProcess;
     fdProcessInfo->hThread = CreateProcessInfo->hThread;
+    if(!NativeBreakIn::BeginTarget(CreateProcessInfo->hProcess))
+        dputs(QT_TRANSLATE_NOOP("DBG", "Warning: break-in process ownership could not be established"));
     varset("$hp", (duint)fdProcessInfo->hProcess, true);
 
     if(settingboolget("Engine", "HideDebugger", true))
@@ -1742,9 +1724,7 @@ static void cbExitProcess(EXIT_PROCESS_DEBUG_INFO* ExitProcess)
 
 static void cbCreateThread(CREATE_THREAD_DEBUG_INFO* CreateThread)
 {
-    if(bBreakInExpected && breakInThreadStartAddress != 0 &&
-            (duint)CreateThread->lpStartAddress == breakInThreadStartAddress)
-        dwBreakInThreadId = GetDebugData()->dwThreadId;
+    NativeBreakIn::BindThread(GetDebugData()->dwProcessId, GetDebugData()->dwThreadId, *CreateThread);
 
     ThreadCreate(CreateThread); //update thread list
     DWORD dwThreadId = GetDebugData()->dwThreadId;
@@ -1824,12 +1804,6 @@ static void cbExitThread(EXIT_THREAD_DEBUG_INFO* ExitThread)
             dputs(QT_TRANSLATE_NOOP("DBG", "No threads left to switch to (bug?)"));
     }
     DWORD dwThreadId = GetDebugData()->dwThreadId;
-    if(dwThreadId == dwBreakInThreadId)
-    {
-        bBreakInExpected = false;
-        dwBreakInThreadId = 0;
-        breakInThreadStartAddress = 0;
-    }
     PLUG_CB_EXITTHREAD callbackInfo;
     callbackInfo.ExitThread = ExitThread;
     callbackInfo.dwThreadId = dwThreadId;
@@ -2234,15 +2208,8 @@ static void cbException(EXCEPTION_DEBUG_INFO* ExceptionData)
     GuiSetLastException(ExceptionCode);
     lastExceptionInfo = *ExceptionData;
 
-    if(bBreakInExpected && dwBreakInThreadId != 0 &&
-            GetDebugData()->dwThreadId == dwBreakInThreadId &&
-            ExceptionCode == EXCEPTION_BREAKPOINT && ExceptionData->dwFirstChance)
+    if(NativeBreakIn::Consume(GetDebugData()->dwProcessId, GetDebugData()->dwThreadId, *ExceptionData))
     {
-        // The pause command spawned this thread. Treat its breakpoint as a
-        // pause instead of consuming an unrelated debuggee breakpoint.
-        bBreakInExpected = false;
-        dwBreakInThreadId = 0;
-        breakInThreadStartAddress = 0;
         dbgsetcontinuestatus(DBG_CONTINUE);
         dputs(QT_TRANSLATE_NOOP("DBG", "paused!"));
         auto CIP = GetContextDataEx(hActiveThread, UE_CIP);
@@ -3078,9 +3045,7 @@ static void debugLoopFunction(INIT_STRUCT* init)
     bIsAttached = init->attach;
     bPauseAtAttach = init->attach && init->pauseAtAttach;
     dwAttachMainThread = 0;
-    bBreakInExpected = false;
-    dwBreakInThreadId = 0;
-    breakInThreadStartAddress = 0;
+    NativeBreakIn::EndTarget();
     dbgsetskipexceptions(false);
     bFreezeStack = false;
 
@@ -3268,6 +3233,8 @@ static void debugLoopFunction(INIT_STRUCT* init)
         DebugLoop();
     }
 
+    NativeBreakIn::EndTarget();
+
     //fixes data loss when attach failed (https://github.com/x64dbg/x64dbg/issues/1899)
     DbClose();
 
@@ -3294,9 +3261,7 @@ static void debugLoopFunction(INIT_STRUCT* init)
     bIsDebugging = false;
     bPauseAtAttach = false;
     dwAttachMainThread = 0;
-    bBreakInExpected = false;
-    dwBreakInThreadId = 0;
-    breakInThreadStartAddress = 0;
+    NativeBreakIn::EndTarget();
     GuiSetDebugState(stopped);
     GuiUpdateAllViews();
     dputs(QT_TRANSLATE_NOOP("DBG", "Debugging stopped!"));

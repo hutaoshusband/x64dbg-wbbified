@@ -9,6 +9,7 @@
 #include "command.h"
 #include "variable.h"
 #include "debugger.h"
+#include "native_breakin.h"
 #include "simplescript.h"
 #include "console.h"
 #include "x64dbg.h"
@@ -985,6 +986,7 @@ extern "C" DLL_EXPORT void _dbg_dbgexitsignal()
     WaitForThreadTermination(hCommandLoopThread);
     dputs(QT_TRANSLATE_NOOP("DBG", "Stopping running debuggee..."));
     cbDebugStop(0, 0); //after this, debugging stopped
+    NativeBreakIn::Shutdown();
     dputs(QT_TRANSLATE_NOOP("DBG", "Aborting scripts..."));
     ScriptInterruptAwait(ScriptInterrupt::AbortShutdown);
     dputs(QT_TRANSLATE_NOOP("DBG", "Unloading plugins..."));

@@ -73,6 +73,7 @@ compile-features = ["cxx_std_17"]
 
 [target.dbg]
 type = "shared"
+include-after = ["cmake/native_breakin.cmake"]
 sources = [
     "src/dbg/*.cpp",
     "src/dbg/*.c",

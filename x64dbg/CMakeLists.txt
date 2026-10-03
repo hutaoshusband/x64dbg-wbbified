@@ -391,6 +391,9 @@ set(dbg_SOURCES
 	"src/dbg/msgqueue.h"
 	"src/dbg/murmurhash.cpp"
 	"src/dbg/murmurhash.h"
+	"src/dbg/native_breakin.cpp"
+	"src/dbg/native_breakin.h"
+	"src/dbg/native_breakin_payload.h"
 	"src/dbg/ntdll/ntdll.h"
 	"src/dbg/patches.cpp"
 	"src/dbg/patches.h"
@@ -541,6 +544,9 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8) # x64
 			wininspect
 	)
 endif()
+
+set(CMKR_TARGET dbg)
+include("cmake/native_breakin.cmake")
 
 # Target: gui
 set(gui_SOURCES

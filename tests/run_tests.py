@@ -429,7 +429,7 @@ def main():
         names = ["test_fixture_oracles", "test_native_argument_oracles", "test_native_guard_page_oracles", "test_native_memory_oracles",
                  "test_native_database_oracles", "test_native_stale_breakpoint_oracles", "test_native_execution_oracles", "test_native_register_oracles",
                  "test_native_module_oracles", "test_native_exception_oracles", "test_native_thread_oracles", "test_native_trace_oracles", "test_native_patch_oracles",
-                 "test_native_file_patch_oracles", "test_native_script_oracles"]
+                 "test_native_file_patch_oracles", "test_native_script_oracles", "test_native_breakin_oracles"]
     if arguments.phase == "runner":
         names = ["test_native_runner_ownership"]
     if arguments.phase == "inventory":
@@ -527,6 +527,9 @@ def main():
                 if "test_native_exception_oracles" in selected_names:
                     from exception_checks import run_exception_oracles
                     run_exception_oracles(environment, architecture_results, native_fixture_identity, run_owned_native_command)
+                if "test_native_breakin_oracles" in selected_names:
+                    from breakin_checks import run_breakin_oracles
+                    run_breakin_oracles(environment, architecture_results, native_fixture_identity, run_owned_native_command)
                 if "test_native_thread_oracles" in selected_names:
                     from thread_checks import run_thread_oracles
                     run_thread_oracles(environment, architecture_results, native_fixture_identity, run_owned_native_command)

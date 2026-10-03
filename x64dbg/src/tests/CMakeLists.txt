@@ -232,3 +232,6 @@ set_target_properties(test_random_dll_library PROPERTIES OUTPUT_NAME random)
 x64dbg_set_output_dir(test_random_dll_library "${X64DBG_TEST_OUTPUT_DIR}")
 target_link_libraries(test_random_dll_target PRIVATE psapi)
 add_dependencies(test_random_dll_target test_random_dll_library)
+
+x64dbg_add_test(NAME native_breakin TARGET_COMPILE_DEFINITIONS WINVER=0x0601 _WIN32_WINNT=0x0601)
+target_sources(test_native_breakin_target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../dbg/native_breakin.cpp")
