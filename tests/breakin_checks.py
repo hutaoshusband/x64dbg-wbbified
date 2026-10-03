@@ -169,7 +169,7 @@ def check_breakin_receipt(receipt, architecture, mode, detached, failure=None):
 
 
 def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
-    assert kind in ("normal", "register", "remove", "partial") and mode in ("show", "hide", "both")
+    assert kind in ("normal", "register", "remove", "partial", "cleanup", "cleanup-shutdown") and mode in ("show", "hide", "both")
     assert receipt["exitCode"] == 0 and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"]
     lines = receipt["stdout"].splitlines()
     headers = [index for index, line in enumerate(lines) if line.startswith("SESSION ")]
@@ -180,7 +180,10 @@ def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
     partial = kind == "partial"
     registration = kind == "register"
     removal = kind == "remove"
-    retained = partial or removal
+    cleanup_shutdown = kind == "cleanup-shutdown"
+    cleanup = cleanup_shutdown or kind == "cleanup"
+    assert not cleanup_shutdown or rounds == 1
+    retained = partial or removal or cleanup
     for round_index, begin in enumerate(headers):
         block = lines[begin:headers[round_index + 1] if round_index + 1 < rounds else len(lines)]
         session = one_line(block, "SESSION ")
@@ -216,10 +219,12 @@ def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
             assert len([line for line in block if line.startswith(prefix)]) == 2
         assert len([line for line in block if line.startswith("SESSION_CONSUME ")]) == (1 if registration else 2)
         if retained:
-            retention = one_line(block, "SESSION_RETAIN ")
-            assert {key: retention[key] for key in ("pid", "code", "alive", "executable", "data", "unchanged")} == {
-                "pid": helpers[0]["pid"], "code": helpers[0]["code"], "alive": "1", "executable": "00000020", "data": "00000004", "unchanged": "1"}
-            assert int(retention["samples"]) > 0 and 250 <= int(retention["elapsed"]) < 10000
+            retentions = [fields(line) for line in block if line.startswith("SESSION_RETAIN ")]
+            assert len(retentions) == (2 if cleanup_shutdown else 1)
+            for retention in retentions:
+                assert {key: retention[key] for key in ("pid", "code", "alive", "executable", "data", "unchanged")} == {
+                    "pid": helpers[0]["pid"], "code": helpers[0]["code"], "alive": "1", "executable": "00000020", "data": "00000004", "unchanged": "1"}
+                assert int(retention["samples"]) > 0 and 250 <= int(retention["elapsed"]) < 10000
         else:
             assert not any(line.startswith("SESSION_RETAIN ") for line in block)
         if partial:
@@ -238,6 +243,30 @@ def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
                 assert handler["protection"] == "00000020"
         else:
             assert not any(line.startswith("HANDLER ") for line in block)
+        cleanup_observation = None
+        if cleanup:
+            profile = one_line(block, "CLEANUP_PROFILE ")
+            assert profile == {"shutdown": str(int(cleanup_shutdown)), "pid": session["old"], "creation": session["oldCreation"], "controller": str(receipt["processIdentity"]["pid"]), "controllerCreation": receipt["processIdentity"]["creationTime"]}
+            cleanup_observation = one_line(block, "NATIVE_CLEANUP ")
+            assert set(cleanup_observation) == {"pid", "creation", "code", "size", "type", "requestedAccess", "originalAccess", "actualAccess", "result", "error", "prepared", "unchanged", "calls"}
+            assert {key: cleanup_observation[key] for key in ("pid", "creation", "code", "size", "type", "requestedAccess", "result", "error", "prepared", "unchanged", "calls")} == {
+                "pid": session["old"], "creation": session["oldCreation"], "code": helpers[0]["code"], "size": "0", "type": "00008000", "requestedAccess": "00100410", "result": "0", "error": "5", "prepared": "1", "unchanged": "1", "calls": "1"}
+            assert int(cleanup_observation["originalAccess"], 16) == 0x1fffff and int(cleanup_observation["actualAccess"], 16) in (0x100410, 0x101410)
+            profile_position = next(index for index, line in enumerate(block) if line.startswith("CLEANUP_PROFILE "))
+            native_position = next(index for index, line in enumerate(block) if line.startswith("NATIVE_CLEANUP "))
+            old_helper_position = next(index for index, line in enumerate(block) if line.startswith("SESSION_HELPER role=0 "))
+            old_page_position = next(index for index, line in enumerate(block) if line.startswith("SESSION_PAGE role=0 "))
+            assert profile_position < old_helper_position < native_position < old_page_position
+            if cleanup_shutdown:
+                assert one_line(block, "CLEANUP_SHUTDOWN ") == {"rejected": "1", "error": "170", "beginRejected": "1"}
+                retained_positions = [index for index, line in enumerate(block) if line.startswith("SESSION_RETAIN ")]
+                shutdown_position = next(index for index, line in enumerate(block) if line.startswith("CLEANUP_SHUTDOWN "))
+                completion_position = next(index for index, line in enumerate(block) if line.startswith("TARGET breakpoint_returned="))
+                assert old_page_position < retained_positions[0] < shutdown_position < retained_positions[1] < completion_position
+            else:
+                assert not any(line.startswith("CLEANUP_SHUTDOWN ") for line in block)
+        else:
+            assert not any(line.startswith(("CLEANUP_PROFILE ", "NATIVE_CLEANUP ", "CLEANUP_SHUTDOWN ")) for line in block)
         final = [fields(line) for line in block if line.startswith("TARGET final_peb=")]
         assert len(final) == 2 and all(item == {"final_peb": str(int(mode == "show")), "final_port": "1", "detached": "0", "port_read": "1"} for item in final)
         if architecture == "x32":
@@ -255,7 +284,7 @@ def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
             held = next(index for index, line in enumerate(block) if line.startswith("SESSION_RETAIN "))
             released = next(index for index, line in enumerate(block) if line.startswith("TARGET breakpoint_returned="))
             assert page_position < held < released
-        observed.append({"session": session, "helpers": helpers, "retained": retained, "sameVirtualAddress": helpers[0]["code"] == helpers[1]["code"]})
+        observed.append({"session": session, "helpers": helpers, "retained": retained, "sameVirtualAddress": helpers[0]["code"] == helpers[1]["code"], "nativeCleanup": cleanup_observation})
     assert len(generations) == rounds * 2
     return {"rounds": observed, "targetGenerations": len(generations)}
 
@@ -445,6 +474,16 @@ def run_breakin_oracles(environment, results, fixture_identity, run_owned):
         observed = check_quota_receipt(receipt, environment.architecture, mode)
         assert file_identity(binary) == identity, "Native quota fixture changed"
         quotas.append({"mode": mode, "receipt": file_identity(path), "observed": observed})
+    cleanups = []
+    for kind in ("cleanup", "cleanup-shutdown"):
+        rounds = 1 if kind == "cleanup-shutdown" else 8
+        for mode in ("show", "hide", "both"):
+            receipt = run_owned([str(binary), mode, "replacement", kind, str(rounds)], os.environ, 35)
+            path = environment.root / f"breakin-{kind}-{mode}.json"
+            write_json(path, receipt)
+            observed = check_replacement_receipt(receipt, environment.architecture, mode, kind, rounds)
+            assert file_identity(binary) == identity, "Native cleanup fixture changed"
+            cleanups.append({"mode": mode, "kind": kind, "rounds": rounds, "receipt": file_identity(path), "observed": observed})
     results.append({"name": "test_native_breakin_oracles", "status": "verified", "oracle": {
-        "binary": identity, "machine": machine, "observations": observations, "replacements": replacements, "inflight": inflight, "quotas": quotas, "debuggerUsed": "owned Windows native controller"}})
-    print(f"[VERIFIED] Native {environment.architecture} hidden/unhidden break-in, identity rejection, detach, thread exit, page release, failed-handler retention, late-thread binding, actual reduced-access creation, repeated replacement, held in-flight retirement/shutdown and retained-request quota recovery", flush=True)
+        "binary": identity, "machine": machine, "observations": observations, "replacements": replacements, "inflight": inflight, "quotas": quotas, "cleanups": cleanups, "debuggerUsed": "owned Windows native controller"}})
+    print(f"[VERIFIED] Native {environment.architecture} break-in identities, hidden/detached/native creation and handler references, repeated replacement, in-flight lifetime, quota recovery and actual failed-cleanup retention/shutdown", flush=True)

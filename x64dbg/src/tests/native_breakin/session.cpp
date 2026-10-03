@@ -33,7 +33,7 @@ namespace BreakInSessions
         DWORD processId = 0, threadId = 0;
         unsigned breaks = 0, helperBreaks = 0, exits = 0;
         std::uintptr_t ntdllBase = 0, imageBase = 0;
-        std::array<unsigned char, 64> originalCode{};
+        std::array<unsigned char, NativeBreakInPayload::CodePageSize> originalCode{};
         void* remoteCode = nullptr;
         bool terminal = false;
         ~OwnedSessionTarget()
@@ -99,7 +99,7 @@ namespace BreakInSessions
         do
         {
             MEMORY_BASIC_INFORMATION code{}, data{};
-            std::array<unsigned char, 64> observed{};
+            decltype(target.originalCode) observed{};
             SIZE_T copied = 0;
             if(WaitForSingleObject(target.process.get(), 0) != WAIT_TIMEOUT || VirtualQueryEx(target.process.get(), target.remoteCode, &code, sizeof(code)) != sizeof(code) || VirtualQueryEx(target.process.get(), static_cast<unsigned char*>(target.remoteCode) + NativeBreakInPayload::CodePageSize, &data, sizeof(data)) != sizeof(data) || code.AllocationBase != target.remoteCode || data.AllocationBase != target.remoteCode || code.State != MEM_COMMIT || data.State != MEM_COMMIT || code.Type != MEM_PRIVATE || data.Type != MEM_PRIVATE || code.Protect != PAGE_EXECUTE_READ || data.Protect != PAGE_READWRITE || !ReadProcessMemory(target.process.get(), target.remoteCode, observed.data(), observed.size(), &copied) || copied != observed.size() || observed != target.originalCode)
                 return false;
@@ -117,12 +117,22 @@ namespace BreakInSessions
         const bool partial = std::wcscmp(kind, L"partial") == 0;
         const bool registration = std::wcscmp(kind, L"register") == 0;
         const bool removal = std::wcscmp(kind, L"remove") == 0;
+        const bool cleanupShutdown = std::wcscmp(kind, L"cleanup-shutdown") == 0;
+        const bool cleanup = cleanupShutdown || std::wcscmp(kind, L"cleanup") == 0;
         const DWORD oldExit = registration ? 2u : removal ? 1u : 0u;
+        OwnedHandle cleanupCompleted(cleanup ? CreateEventW(nullptr, TRUE, FALSE, nullptr) : nullptr);
         std::array<OwnedSessionTarget, 2> targets;
         for(unsigned role = 0; role < targets.size(); ++role)
             if(!StartTarget(targets[role], binary, mode, role ? L"normal" : kind))
                 return 11;
+        if(cleanup && (!cleanupCompleted || !FixtureNativeCleanup::ConfigureDeniedTarget(targets[0].process.get(), cleanupCompleted.get())))
+            return 81;
         std::printf("SESSION round=%u old=%lu oldCreation=%llu next=%lu nextCreation=%llu partial=%u registration=%u removal=%u\n", round, targets[0].processId, CreationTime(targets[0].process.get(), false), targets[1].processId, CreationTime(targets[1].process.get(), false), unsigned(partial), unsigned(registration), unsigned(removal));
+        if(cleanup)
+        {
+            std::printf("CLEANUP_PROFILE shutdown=%u pid=%lu creation=%llu controller=%lu controllerCreation=%llu\n", unsigned(cleanupShutdown), targets[0].processId, CreationTime(targets[0].process.get(), false), GetCurrentProcessId(), CreationTime(GetCurrentProcess(), false));
+            std::fflush(stdout);
+        }
         bool requested = false, released = false;
         FixtureNativeCreation::Observation oldCreation;
         const auto deadline = GetTickCount64() + 20000;
@@ -240,8 +250,26 @@ namespace BreakInSessions
                         return 22;
                     std::printf("SESSION_THREAD_TERMINAL role=%u pid=%lu thread=%lu exit=%lu\n", role, item.processId, item.threadId, exit);
                 }
-                if(!VerifyPages(targets[0], 0, !partial && !removal) || !VerifyPages(targets[1], 1, true) || ((partial || removal) && !VerifyRetainedPages(targets[0])))
+                if(cleanup)
+                {
+                    if(WaitForSingleObject(cleanupCompleted.get(), 3000) != WAIT_OBJECT_0)
+                        return 82;
+                    const auto observation = FixtureNativeCleanup::Capture();
+                    if(!observation.verified || observation.calls != 1 || observation.processId != targets[0].processId || observation.creation != CreationTime(targets[0].process.get(), false) || observation.address != targets[0].remoteCode)
+                        return 83;
+                }
+                if(!VerifyPages(targets[0], 0, !partial && !removal && !cleanup) || !VerifyPages(targets[1], 1, true) || ((partial || removal || cleanup) && !VerifyRetainedPages(targets[0])))
                     return 23;
+                if(cleanupShutdown)
+                {
+                    NativeBreakIn::Shutdown();
+                    const auto rejected = NativeBreakIn::Create(targets[1].ntdllBase);
+                    const auto beginRejected = !NativeBreakIn::BeginTarget(targets[0].process.get());
+                    std::printf("CLEANUP_SHUTDOWN rejected=%u error=%lu beginRejected=%u\n", unsigned(!rejected.created), rejected.error, unsigned(beginRejected));
+                    std::fflush(stdout);
+                    if(rejected.created || rejected.error != ERROR_BUSY || !beginRejected || !VerifyRetainedPages(targets[0]))
+                        return 84;
+                }
                 released = SetEvent(targets[0].completion.get()) && SetEvent(targets[1].completion.get());
                 if(!released)
                     return 24;
@@ -262,6 +290,8 @@ namespace BreakInSessions
             return 30;
         std::printf("SESSION_ROUND round=%u completed=1\n", round);
         std::fflush(stdout);
+        if(cleanup)
+            FixtureNativeCleanup::Reset();
         return 0;
     }
 
@@ -809,7 +839,9 @@ namespace BreakInSessions
 
     int RunReplacement(const wchar_t* mode, const wchar_t* kind, unsigned rounds)
     {
-        if(rounds == 0 || rounds > MaxReplacementRounds || (std::wcscmp(kind, L"normal") && std::wcscmp(kind, L"partial") && std::wcscmp(kind, L"register") && std::wcscmp(kind, L"remove")))
+        const bool cleanupShutdown = std::wcscmp(kind, L"cleanup-shutdown") == 0;
+        if(rounds == 0 || rounds > MaxReplacementRounds || (cleanupShutdown && rounds != 1) ||
+                (std::wcscmp(kind, L"normal") && std::wcscmp(kind, L"partial") && std::wcscmp(kind, L"register") && std::wcscmp(kind, L"remove") && std::wcscmp(kind, L"cleanup") && !cleanupShutdown))
             return 31;
         if(std::wcscmp(mode, L"show") && std::wcscmp(mode, L"hide") && std::wcscmp(mode, L"both"))
             return 31;

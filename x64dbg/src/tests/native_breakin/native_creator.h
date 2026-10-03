@@ -36,3 +36,22 @@ namespace FixtureNativeCreation
     bool VerifyThread(HANDLE thread, const char* phase);
     Observation Capture();
 }
+
+namespace FixtureNativeCleanup
+{
+    struct Observation
+    {
+        DWORD processId = 0;
+        unsigned long long creation = 0;
+        void* address = nullptr;
+        DWORD originalAccess = 0, actualAccess = 0;
+        DWORD error = 0;
+        BOOL result = FALSE;
+        unsigned calls = 0;
+        bool verified = false;
+    };
+
+    bool ConfigureDeniedTarget(HANDLE process, HANDLE completed);
+    void Reset();
+    Observation Capture();
+}

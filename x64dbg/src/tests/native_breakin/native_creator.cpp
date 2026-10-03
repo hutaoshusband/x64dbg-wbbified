@@ -1,4 +1,5 @@
 #include "native_creator.h"
+#include "../../dbg/native_breakin_payload.h"
 #include <winternl.h>
 #include <tlhelp32.h>
 #include <memory>
@@ -6,6 +7,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <array>
 
 extern "C" LONG NTAPI LdrGetProcedureAddress(void*, const ANSI_STRING*, ULONG, void**);
 
@@ -269,4 +272,140 @@ namespace FixtureNativeCreation
 extern "C" FARPROC WINAPI FixtureGetProcAddress(HMODULE module, LPCSTR name)
 {
     return FixtureNativeCreation::Resolve(module, name);
+}
+
+namespace FixtureNativeCleanup
+{
+    namespace
+    {
+        using NativeFree = BOOL(WINAPI*)(HANDLE, void*, SIZE_T, DWORD);
+        using OwnedHandle = std::unique_ptr<void, decltype(&CloseHandle)>;
+        constexpr DWORD RestrictedProcessAccess = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE;
+
+        struct CleanupSession
+        {
+            DWORD processId = 0;
+            unsigned long long creation = 0;
+            OwnedHandle completed{nullptr, CloseHandle};
+            std::mutex mutex;
+            Observation observation;
+        };
+
+        std::mutex registryMutex;
+        std::shared_ptr<CleanupSession> current;
+
+        unsigned long long CreationTime(HANDLE process)
+        {
+            FILETIME creation{}, exit{}, kernel{}, user{};
+            if(!GetProcessTimes(process, &creation, &exit, &kernel, &user))
+                return 0;
+            return (static_cast<unsigned long long>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+        }
+
+        bool Access(HANDLE handle, DWORD& granted)
+        {
+            using Query = LONG(NTAPI*)(HANDLE, OBJECT_INFORMATION_CLASS, void*, ULONG, ULONG*);
+            const auto query = reinterpret_cast<Query>(FixtureNativeCreation::Resolve(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"));
+            PUBLIC_OBJECT_BASIC_INFORMATION information{};
+            ULONG length = 0;
+            if(!query || query(handle, ObjectBasicInformation, &information, sizeof(information), &length) < 0 || length != sizeof(information))
+                return false;
+            granted = information.GrantedAccess;
+            return true;
+        }
+    }
+
+    bool ConfigureDeniedTarget(HANDLE process, HANDLE completed)
+    {
+        auto session = std::make_shared<CleanupSession>();
+        session->processId = GetProcessId(process);
+        session->creation = CreationTime(process);
+        HANDLE duplicate = nullptr;
+        if(!session->processId || !session->creation || !DuplicateHandle(GetCurrentProcess(), completed, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            return false;
+        session->completed.reset(duplicate);
+        std::lock_guard<std::mutex> guard(registryMutex);
+        current = std::move(session);
+        return true;
+    }
+
+    void Reset()
+    {
+        std::lock_guard<std::mutex> guard(registryMutex);
+        current.reset();
+    }
+
+    Observation Capture()
+    {
+        std::shared_ptr<CleanupSession> session;
+        {
+            std::lock_guard<std::mutex> guard(registryMutex);
+            session = current;
+        }
+        if(!session)
+            return {};
+        std::lock_guard<std::mutex> guard(session->mutex);
+        return session->observation;
+    }
+
+    BOOL Free(HANDLE process, void* address, SIZE_T size, DWORD type)
+    {
+        const auto incomingError = GetLastError();
+        const auto native = reinterpret_cast<NativeFree>(FixtureNativeCreation::Resolve(GetModuleHandleW(L"kernel32.dll"), "VirtualFreeEx"));
+        if(!native)
+        {
+            SetLastError(ERROR_PROC_NOT_FOUND);
+            return FALSE;
+        }
+        std::shared_ptr<CleanupSession> session;
+        {
+            std::lock_guard<std::mutex> guard(registryMutex);
+            session = current;
+        }
+        if(!session || GetProcessId(process) != session->processId || CreationTime(process) != session->creation)
+        {
+            SetLastError(incomingError);
+            return native(process, address, size, type);
+        }
+        HANDLE duplicate = nullptr;
+        if(!DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &duplicate, RestrictedProcessAccess, FALSE, 0))
+            return FALSE;
+        OwnedHandle restricted(duplicate, CloseHandle);
+        DWORD originalAccess = 0, actualAccess = 0;
+        MEMORY_BASIC_INFORMATION before{}, after{};
+        std::array<unsigned char, NativeBreakInPayload::CodePageSize> original{}, observed{};
+        SIZE_T copied = 0;
+        const auto prepared = size == 0 && type == MEM_RELEASE && Access(process, originalAccess) && Access(duplicate, actualAccess) &&
+                              (originalAccess & PROCESS_VM_OPERATION) && !(actualAccess & PROCESS_VM_OPERATION) &&
+                              (actualAccess & RestrictedProcessAccess) == RestrictedProcessAccess &&
+                              GetProcessId(duplicate) == session->processId && CreationTime(duplicate) == session->creation &&
+                              VirtualQueryEx(process, address, &before, sizeof(before)) == sizeof(before) && before.AllocationBase == address &&
+                              before.State == MEM_COMMIT && before.Protect == PAGE_EXECUTE_READ && before.Type == MEM_PRIVATE &&
+                              ReadProcessMemory(duplicate, address, original.data(), original.size(), &copied) && copied == original.size();
+        const auto result = native(duplicate, address, size, type);
+        const auto error = GetLastError();
+        const auto unchanged = VirtualQueryEx(process, address, &after, sizeof(after)) == sizeof(after) &&
+                               after.AllocationBase == before.AllocationBase && after.RegionSize == before.RegionSize &&
+                               after.State == before.State && after.Protect == before.Protect && after.Type == before.Type &&
+                               ReadProcessMemory(duplicate, address, observed.data(), observed.size(), &copied) && copied == observed.size() && observed == original &&
+                               WaitForSingleObject(duplicate, 0) == WAIT_TIMEOUT;
+        {
+            std::lock_guard<std::mutex> guard(session->mutex);
+            session->observation = {session->processId, session->creation, address, originalAccess, actualAccess, error, result, session->observation.calls + 1,
+                                    prepared && unchanged && result == FALSE && error == ERROR_ACCESS_DENIED};
+            std::printf("NATIVE_CLEANUP pid=%lu creation=%llu code=%p size=%zu type=%08lx requestedAccess=%08lx originalAccess=%08lx actualAccess=%08lx result=%u error=%lu prepared=%u unchanged=%u calls=%u\n",
+                        session->processId, session->creation, address, size, type, RestrictedProcessAccess, originalAccess, actualAccess, unsigned(result), error,
+                        unsigned(prepared), unsigned(unchanged), session->observation.calls);
+            std::fflush(stdout);
+        }
+        SetEvent(session->completed.get());
+        restricted.reset();
+        SetLastError(error);
+        return result;
+    }
+}
+
+extern "C" BOOL WINAPI FixtureVirtualFreeEx(HANDLE process, void* address, SIZE_T size, DWORD type)
+{
+    return FixtureNativeCleanup::Free(process, address, size, type);
 }
