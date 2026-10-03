@@ -10,6 +10,11 @@
 #include <memory>
 #include <array>
 #include <thread>
+#include <tlhelp32.h>
+#include <vector>
+#include <tuple>
+#include <algorithm>
+#include <limits>
 
 namespace BreakInSessions
 {
@@ -451,6 +456,355 @@ namespace BreakInSessions
         std::printf("INFLIGHT_TARGET_TERMINAL pid=%lu exit=%lu breaks=%u helperBreaks=%u helperExits=%u\n", target.processId, exit, target.breaks, target.helperBreaks, target.exits);
         std::fflush(stdout);
         return 0;
+    }
+
+    constexpr unsigned RetainedRequestLimit = 64;
+
+    struct NativeSnapshot
+    {
+        unsigned long long addressEnd = 0;
+        std::vector<std::pair<DWORD, unsigned long long>> threads;
+        std::vector<std::tuple<std::uintptr_t, SIZE_T, DWORD, DWORD, DWORD, std::uintptr_t>> memory;
+    };
+
+    static bool Snapshot(OwnedSessionTarget& target, NativeSnapshot& result)
+    {
+        OwnedHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+        if(snapshot.get() == INVALID_HANDLE_VALUE)
+        {
+            snapshot.release();
+            return false;
+        }
+        THREADENTRY32 thread{};
+        thread.dwSize = sizeof(thread);
+        if(!snapshot || !Thread32First(snapshot.get(), &thread))
+            return false;
+        do
+        {
+            if(thread.th32OwnerProcessID != target.processId)
+                continue;
+            OwnedHandle handle(OpenThread(THREAD_QUERY_INFORMATION | SYNCHRONIZE, FALSE, thread.th32ThreadID));
+            const auto creation = handle ? CreationTime(handle.get(), true) : 0;
+            if(!creation || GetProcessIdOfThread(handle.get()) != target.processId || WaitForSingleObject(handle.get(), 0) != WAIT_TIMEOUT)
+                return false;
+            result.threads.emplace_back(thread.th32ThreadID, creation);
+        }
+        while(Thread32Next(snapshot.get(), &thread));
+        if(GetLastError() != ERROR_NO_MORE_FILES)
+            return false;
+        std::sort(result.threads.begin(), result.threads.end());
+        std::uintptr_t address = 0;
+        while(true)
+        {
+            MEMORY_BASIC_INFORMATION region{};
+            if(VirtualQueryEx(target.process.get(), reinterpret_cast<void*>(address), &region, sizeof(region)) != sizeof(region))
+            {
+                if(GetLastError() != ERROR_INVALID_PARAMETER || !address)
+                    return false;
+                break;
+            }
+            const auto base = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+            const auto allocation = region.State == MEM_FREE ? 0 : reinterpret_cast<std::uintptr_t>(region.AllocationBase);
+            result.memory.emplace_back(base, region.RegionSize, region.State, region.State == MEM_COMMIT ? region.Protect : 0, region.State == MEM_COMMIT ? region.Type : 0, allocation);
+            result.addressEnd = static_cast<unsigned long long>(base) + region.RegionSize;
+            if(region.RegionSize > std::numeric_limits<std::uintptr_t>::max() - base)
+            {
+                if constexpr(sizeof(std::uintptr_t) == 4)
+                {
+                    if(region.RegionSize - 1 != std::numeric_limits<std::uintptr_t>::max() - base)
+                        return false;
+                    break;
+                }
+                else
+                    return false;
+            }
+            const auto next = base + region.RegionSize;
+            if(next <= address)
+                return false;
+            address = next;
+        }
+        return !result.threads.empty() && WaitForSingleObject(target.process.get(), 0) == WAIT_TIMEOUT;
+    }
+
+    struct RetainedHelper
+    {
+        FixtureNativeCreation::Observation creation;
+        OwnedHandle thread;
+        std::array<unsigned char, NativeBreakInPayload::CodePageSize> code{};
+        unsigned breaks = 0, exits = 0;
+    };
+
+    static bool VerifyQuotaPages(OwnedSessionTarget& target, const std::vector<RetainedHelper>& helpers, const char* phase)
+    {
+        const auto begin = GetTickCount64();
+        unsigned samples = 0;
+        do
+        {
+            if(WaitForSingleObject(target.process.get(), 0) != WAIT_TIMEOUT)
+                return false;
+            for(const auto& helper : helpers)
+            {
+                MEMORY_BASIC_INFORMATION code{}, data{};
+                std::array<unsigned char, NativeBreakInPayload::CodePageSize> observed{};
+                SIZE_T copied = 0;
+                const auto start = helper.creation.start;
+                if(VirtualQueryEx(target.process.get(), start, &code, sizeof(code)) != sizeof(code) ||
+                        VirtualQueryEx(target.process.get(), static_cast<unsigned char*>(start) + NativeBreakInPayload::CodePageSize, &data, sizeof(data)) != sizeof(data) ||
+                        code.AllocationBase != start || data.AllocationBase != start || code.State != MEM_COMMIT || data.State != MEM_COMMIT ||
+                        code.Type != MEM_PRIVATE || data.Type != MEM_PRIVATE || code.Protect != PAGE_EXECUTE_READ || data.Protect != PAGE_READWRITE ||
+                        !ReadProcessMemory(target.process.get(), start, observed.data(), observed.size(), &copied) || copied != observed.size() || observed != helper.code)
+                    return false;
+            }
+            ++samples;
+            Sleep(1);
+        }
+        while(GetTickCount64() - begin < 250);
+        std::printf("QUOTA_RETAIN phase=%s pid=%lu requests=%zu alive=1 executable=00000020 data=00000004 unchanged=1 bytes=%zu samples=%u elapsed=%llu\n", phase, target.processId, helpers.size(), helpers.front().code.size(), samples, GetTickCount64() - begin);
+        std::fflush(stdout);
+        return helpers.size() == RetainedRequestLimit;
+    }
+
+    static bool FillQuota(std::array<OwnedSessionTarget, 2>& targets, std::vector<RetainedHelper>& helpers)
+    {
+        FixtureNativeCreation::Configure(FixtureNativeCreation::Mode::ControlledFailure);
+        for(unsigned index = 0; index < RetainedRequestLimit; ++index)
+        {
+            if(!NativeBreakIn::BeginTarget(targets[0].process.get()))
+                return false;
+            const auto result = NativeBreakIn::Create(targets[0].ntdllBase);
+            RetainedHelper helper;
+            helper.creation = FixtureNativeCreation::Capture();
+            SIZE_T copied = 0;
+            if(result.created || result.status != static_cast<LONG>(0xc0000022) || result.error != ERROR_ACCESS_DENIED ||
+                    !helper.creation.nativeCreated || !helper.creation.handleClosed || helper.creation.processId != targets[0].processId || helper.creation.calls != index + 1 ||
+                    !ReadProcessMemory(targets[0].process.get(), helper.creation.start, helper.code.data(), helper.code.size(), &copied) || copied != helper.code.size())
+                return false;
+            for(const auto& previous : helpers)
+                if(previous.creation.start == helper.creation.start || previous.creation.threadId == helper.creation.threadId)
+                    return false;
+            helpers.push_back(std::move(helper));
+            NativeBreakIn::EndTarget();
+        }
+        if(!NativeBreakIn::BeginTarget(targets[1].process.get()) || !VerifyQuotaPages(targets[0], helpers, "full"))
+            return false;
+        std::array<NativeSnapshot, 2> before, after;
+        for(unsigned role = 0; role < targets.size(); ++role)
+            if(!Snapshot(targets[role], before[role]))
+                return false;
+        for(const auto& helper : helpers)
+            if(std::find(before[0].threads.begin(), before[0].threads.end(), std::make_pair(helper.creation.threadId, helper.creation.creation)) == before[0].threads.end())
+                return false;
+        for(unsigned attempt = 0; attempt < 4; ++attempt)
+        {
+            const auto rejected = NativeBreakIn::Create(targets[1].ntdllBase);
+            const auto unchanged = FixtureNativeCreation::Capture().calls == RetainedRequestLimit;
+            std::printf("QUOTA_REJECT attempt=%u created=%u status=%08lx error=%lu calls=%u unchanged=%u\n", attempt, unsigned(rejected.created), rejected.status, rejected.error, FixtureNativeCreation::Capture().calls, unsigned(unchanged));
+            if(rejected.created || rejected.status != 0 || rejected.error != ERROR_BUSY || !unchanged)
+                return false;
+        }
+        for(unsigned role = 0; role < targets.size(); ++role)
+        {
+            if(!Snapshot(targets[role], after[role]) || before[role].threads != after[role].threads || before[role].memory != after[role].memory || before[role].addressEnd != after[role].addressEnd)
+                return false;
+            std::printf("QUOTA_NO_EFFECT role=%u pid=%lu threads=%zu regions=%zu addressEnd=%llx sameThreads=1 sameMemory=1\n", role, targets[role].processId, after[role].threads.size(), after[role].memory.size(), after[role].addressEnd);
+        }
+        std::fflush(stdout);
+        return true;
+    }
+
+    int RunQuota(const wchar_t* mode)
+    {
+        if(std::wcscmp(mode, L"show") && std::wcscmp(mode, L"hide") && std::wcscmp(mode, L"both"))
+            return 59;
+        wchar_t binary[32768]{};
+        std::array<OwnedSessionTarget, 2> targets;
+        std::vector<RetainedHelper> helpers;
+        helpers.reserve(RetainedRequestLimit);
+        if(!GetModuleFileNameW(nullptr, binary, 32768))
+            return 60;
+        for(auto& target : targets)
+            if(!StartTarget(target, binary, mode, L"normal"))
+                return 61;
+        std::printf("QUOTA limit=%u old=%lu oldCreation=%llu next=%lu nextCreation=%llu controller=%lu controllerCreation=%llu\n", RetainedRequestLimit, targets[0].processId, CreationTime(targets[0].process.get(), false), targets[1].processId, CreationTime(targets[1].process.get(), false), GetCurrentProcessId(), CreationTime(GetCurrentProcess(), false));
+        std::fflush(stdout);
+        bool filled = false, oldReleased = false, nextRequested = false, nextReleased = false;
+        const auto deadline = GetTickCount64() + 20000;
+        while(GetTickCount64() < deadline)
+        {
+            DEBUG_EVENT event{};
+            if(!WaitForDebugEvent(&event, 1000))
+            {
+                if(GetLastError() == ERROR_SEM_TIMEOUT)
+                    continue;
+                return 62;
+            }
+            const auto role = event.dwProcessId == targets[0].processId ? 0u : event.dwProcessId == targets[1].processId ? 1u : 2u;
+            if(role == 2)
+                return 63;
+            auto& target = targets[role];
+            auto helper = std::find_if(helpers.begin(), helpers.end(), [&](const RetainedHelper& item) { return role == 0 && item.creation.threadId == event.dwThreadId; });
+            DWORD status = DBG_CONTINUE;
+            if(event.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT && event.u.LoadDll.hFile)
+            {
+                wchar_t path[32768]{};
+                if(GetFinalPathNameByHandleW(event.u.LoadDll.hFile, path, 32768, FILE_NAME_NORMALIZED))
+                {
+                    const auto length = std::wcslen(path);
+                    if(length >= 9 && _wcsicmp(path + length - 9, L"ntdll.dll") == 0)
+                        target.ntdllBase = reinterpret_cast<std::uintptr_t>(event.u.LoadDll.lpBaseOfDll);
+                }
+                CloseHandle(event.u.LoadDll.hFile);
+            }
+            if(event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT && event.u.CreateProcessInfo.hFile)
+                CloseHandle(event.u.CreateProcessInfo.hFile);
+            if(event.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT)
+            {
+                NativeBreakIn::BindThread(event.dwProcessId, event.dwThreadId, event.u.CreateThread);
+                if(helper != helpers.end())
+                {
+                    HANDLE duplicate = nullptr;
+                    if(helper->thread || helper->creation.start != event.u.CreateThread.lpStartAddress ||
+                            !DuplicateHandle(GetCurrentProcess(), event.u.CreateThread.hThread, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                        return 64;
+                    helper->thread.reset(duplicate);
+                    if(GetProcessIdOfThread(duplicate) != target.processId || CreationTime(duplicate, true) != helper->creation.creation)
+                        return 65;
+                    std::printf("QUOTA_HELPER index=%zu pid=%lu thread=%lu creation=%llu code=%p\n", std::size_t(helper - helpers.begin()), target.processId, event.dwThreadId, helper->creation.creation, helper->creation.start);
+                }
+                else if(role == 1 && nextRequested)
+                {
+                    MEMORY_BASIC_INFORMATION memory{};
+                    if(VirtualQueryEx(target.process.get(), event.u.CreateThread.lpStartAddress, &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT && memory.Type == MEM_PRIVATE && memory.Protect == PAGE_EXECUTE_READ && memory.AllocationBase == event.u.CreateThread.lpStartAddress)
+                    {
+                        HANDLE duplicate = nullptr;
+                        if(target.helper || !DuplicateHandle(GetCurrentProcess(), event.u.CreateThread.hThread, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                            return 66;
+                        target.helper.reset(duplicate);
+                        target.threadId = event.dwThreadId;
+                        target.remoteCode = event.u.CreateThread.lpStartAddress;
+                        std::printf("QUOTA_NEXT_HELPER pid=%lu thread=%lu creation=%llu code=%p\n", target.processId, target.threadId, CreationTime(duplicate, true), target.remoteCode);
+                    }
+                }
+            }
+            if(event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
+            {
+                if(event.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT)
+                {
+                    if(helper != helpers.end() || (role == 1 && target.helper && event.dwThreadId == target.threadId))
+                    {
+                        const auto consumed = NativeBreakIn::Consume(event.dwProcessId, event.dwThreadId, event.u.Exception);
+                        const auto repeated = NativeBreakIn::Consume(event.dwProcessId, event.dwThreadId, event.u.Exception);
+                        std::printf("QUOTA_CONSUME role=%u thread=%lu consumed=%u repeated=%u\n", role, event.dwThreadId, unsigned(consumed), unsigned(repeated));
+                        if(consumed != bool(role) || repeated)
+                            return 67;
+                        ++target.helperBreaks;
+                        if(role == 0)
+                        {
+                            ++helper->breaks;
+                            status = DBG_EXCEPTION_NOT_HANDLED;
+                        }
+                    }
+                    else
+                        ++target.breaks;
+                }
+                else
+                    status = DBG_EXCEPTION_NOT_HANDLED;
+            }
+            if(event.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT && (helper != helpers.end() || (role == 1 && target.helper && event.dwThreadId == target.threadId)))
+            {
+                if(role == 0)
+                    ++helper->exits;
+                ++target.exits;
+            }
+            if(event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT)
+            {
+                if(event.u.ExitProcess.dwExitCode != 7)
+                    return 68;
+                target.terminal = true;
+            }
+            std::fflush(stdout);
+            if(!ContinueDebugEvent(event.dwProcessId, event.dwThreadId, status))
+                return 69;
+            if(!filled && targets[0].breaks == 2 && targets[1].breaks == 2)
+            {
+                if(!FillQuota(targets, helpers))
+                    return 70;
+                filled = true;
+            }
+            if(!oldReleased && targets[0].exits == RetainedRequestLimit)
+            {
+                for(std::size_t index = 0; index < helpers.size(); ++index)
+                {
+                    auto& item = helpers[index];
+                    DWORD exit = STILL_ACTIVE;
+                    if(!item.thread || item.breaks != 1 || item.exits != 1 || WaitForSingleObject(item.thread.get(), 1000) != WAIT_OBJECT_0 || !GetExitCodeThread(item.thread.get(), &exit) || exit != 0)
+                        return 71;
+                    std::printf("QUOTA_THREAD_TERMINAL index=%zu pid=%lu thread=%lu exit=%lu\n", index, targets[0].processId, item.creation.threadId, exit);
+                }
+                const auto rejected = NativeBreakIn::Create(targets[1].ntdllBase);
+                if(rejected.created || rejected.error != ERROR_BUSY || FixtureNativeCreation::Capture().calls != RetainedRequestLimit || !VerifyQuotaPages(targets[0], helpers, "threads-completed"))
+                    return 72;
+                std::printf("QUOTA_STILL_FULL requests=%u error=%lu calls=%u\n", RetainedRequestLimit, rejected.error, FixtureNativeCreation::Capture().calls);
+                std::fflush(stdout);
+                oldReleased = SetEvent(targets[0].completion.get()) != FALSE;
+                if(!oldReleased)
+                    return 73;
+            }
+            if(targets[0].terminal && !nextRequested)
+            {
+                DWORD exit = STILL_ACTIVE;
+                if(WaitForSingleObject(targets[0].process.get(), 1000) != WAIT_OBJECT_0 || !GetExitCodeProcess(targets[0].process.get(), &exit) || exit != 7)
+                    return 74;
+                std::printf("QUOTA_OLD_TERMINAL pid=%lu exit=%lu helpers=%u\n", targets[0].processId, exit, targets[0].exits);
+                FixtureNativeCreation::Configure(FixtureNativeCreation::Mode::Normal);
+                NativeBreakIn::Result recovered{};
+                unsigned attempts = 0;
+                const auto recoveryDeadline = GetTickCount64() + 3000;
+                do
+                {
+                    recovered = NativeBreakIn::Create(targets[1].ntdllBase);
+                    ++attempts;
+                    if(recovered.created)
+                        break;
+                    if(recovered.error != ERROR_BUSY)
+                        return 75;
+                    Sleep(1);
+                }
+                while(GetTickCount64() < recoveryDeadline);
+                if(!recovered.created || recovered.status != 0 || recovered.error != 0)
+                    return 76;
+                std::printf("QUOTA_RECOVERY created=1 status=%08lx error=%lu attempts=%u oldTerminal=1\n", recovered.status, recovered.error, attempts);
+                std::fflush(stdout);
+                nextRequested = true;
+            }
+            if(nextRequested && !nextReleased && targets[1].exits == 1)
+            {
+                DWORD exit = STILL_ACTIVE;
+                if(WaitForSingleObject(targets[1].helper.get(), 1000) != WAIT_OBJECT_0 || !GetExitCodeThread(targets[1].helper.get(), &exit) || exit != 0 || !VerifyPages(targets[1], 1, true))
+                    return 77;
+                std::printf("QUOTA_NEXT_THREAD_TERMINAL pid=%lu thread=%lu exit=%lu\n", targets[1].processId, targets[1].threadId, exit);
+                std::fflush(stdout);
+                nextReleased = SetEvent(targets[1].completion.get()) != FALSE;
+                if(!nextReleased)
+                    return 78;
+            }
+            if(targets[0].terminal && targets[1].terminal)
+                break;
+        }
+        NativeBreakIn::EndTarget();
+        NativeBreakIn::Shutdown();
+        for(unsigned role = 0; role < targets.size(); ++role)
+        {
+            auto& target = targets[role];
+            DWORD exit = STILL_ACTIVE;
+            const auto count = role ? 1u : RetainedRequestLimit;
+            if(!target.terminal || target.breaks != 2 || target.helperBreaks != count || target.exits != count ||
+                    WaitForSingleObject(target.process.get(), 1000) != WAIT_OBJECT_0 || !GetExitCodeProcess(target.process.get(), &exit) || exit != 7)
+                return 79;
+            std::printf("QUOTA_TARGET_TERMINAL role=%u pid=%lu exit=%lu breaks=%u helperBreaks=%u helperExits=%u\n", role, target.processId, exit, target.breaks, target.helperBreaks, target.exits);
+        }
+        std::fflush(stdout);
+        return filled && oldReleased && nextRequested && nextReleased ? 0 : 80;
     }
 
     int RunReplacement(const wchar_t* mode, const wchar_t* kind, unsigned rounds)

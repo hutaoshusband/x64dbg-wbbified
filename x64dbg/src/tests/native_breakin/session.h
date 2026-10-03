@@ -6,4 +6,5 @@ namespace BreakInSessions
 
     int RunReplacement(const wchar_t* mode, const wchar_t* kind, unsigned rounds);
     int RunInFlight(const wchar_t* mode, const wchar_t* phase, const wchar_t* action);
+    int RunQuota(const wchar_t* mode);
 }

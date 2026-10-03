@@ -318,6 +318,91 @@ def check_inflight_receipt(receipt, architecture, mode, phase, action):
     return {"target": header, "worker": worker, "helper": helper, "gate": gate, "retentions": [sample for index, sample in retentions], "retainedThroughProcessLifetime": retained}
 
 
+def check_quota_receipt(receipt, architecture, mode):
+    assert architecture in ("x64", "x32") and mode in ("show", "hide", "both")
+    assert receipt["exitCode"] == 0 and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"]
+    lines = receipt["stdout"].splitlines()
+    header = one_line(lines, "QUOTA limit=")
+    assert set(header) == {"limit", "old", "oldCreation", "next", "nextCreation", "controller", "controllerCreation"} and header["limit"] == "64"
+    assert header["controller"] == str(receipt["processIdentity"]["pid"])
+    assert header["controllerCreation"] == receipt["processIdentity"]["creationTime"]
+    for role in ("old", "next"):
+        assert int(header[role]) > 0 and header[role] != str(receipt["processIdentity"]["pid"]) and int(header[role + "Creation"]) >= int(header["controllerCreation"])
+    assert header["old"] != header["next"]
+    identities = [fields(line) for line in lines if line.startswith("IDENTITY ")]
+    assert len(identities) == 2 and all(set(item) == {"role", "pid", "creation"} and item["role"] == "target" for item in identities)
+    assert {(item["pid"], item["creation"]) for item in identities} == {(header[role], header[role + "Creation"]) for role in ("old", "next")}
+    creators = [fields(line) for line in lines if line.startswith("CREATOR ")]
+    assert len(creators) == 64
+    for index, creator in enumerate(creators):
+        assert creator == {"nativeStatus": "00000000", "returnedStatus": "c0000022", "error": "5", "requestedAccess": "001fffff", "actualAccess": "001fffff", "flags": "2", "pid": header["old"], "thread": creator["thread"], "creation": creator["creation"], "start": creator["start"], "nativeCreated": "1", "handleClosed": "1", "calls": str(index + 1)}
+        assert int(creator["thread"]) > 0 and int(creator["creation"]) > int(header["oldCreation"]) and int(creator["start"], 16) > 0 and int(creator["start"], 16) % 4096 == 0
+    assert len({item["thread"] for item in creators}) == len({item["start"] for item in creators}) == 64
+    helper_lines = [fields(line) for line in lines if line.startswith("QUOTA_HELPER ")]
+    terminal_lines = [fields(line) for line in lines if line.startswith("QUOTA_THREAD_TERMINAL ")]
+    consumes = [fields(line) for line in lines if line.startswith("QUOTA_CONSUME ")]
+    assert len(helper_lines) == len(terminal_lines) == 64 and len(consumes) == 65
+    assert {item["index"] for item in helper_lines} == {item["index"] for item in terminal_lines} == {str(index) for index in range(64)}
+    old_consumes = [item for item in consumes if item["role"] == "0"]
+    assert len(old_consumes) == 64 and {item["thread"] for item in old_consumes} == {item["thread"] for item in creators}
+    for index, creator in enumerate(creators):
+        helper = next(item for item in helper_lines if item["index"] == str(index))
+        terminal = next(item for item in terminal_lines if item["index"] == str(index))
+        consume = next(item for item in old_consumes if item["thread"] == creator["thread"])
+        assert helper == {"index": str(index), "pid": header["old"], "thread": creator["thread"], "creation": creator["creation"], "code": creator["start"]}
+        assert terminal == {"index": str(index), "pid": header["old"], "thread": creator["thread"], "exit": "0"}
+        assert consume == {"role": "0", "thread": creator["thread"], "consumed": "0", "repeated": "0"}
+    rejections = [fields(line) for line in lines if line.startswith("QUOTA_REJECT ")]
+    assert rejections == [{"attempt": str(index), "created": "0", "status": "00000000", "error": "170", "calls": "64", "unchanged": "1"} for index in range(4)]
+    snapshots = [fields(line) for line in lines if line.startswith("QUOTA_NO_EFFECT ")]
+    assert len(snapshots) == 2
+    for role, snapshot in enumerate(snapshots):
+        assert set(snapshot) == {"role", "pid", "threads", "regions", "addressEnd", "sameThreads", "sameMemory"}
+        assert snapshot["role"] == str(role) and snapshot["pid"] == header["next" if role else "old"] and snapshot["sameThreads"] == snapshot["sameMemory"] == "1"
+        assert int(snapshot["threads"]) >= (1 if role else 65) and int(snapshot["regions"]) > 0
+        assert 0 < int(snapshot["addressEnd"], 16) <= (0x100000000 if architecture == "x32" else 0x800000000000)
+        if architecture == "x64":
+            assert int(snapshot["addressEnd"], 16) > 0x100000000
+        if role == 0:
+            assert int(snapshot["addressEnd"], 16) >= max(int(item["start"], 16) + 8192 for item in creators)
+    retentions = [fields(line) for line in lines if line.startswith("QUOTA_RETAIN ")]
+    assert len(retentions) == 2
+    for phase, retention in zip(("full", "threads-completed"), retentions):
+        assert set(retention) == {"phase", "pid", "requests", "alive", "executable", "data", "unchanged", "bytes", "samples", "elapsed"}
+        assert {key: retention[key] for key in ("phase", "pid", "requests", "alive", "executable", "data", "unchanged", "bytes")} == {"phase": phase, "pid": header["old"], "requests": "64", "alive": "1", "executable": "00000020", "data": "00000004", "unchanged": "1", "bytes": "4096"}
+        assert int(retention["samples"]) > 0 and 250 <= int(retention["elapsed"]) < 10000
+    assert one_line(lines, "QUOTA_STILL_FULL ") == {"requests": "64", "error": "170", "calls": "64"}
+    assert one_line(lines, "QUOTA_OLD_TERMINAL ") == {"pid": header["old"], "exit": "7", "helpers": "64"}
+    recovery = one_line(lines, "QUOTA_RECOVERY ")
+    assert set(recovery) == {"created", "status", "error", "attempts", "oldTerminal"} and {key: recovery[key] for key in ("created", "status", "error", "oldTerminal")} == {"created": "1", "status": "00000000", "error": "0", "oldTerminal": "1"}
+    assert 1 <= int(recovery["attempts"]) <= 10000
+    next_helper = one_line(lines, "QUOTA_NEXT_HELPER ")
+    assert set(next_helper) == {"pid", "thread", "creation", "code"} and next_helper["pid"] == header["next"]
+    assert int(next_helper["thread"]) > 0 and int(next_helper["creation"]) > int(header["nextCreation"]) and int(next_helper["code"], 16) > 0
+    assert int(snapshots[1]["addressEnd"], 16) >= int(next_helper["code"], 16) + 8192
+    assert next(item for item in consumes if item["role"] == "1") == {"role": "1", "thread": next_helper["thread"], "consumed": "1", "repeated": "0"}
+    assert one_line(lines, "SESSION_PAGE ") == {"role": "1", "pid": header["next"], "code": next_helper["code"], "freed": "1", "state": "00010000"}
+    assert one_line(lines, "QUOTA_NEXT_THREAD_TERMINAL ") == {"pid": header["next"], "thread": next_helper["thread"], "exit": "0"}
+    terminals = [fields(line) for line in lines if line.startswith("QUOTA_TARGET_TERMINAL ")]
+    assert terminals == [{"role": str(role), "pid": header["next" if role else "old"], "exit": "7", "breaks": "2", "helperBreaks": "1" if role else "64", "helperExits": "1" if role else "64"} for role in range(2)]
+    finals = [fields(line) for line in lines if line.startswith("TARGET final_peb=")]
+    assert len(finals) == 2 and all(item == {"final_peb": str(int(mode == "show")), "final_port": "1", "detached": "0", "port_read": "1"} for item in finals)
+    if architecture == "x32":
+        pebs = [fields(line) for line in lines if line.startswith("NATIVE_PEB ")]
+        assert len(pebs) == 2 and all(set(item) == {"address", "original", "observed"} and int(item["address"], 16) > 0 and item["original"] == "1" and item["observed"] == str(int(mode != "both")) for item in pebs)
+    def positions(prefix):
+        return [index for index, line in enumerate(lines) if line.startswith(prefix)]
+    assert max(positions("CREATOR ")) < positions("QUOTA_RETAIN phase=full ")[0] < min(positions("QUOTA_REJECT ")) <= max(positions("QUOTA_REJECT ")) < min(positions("QUOTA_NO_EFFECT ")) <= max(positions("QUOTA_NO_EFFECT ")) < min(positions("QUOTA_HELPER "))
+    for index, creator in enumerate(creators):
+        helper_position = next(position for position in positions("QUOTA_HELPER ") if fields(lines[position])["index"] == str(index))
+        consume_position = next(position for position in positions("QUOTA_CONSUME role=0 ") if fields(lines[position])["thread"] == creator["thread"])
+        assert helper_position < consume_position < min(positions("QUOTA_THREAD_TERMINAL "))
+    canaries = positions("TARGET breakpoint_returned=")
+    assert len(canaries) == 2 and all(fields(lines[index]) == {"breakpoint_returned": "1"} for index in canaries)
+    assert max(positions("QUOTA_THREAD_TERMINAL ")) < positions("QUOTA_RETAIN phase=threads-completed ")[0] < positions("QUOTA_STILL_FULL ")[0] < canaries[0] < positions("QUOTA_OLD_TERMINAL ")[0] < positions("QUOTA_RECOVERY ")[0] < positions("QUOTA_NEXT_HELPER ")[0] < positions("QUOTA_CONSUME role=1 ")[0] < positions("SESSION_PAGE ")[0] < positions("QUOTA_NEXT_THREAD_TERMINAL ")[0] < canaries[1] < min(positions("QUOTA_TARGET_TERMINAL "))
+    return {"targets": header, "helpers": helper_lines, "snapshots": snapshots, "retentions": retentions, "recovery": recovery, "nextHelper": next_helper}
+
+
 def run_breakin_oracles(environment, results, fixture_identity, run_owned):
     binary, identity, machine = fixture_identity(environment, "native_breakin")
     observations = []
@@ -352,6 +437,14 @@ def run_breakin_oracles(environment, results, fixture_identity, run_owned):
                 observed = check_inflight_receipt(receipt, environment.architecture, mode, phase, action)
                 assert file_identity(binary) == identity, "Native in-flight fixture changed"
                 inflight.append({"mode": mode, "phase": phase, "action": action, "receipt": file_identity(path), "observed": observed})
+    quotas = []
+    for mode in ("show", "hide", "both"):
+        receipt = run_owned([str(binary), mode, "quota"], os.environ, 35)
+        path = environment.root / f"breakin-quota-{mode}.json"
+        write_json(path, receipt)
+        observed = check_quota_receipt(receipt, environment.architecture, mode)
+        assert file_identity(binary) == identity, "Native quota fixture changed"
+        quotas.append({"mode": mode, "receipt": file_identity(path), "observed": observed})
     results.append({"name": "test_native_breakin_oracles", "status": "verified", "oracle": {
-        "binary": identity, "machine": machine, "observations": observations, "replacements": replacements, "inflight": inflight, "debuggerUsed": "owned Windows native controller"}})
-    print(f"[VERIFIED] Native {environment.architecture} hidden/unhidden break-in, identity rejection, detach, thread exit, page release, failed-handler retention, late-thread binding, actual reduced-access creation, repeated replacement and held in-flight creation retirement/shutdown", flush=True)
+        "binary": identity, "machine": machine, "observations": observations, "replacements": replacements, "inflight": inflight, "quotas": quotas, "debuggerUsed": "owned Windows native controller"}})
+    print(f"[VERIFIED] Native {environment.architecture} hidden/unhidden break-in, identity rejection, detach, thread exit, page release, failed-handler retention, late-thread binding, actual reduced-access creation, repeated replacement, held in-flight retirement/shutdown and retained-request quota recovery", flush=True)

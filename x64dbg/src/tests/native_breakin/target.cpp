@@ -267,6 +267,8 @@ static bool VerifyFailureShutdown(HANDLE process, void* code, std::uintptr_t pro
 
 int wmain(int argc, wchar_t** argv)
 {
+    if(argc > 2 && std::wcscmp(argv[2], L"quota") == 0)
+        return argc == 3 ? BreakInSessions::RunQuota(argv[1]) : 27;
     if(argc > 2 && std::wcscmp(argv[2], L"inflight") == 0)
         return argc == 5 ? BreakInSessions::RunInFlight(argv[1], argv[3], argv[4]) : 27;
     if(argc > 2 && std::wcscmp(argv[2], L"replacement") == 0)
