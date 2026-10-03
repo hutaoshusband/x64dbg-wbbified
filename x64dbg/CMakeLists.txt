@@ -1396,6 +1396,8 @@ if(X64DBG_BUILD_MCP) # mcp
 	set(mcp_contract_fixture_SOURCES
 		cmake.toml
 		"src/mcp/testing/contracts.cpp"
+		"src/mcp/testing/library_reference.cpp"
+		"src/mcp/testing/library_reference.h"
 	)
 
 	add_executable(mcp_contract_fixture)

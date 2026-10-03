@@ -19,7 +19,7 @@ from pe_patch_checks import check_pe_file_patch_plans, check_new_file_publicatio
 
 CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_context_roundtrip",
               "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser", "test_legacy_alias_contracts", "test_native_parity_catalog", "test_pe_file_patch_plans",
-              "test_new_file_publication", "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
+              "test_new_file_publication", "test_native_library_fault_oracles", "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
               "test_provider_ui_contracts", "test_library_script_contracts", "test_job_event_artifact_contracts", "test_native_launch_arguments", "test_native_component_builds", "test_ipc_wire_codec")
@@ -2131,6 +2131,9 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_provider_ui_contracts(probe, registry, tool_validators))
             elif name == "test_library_script_contracts":
                 result.update(check_library_script_contracts(probe, registry, tool_validators))
+            elif name == "test_native_library_fault_oracles":
+                from library_checks import check_library_oracles
+                result.update(check_library_oracles(probe, architecture, parent_token_oracle, file_handle_oracle))
             elif name == "test_job_event_artifact_contracts":
                 result.update(check_job_event_artifact_contracts(probe, registry, tool_validators))
             elif name == "test_native_launch_arguments":
