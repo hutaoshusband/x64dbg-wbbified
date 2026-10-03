@@ -13,7 +13,7 @@ import subprocess
 import time
 from types import SimpleNamespace
 
-from wi_driver import KERNEL, McpError, OwnedJob, ROOT, compiler_environment, file_identity, process_identity, write_json
+from wi_driver import KERNEL, McpError, OwnedJob, ROOT, compiler_environment, file_identity, process_identity, resolve_build_toolchain, write_json
 from pe_patch_checks import check_pe_file_patch_plans, check_new_file_publication
 
 
@@ -58,23 +58,7 @@ def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None, 
     build = Path(output) / f"build-{architecture}"
     build.mkdir()
     source = ROOT / "x64dbg"
-    environment = compiler_environment(architecture, msvc_toolset)
-    executable_path = next(value for key, value in environment.items() if key.lower() == "path")
-    cmake_path = shutil.which(str(cmake) if cmake else "cmake", path=executable_path)
-    compiler_path = shutil.which("cl.exe", path=executable_path)
-    if not cmake_path or not compiler_path:
-        raise McpError("Contract builds require resolved CMake and MSVC executables")
-    cmake_path = Path(cmake_path).resolve()
-    compiler_path = Path(compiler_path).resolve()
-    version = subprocess.run([str(cmake_path), "--version"], env=environment, capture_output=True, text=True, timeout=10,
-                             creationflags=subprocess.CREATE_NO_WINDOW)
-    toolchain = {"cmake": file_identity(cmake_path), "compiler": file_identity(compiler_path),
-                 "cmakeVersion": version.stdout.strip(), "versionExitCode": version.returncode, "versionStderr": version.stderr,
-                 "requestedMsvcToolset": msvc_toolset, "requestedUnityBuild": unity_build,
-                 "msvcToolset": next((value.rstrip("\\/") for key, value in environment.items() if key.lower() == "vctoolsversion"), None)}
-    write_json(build / "toolchain.json", toolchain)
-    if version.returncode or not version.stdout.startswith("cmake version "):
-        raise McpError("Selected CMake executable did not report a successful version")
+    environment, cmake_path, compiler_path, toolchain = resolve_build_toolchain(build, architecture, cmake, msvc_toolset, unity_build)
     qt = source / ("build64" if architecture == "x64" else "build32") / "_deps/qt5-src/lib/cmake/Qt5"
     configure = [str(cmake_path), "-S", str(source), "-B", str(build), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
                  "-DX64DBG_BUILD_IN_TREE=OFF", "-DX64DBG_BUILD_MCP=ON", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "-DCMKR_SKIP_GENERATION=ON",

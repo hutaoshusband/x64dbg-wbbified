@@ -312,8 +312,8 @@ def parse_arguments():
                         help="Observe shipped legacy or source-built native GUI surface")
     parser.add_argument("--refresh-registries", action="store_true", help="Update the source parity candidate registry")
     parser.add_argument("--engine", choices=("TitanEngine", "GleeBug", "StaticEngine", "all"), default="TitanEngine")
-    parser.add_argument("--cmake", type=Path, help="CMake executable for the mcp-contracts source build")
-    parser.add_argument("--msvc-toolset", help="Exact installed MSVC toolset version for the mcp-contracts source build")
+    parser.add_argument("--cmake", type=Path, help="CMake executable for the native or mcp-contracts source build")
+    parser.add_argument("--msvc-toolset", help="Exact installed MSVC toolset version for the native or mcp-contracts source build")
     parser.add_argument("--unity-build", action="store_true", help="Enable global CMake unity compilation for the mcp-contracts source build")
     arguments = parser.parse_args()
     if not 1 <= arguments.timeout <= 60:
@@ -327,14 +327,14 @@ def parse_arguments():
     if arguments.surface_provider == "native" and arguments.phase != "surface":
         parser.error("--surface-provider native requires --phase surface")
     if arguments.cmake:
-        if arguments.phase != "mcp-contracts":
-            parser.error("--cmake requires --phase mcp-contracts")
+        if arguments.phase not in ("build", "mcp-contracts"):
+            parser.error("--cmake requires --phase build or mcp-contracts")
         arguments.cmake = arguments.cmake.expanduser().resolve()
         if not arguments.cmake.is_file():
             parser.error("--cmake must identify an existing executable file")
     if arguments.msvc_toolset:
-        if arguments.phase != "mcp-contracts":
-            parser.error("--msvc-toolset requires --phase mcp-contracts")
+        if arguments.phase not in ("build", "mcp-contracts"):
+            parser.error("--msvc-toolset requires --phase build or mcp-contracts")
         if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", arguments.msvc_toolset):
             parser.error("--msvc-toolset must be an exact numeric version")
     if arguments.unity_build and arguments.phase != "mcp-contracts":
@@ -470,7 +470,7 @@ def main():
     if arguments.phase == "build":
         architectures = ("x64", "x32") if arguments.arch == "all" else (arguments.arch,)
         for architecture in architectures:
-            build_debugger(run_root, architecture)
+            build_debugger(run_root, architecture, arguments.cmake, arguments.msvc_toolset)
         return 0
     if arguments.phase == "mcp-contracts":
         from native_contracts import build_contract_fixture, run_contract_checks

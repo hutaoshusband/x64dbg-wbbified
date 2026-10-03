@@ -260,35 +260,69 @@ def build_targets(environment):
     write_json(environment.root / "fixture-build.json", logs)
 
 
-def build_debugger(output, architecture):
+def resolve_build_toolchain(build, architecture, cmake=None, msvc_toolset=None, unity_build=False):
+    environment = compiler_environment(architecture, msvc_toolset)
+    executable_path = next(value for key, value in environment.items() if key.lower() == "path")
+    cmake_path = shutil.which(str(cmake) if cmake else "cmake", path=executable_path)
+    compiler_path = shutil.which("cl.exe", path=executable_path)
+    if not cmake_path or not compiler_path:
+        raise McpError("Native builds require resolved CMake and MSVC executables")
+    cmake_path = Path(cmake_path).resolve()
+    compiler_path = Path(compiler_path).resolve()
+    version = subprocess.run([str(cmake_path), "--version"], env=environment, capture_output=True, text=True, timeout=10,
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+    toolchain = {"cmake": file_identity(cmake_path), "compiler": file_identity(compiler_path),
+                 "cmakeVersion": version.stdout.strip(), "versionExitCode": version.returncode, "versionStderr": version.stderr,
+                 "requestedMsvcToolset": msvc_toolset, "requestedUnityBuild": unity_build,
+                 "msvcToolset": next((value.rstrip("\\/") for key, value in environment.items() if key.lower() == "vctoolsversion"), None)}
+    write_json(Path(build) / "toolchain.json", toolchain)
+    if version.returncode or not version.stdout.startswith("cmake version "):
+        raise McpError("Selected CMake executable did not report a successful version")
+    return environment, cmake_path, compiler_path, toolchain
+
+
+def build_debugger(output, architecture, cmake=None, msvc_toolset=None):
     source = ROOT / "x64dbg"
     build = Path(output) / f"build-{architecture}"
     build.mkdir()
     qt_build = "build64" if architecture == "x64" else "build32"
     qt = source / qt_build / "_deps" / "qt5-src" / "lib" / "cmake" / "Qt5"
-    environment = compiler_environment(architecture)
-    configure = ["cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
-                 "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_UNITY_BUILD=ON", "-DCMAKE_UNITY_BUILD_BATCH_SIZE=6"]
+    environment, cmake_path, compiler_path, toolchain = resolve_build_toolchain(build, architecture, cmake, msvc_toolset, True)
+    configure = [str(cmake_path), "-S", str(source), "-B", str(build), "-G", "Ninja",
+                 "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_UNITY_BUILD=ON", "-DCMAKE_UNITY_BUILD_BATCH_SIZE=6",
+                 "-DCMKR_SKIP_GENERATION=ON", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                 f"-DCMAKE_C_COMPILER={compiler_path.as_posix()}", f"-DCMAKE_CXX_COMPILER={compiler_path.as_posix()}"]
     if qt.is_dir():
         configure.append(f"-DQt5_DIR={qt}")
-    commands = [configure, ["cmake", "--build", str(build), "--target", "exe", "headless", "x64dbg_tests", "--parallel", "6"]]
+    commands = [configure, [str(cmake_path), "--build", str(build), "--target", "exe", "headless", "x64dbg_tests",
+                            "mcp_broker", "mcp_connect", "mcp_worker", "mcp_contract_fixture", "mcp_launch_reference", "--parallel", "6"]]
+    inputs = subprocess.check_output(["git", "ls-files", "-z", "x64dbg"], cwd=ROOT).decode("utf-8").split("\0")
+    source_inputs = [file_identity(ROOT / path) for path in inputs if path and (ROOT / path).is_file()]
+    source_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    source_status = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)
     results = []
     with (build / "build.log").open("w", encoding="utf-8") as log:
         for command in commands:
             print(f"Building native {architecture}: {command[1]}", flush=True)
-            process = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
+            process = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
             log.flush()
             results.append({"command": command, "exitCode": process.returncode})
             write_json(build / "commands.json", results)
             if process.returncode:
                 raise McpError(f"Native build failed: {(build / 'build.log').read_text(encoding='utf-8')[-8000:]}")
     artifacts = source / "bin" / architecture
-    inputs = subprocess.check_output(["git", "ls-files", "x64dbg"], cwd=ROOT, text=True).splitlines()
-    manifest = {"architecture": architecture, "sourceHead": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-                "sourceInputs": [file_identity(ROOT / path) for path in inputs if Path(path).suffix in (".cpp", ".c", ".h", ".asm", ".toml", ".cmake", ".txt", ".rc", ".xml")],
-                "buildInputs": file_identity(build / "CMakeCache.txt"), "commands": results,
+    for entry in source_inputs:
+        if file_identity(entry["path"]) != entry:
+            raise McpError("Native build source changed during compilation")
+    for key in ("cmake", "compiler"):
+        if file_identity(toolchain[key]["path"]) != toolchain[key]:
+            raise McpError("Native build tool changed during compilation")
+    manifest = {"architecture": architecture, "sourceHead": source_head, "sourceStatus": source_status, "sourceInputs": source_inputs,
+                "buildInputs": file_identity(build / "CMakeCache.txt"), "commands": results, "toolchain": toolchain,
+                "compileCommands": json.loads((build / "compile_commands.json").read_text(encoding="utf-8")),
+                "privateArtifacts": [file_identity(path) for path in sorted(build.glob("*.exe"))],
                 "artifacts": [file_identity(path) for path in sorted(artifacts.rglob("*"))
-                              if path.is_file() and path.suffix.lower() in (".exe", ".dll", ".dp64", ".dp32")]}
+                              if path.is_file() and path.suffix.lower() in (".exe", ".dll", ".dp64", ".dp32", ".lib")]}
     write_json(build / "build-manifest.json", manifest)
     print(f"[VERIFIED] Native {architecture} release build: {build}", flush=True)
     return manifest
