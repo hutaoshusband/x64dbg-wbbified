@@ -191,7 +191,8 @@ namespace GleeBug
         if(breakpointDeleted)
         {
             mThread->isInternalStepping = false;
-            Registers(mThread->hThread, CONTEXT_CONTROL).TrapFlag = false;
+            if(!mThread->isSingleStepping)
+                Registers(mThread->hThread, CONTEXT_CONTROL).TrapFlag = false;
         }
 
         //delete the breakpoint if it is singleshoot

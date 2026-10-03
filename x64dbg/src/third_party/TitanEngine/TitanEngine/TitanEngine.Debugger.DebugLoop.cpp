@@ -34,6 +34,20 @@ static void ClearTrapFlagFromStack()
     }
 }
 
+struct PendingStepLock
+{
+    PendingStepLock() { EnterCriticalSection(&engineStepActiveCr); }
+    ~PendingStepLock() { LeaveCriticalSection(&engineStepActiveCr); }
+    PendingStepLock(const PendingStepLock&) = delete;
+    PendingStepLock& operator=(const PendingStepLock&) = delete;
+};
+
+static bool HasPendingUserStep(DWORD threadId)
+{
+    PendingStepLock lock;
+    return engineStepThreads.find(threadId) != engineStepThreads.end();
+}
+
 static void engineStep()
 {
     EnterCriticalSection(&engineStepActiveCr);
@@ -821,6 +835,7 @@ __declspec(dllexport) void TITCALL DebugLoop()
                 else //no resetting needed (debugger reached hardware breakpoint or the user stepped)
                 {
                     //handle hardware breakpoints
+                    bool hardwareHandled = false;
                     hActiveThread = EngineOpenThread(THREAD_GETSETSUSPEND, false, DBGEvent.dwThreadId);
                     CONTEXT myDBGContext;
                     myDBGContext.ContextFlags = CONTEXT_DEBUG_REGISTERS | ContextControlFlags;
@@ -835,6 +850,7 @@ __declspec(dllexport) void TITCALL DebugLoop()
                                 synchronizedStep = true;
                                 SetThreadContext(hActiveThread, &myDBGContext);
                             }
+                            hardwareHandled = true;
                             myCustomHandler = (fCustomHandler)(DebugRegister[0].DrxCallBack);
                             myCustomHandler((void*)myDBGContext.Dr0);
                             if(DebugRegister[0].DrxEnabled)
@@ -846,10 +862,13 @@ __declspec(dllexport) void TITCALL DebugLoop()
                             }
                             else
                             {
-                                GetThreadContext(hActiveThread, &myDBGContext);
-                                myDBGContext.EFlags &= ~UE_TRAP_FLAG;
-                                SetThreadContext(hActiveThread, &myDBGContext);
-                                synchronizedStep = false;
+                                if(!HasPendingUserStep(DBGEvent.dwThreadId))
+                                {
+                                    GetThreadContext(hActiveThread, &myDBGContext);
+                                    myDBGContext.EFlags &= ~UE_TRAP_FLAG;
+                                    SetThreadContext(hActiveThread, &myDBGContext);
+                                    synchronizedStep = false;
+                                }
                             }
                         }
                         else
@@ -867,6 +886,7 @@ __declspec(dllexport) void TITCALL DebugLoop()
                                 synchronizedStep = true;
                                 SetThreadContext(hActiveThread, &myDBGContext);
                             }
+                            hardwareHandled = true;
                             myCustomHandler = (fCustomHandler)(DebugRegister[1].DrxCallBack);
                             myCustomHandler((void*)myDBGContext.Dr1);
                             if(DebugRegister[1].DrxEnabled)
@@ -878,10 +898,13 @@ __declspec(dllexport) void TITCALL DebugLoop()
                             }
                             else
                             {
-                                GetThreadContext(hActiveThread, &myDBGContext);
-                                myDBGContext.EFlags &= ~UE_TRAP_FLAG;
-                                SetThreadContext(hActiveThread, &myDBGContext);
-                                synchronizedStep = false;
+                                if(!HasPendingUserStep(DBGEvent.dwThreadId))
+                                {
+                                    GetThreadContext(hActiveThread, &myDBGContext);
+                                    myDBGContext.EFlags &= ~UE_TRAP_FLAG;
+                                    SetThreadContext(hActiveThread, &myDBGContext);
+                                    synchronizedStep = false;
+                                }
                             }
                         }
                         else
@@ -899,6 +922,7 @@ __declspec(dllexport) void TITCALL DebugLoop()
                                 synchronizedStep = true;
                                 SetThreadContext(hActiveThread, &myDBGContext);
                             }
+                            hardwareHandled = true;
                             myCustomHandler = (fCustomHandler)(DebugRegister[2].DrxCallBack);
                             myCustomHandler((void*)myDBGContext.Dr2);
                             if(DebugRegister[2].DrxEnabled)
@@ -910,10 +934,13 @@ __declspec(dllexport) void TITCALL DebugLoop()
                             }
                             else
                             {
-                                GetThreadContext(hActiveThread, &myDBGContext);
-                                myDBGContext.EFlags &= ~UE_TRAP_FLAG;
-                                SetThreadContext(hActiveThread, &myDBGContext);
-                                synchronizedStep = false;
+                                if(!HasPendingUserStep(DBGEvent.dwThreadId))
+                                {
+                                    GetThreadContext(hActiveThread, &myDBGContext);
+                                    myDBGContext.EFlags &= ~UE_TRAP_FLAG;
+                                    SetThreadContext(hActiveThread, &myDBGContext);
+                                    synchronizedStep = false;
+                                }
                             }
                         }
                         else
@@ -931,6 +958,7 @@ __declspec(dllexport) void TITCALL DebugLoop()
                                 synchronizedStep = true;
                                 SetThreadContext(hActiveThread, &myDBGContext);
                             }
+                            hardwareHandled = true;
                             myCustomHandler = (fCustomHandler)(DebugRegister[3].DrxCallBack);
                             myCustomHandler((void*)myDBGContext.Dr3);
                             if(DebugRegister[3].DrxEnabled)
@@ -942,10 +970,13 @@ __declspec(dllexport) void TITCALL DebugLoop()
                             }
                             else
                             {
-                                GetThreadContext(hActiveThread, &myDBGContext);
-                                myDBGContext.EFlags &= ~UE_TRAP_FLAG;
-                                SetThreadContext(hActiveThread, &myDBGContext);
-                                synchronizedStep = false;
+                                if(!HasPendingUserStep(DBGEvent.dwThreadId))
+                                {
+                                    GetThreadContext(hActiveThread, &myDBGContext);
+                                    myDBGContext.EFlags &= ~UE_TRAP_FLAG;
+                                    SetThreadContext(hActiveThread, &myDBGContext);
+                                    synchronizedStep = false;
+                                }
                             }
                         }
                         else
@@ -967,7 +998,7 @@ __declspec(dllexport) void TITCALL DebugLoop()
                         if(strstr(DisassembledString, "PUSHF"))
                             PushfBPX = true;
                     }
-                    if(!ResetHwBPX)
+                    if(!ResetHwBPX && !hardwareHandled)
                         engineStep();
                 }
                 if(DBGCode == DBG_EXCEPTION_NOT_HANDLED) //NOTE: only call the chSingleStep callback when the debuggee generated the exception

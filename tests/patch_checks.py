@@ -69,9 +69,11 @@ def check_patch_output(receipt, facts, mode, value=7):
     return observed
 
 
-def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine", file_exports=False):
+def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine", file_exports=False, single_shot=False, hardware_slot=0):
     assert kind in ("software", "hardware", "memory") and engine in ("TitanEngine", "GleeBug"), "Unknown patch reference variant"
     assert not file_exports or kind == "software", "File reference requires its declared software breakpoint"
+    assert not single_shot or kind == "hardware", "Single-shot reference requires its declared hardware breakpoint"
+    assert hardware_slot in range(4), "Unknown independently requested hardware slot"
     output = receipt["stdout"]
     finals = re.findall(r"\[wi-test\] FINAL status=(pass|fail) asserts=(\d+)(?: reason=(\w+))?", output)
     assert len(finals) == 1 and finals[0][0] == "pass" and 150 <= int(finals[0][1]) < 1000 and receipt["exitCode"] == 0 and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"], "Native patch reference did not complete"
@@ -92,13 +94,15 @@ def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine",
     expected_hits = [0, 1, 1, 1, 1, 1, 2, 2, 3] if kind != "memory" else [0, 1, 1, 1, 1, 1, 1, 2, 2, 3]
     if file_exports:
         expected_hits = [0] + [1] * 23 + [2, 2, 3]
-    assert len(breakpoints) == len(snapshots) and [int(item[6]) for item in breakpoints] == expected_hits, "Breakpoint metadata omits its exact stop sequence"
+    if single_shot:
+        expected_hits = [0]
+    assert len(breakpoints) == (1 if single_shot else len(snapshots)) and [int(item[6]) for item in breakpoints] == expected_hits, "Breakpoint metadata omits its exact stop sequence"
     protection = 2 if kind == "memory" else 0x20
     for observed_type, location, extended, enabled, active, singleshoot, _, actual, original in breakpoints:
         assert int(observed_type) == breakpoint_type and int(location, 16) == address and int(extended) == (2 if kind == "hardware" else 3 if kind == "memory" else 0), "Selected breakpoint type or exact execute range differs"
-        assert (enabled, active, singleshoot) == ("1", "1", "0") and int(actual, 16) == protection and int(original, 16) == 0x20, "Patch write or restore loses actual breakpoint protection"
+        assert (enabled, active, singleshoot) == ("1", "1", str(int(single_shot))) and int(actual, 16) == protection and int(original, 16) == 0x20, "Patch write or restore loses actual breakpoint protection"
     hardware = re.findall(r"PATCH_HARDWARE slot=(\d+) address=([0-9a-f]+) dr7=([0-9a-f]+)", output)
-    assert len(hardware) == (len(snapshots) if kind == "hardware" else 0), "Hardware reference omits or invents actual OS debug-register observations"
+    assert len(hardware) == (1 if single_shot else len(snapshots) if kind == "hardware" else 0), "Hardware reference omits or invents actual OS debug-register observations"
     for slot, location, dr7 in hardware:
         slot, dr7 = int(slot), int(dr7, 16)
         assert 0 <= slot < 4 and int(location, 16) == address and dr7 & (3 << (slot * 2)) and ((dr7 >> (16 + slot * 4)) & 15) == 0, "Hardware slot has the wrong address, enable or access/size bits"
@@ -108,6 +112,44 @@ def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine",
     for index, (entry, expected_ip, expected_ax, expected_hit) in enumerate(zip(steps, step_ips, [7, 7, 42, 42, 42, 7, 7], [1, 1, 2, 2, 2, 3, 3])):
         sequence, hit, native_ip, native_ax, read, os_ip, os_ax, _, _, _ = entry
         assert int(sequence) == index and int(hit) == expected_hit and read == "1" and int(native_ip, 16) == int(os_ip, 16) == expected_ip and int(native_ax, 16) == int(os_ax, 16) == expected_ax, "Native or independent OS context reports a step before its actual instruction outcome"
+    arms = re.findall(r"PATCH_ARM index=(\d+) address=([0-9a-f]+) slot=(\d+) dr7=([0-9a-f]+) pid=(\d+) thread=(\d+) creation=(\d+) singleshoot=([01]) hits=(\d+)", output)
+    single_states = re.findall(r"PATCH_SINGLESHOT address=([0-9a-f]+) slot=(\d+) actualSlot=([0-9a-f]+) dr7=([0-9a-f]+) present=([01]) armed=([01]) hits=(\d+) arms=(\d+)", output)
+    single_steps = re.findall(r"PATCH_SINGLESTEP index=(\d+) present=([01]) dr7=([0-9a-f]+)", output)
+    if single_shot:
+        assert len(arms) == 3 and len(single_states) == 12 and len(single_steps) == 7, "Single-shot rearming, removal or actual CPU-step evidence is missing"
+        arm_slots = []
+        for index, arm in enumerate(arms):
+            sequence, location, slot, dr7, arm_pid, arm_thread, thread_creation, singleshoot, arm_hits = arm
+            slot, dr7 = int(slot), int(dr7, 16)
+            assert sequence == str(index) and int(location, 16) == address and slot == hardware_slot and dr7 & (3 << (slot * 2)) and ((dr7 >> (16 + slot * 4)) & 15) == 0
+            assert (arm_pid, arm_thread, singleshoot, arm_hits) == (pid, thread, "1", "0") and int(thread_creation) > int(creation)
+            arm_slots.append(slot)
+        assert len({arm[6] for arm in arms}) == 1, "Rearming changed actual target thread generation"
+        expected_single_hits = [0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3]
+        for index, (state, expected_hit) in enumerate(zip(single_states, expected_single_hits)):
+            location, slot, actual_slot, dr7, present, armed, single_hits, arm_count = state
+            expected_arms = max(expected_hit, 1)
+            assert int(location, 16) == address and int(slot) == arm_slots[expected_arms - 1] and int(single_hits) == expected_hit and int(arm_count) == expected_arms
+            assert present == armed == str(int(index == 0))
+            if index == 0:
+                assert int(actual_slot, 16) == address and int(dr7, 16) & (3 << (int(slot) * 2))
+                assert (slot, actual_slot, dr7) == hardware[0], "Initial single-shot state differs from the independent OS hardware snapshot"
+            else:
+                assert int(dr7, 16) & 0xff == 0, "Consumed single-shot retains an enabled OS hardware slot"
+        for index, (single_step, step) in enumerate(zip(single_steps, steps)):
+            assert single_step == (str(index), "0", step[-1]) and int(single_step[-1], 16) & 0xff == 0
+        positions = lambda prefix: [match.start() for match in re.finditer(re.escape(prefix), output)]
+        arm_positions, hit_positions = positions("PATCH_ARM "), positions("PATCH_HIT ")
+        assert len(arm_positions) == len(hit_positions) == 3, "Single-shot arm/hit sequence is incomplete"
+        for index in range(3):
+            assert arm_positions[index] < hit_positions[index] and (index == 0 or hit_positions[index - 1] < arm_positions[index])
+        step_positions, single_step_positions = positions("PATCH_STEP "), positions("PATCH_SINGLESTEP ")
+        assert len(step_positions) == len(single_step_positions) == 7
+        for index in range(7):
+            assert hit_positions[[1, 1, 2, 2, 2, 3, 3][index] - 1] < step_positions[index] < single_step_positions[index]
+            assert single_step_positions[index] < (step_positions[index + 1] if index < 6 else positions("PATCH_RESULT ")[0])
+    else:
+        assert not arms and not single_states and not single_steps, "Unexpected single-shot evidence"
     failures = re.findall(r"PATCH_WRITE_FAILURE engine=([01]) address=([0-9a-f]+) requested=(\d+) written=(\d+) success=([01]) before=([0-9a-f]+) after=([0-9a-f]+) reserved=([0-9a-f]+) error=(\d+) softwareOffset=(\d+) softwareLogical=([0-9a-f]+) softwareRaw=([0-9a-f]+) prefix=([0-9a-f]+) remainder=([0-9a-f]+)", output)
     assert len(failures) == (1 if kind == "memory" else 0), "Actual failed-write restoration control is missing or unexpected"
     if failures:
@@ -141,10 +183,10 @@ def check_patch_reference(receipt, facts, kind="software", engine="TitanEngine",
             "values": [7, 42, 7], "markers": ["original", "patched", "original"], "exitCode": 56,
             "original": facts["original"], "patched": facts["patched"], "changedOffsets": facts["changedOffsets"], "breakpointKind": kind,
             "pageProtection": hex(protection), "cpuStepCount": len(steps), "partialFailedWrite": {"written": int(failures[0][3]), "requested": 4097} if failures else None,
-            "oversizedNativeErrorPresent": assembly[0][1] == "1"}
+            "oversizedNativeErrorPresent": assembly[0][1] == "1", "singleShot": single_shot, "hardwareSlot": hardware_slot if single_shot else None}
 
 
-def check_patch_negative_controls(receipt, facts, kind="software", engine="TitanEngine", file_exports=False):
+def check_patch_negative_controls(receipt, facts, kind="software", engine="TitanEngine", file_exports=False, single_shot=False, hardware_slot=0):
     output = receipt["stdout"]
     changes = [("wrong_executed_value", "values=7/42/7", "values=7/43/7"), ("wrong_marker", "markers=original/patched/original", "markers=original/original/original"),
                ("wrong_original_byte", "old=b8 new=66", "old=90 new=66"), ("wrong_raw_opcode", "raw=cc07000000c3" if kind == "software" else "raw=b807000000c3", "raw=9007000000c3"),
@@ -154,7 +196,10 @@ def check_patch_negative_controls(receipt, facts, kind="software", engine="Titan
                ("missing_cpu_step", "PATCH_STEP index=0", "IGNORED_STEP index=0"), ("missing_actual_context", "osRead=1", "osRead=0"),
                ("lost_breakpoint", "enabled=1 active=1", "enabled=0 active=1"), ("lost_page_protection", "originalProtection=20", "originalProtection=4")]
     if kind == "hardware":
-        changes.append(("wrong_hardware_slot", "PATCH_HARDWARE slot=0", "PATCH_HARDWARE slot=4"))
+        changes.append(("wrong_hardware_slot", f"PATCH_HARDWARE slot={hardware_slot}", "PATCH_HARDWARE slot=4"))
+    if single_shot:
+        changes.extend((("missing_rearm", "PATCH_ARM index=1", "IGNORED_ARM index=1"), ("missing_single_removal", "present=0 armed=0", "present=1 armed=0"),
+                        ("lost_single_setting", "singleshoot=1 hits=0", "singleshoot=0 hits=0"), ("missing_single_step", "PATCH_SINGLESTEP index=0", "IGNORED_SINGLESTEP index=0")))
     if kind == "memory":
         changes.extend((("wrong_failed_write", "requested=4097", "requested=4096"), ("lost_failure_restoration", "before=2 after=2", "before=2 after=20"),
                         ("lost_partial_software_trap", "softwareRaw=cc", "softwareRaw=5a"), ("lost_partial_cache", "softwareLogical=" + ("5b" if engine == "GleeBug" else "5a"), "softwareLogical=cc"),
@@ -167,12 +212,28 @@ def check_patch_negative_controls(receipt, facts, kind="software", engine="Titan
     observed = []
     for name, candidate in controls:
         try:
-            check_patch_reference(candidate, facts, kind, engine, file_exports)
+            check_patch_reference(candidate, facts, kind, engine, file_exports, single_shot, hardware_slot)
         except (AssertionError, ValueError, KeyError) as error:
             observed.append({"name": name, "status": "rejected", "error": str(error), "targetExecuted": False})
         else:
             raise AssertionError(f"Patch negative control was admitted: {name}")
     return observed
+
+
+def patch_reference_script(text, single_shot=False, hardware_slot=0):
+    assert hardware_slot in range(4)
+    if not single_shot:
+        return text
+    placeholders = [f"patch_canary:PatchValue+0x{0x100 + index * 0x10:x}" for index in range(hardware_slot)]
+    arming = "\n".join([*(f"bph {address},x,1" for address in placeholders), "bph patch_canary:PatchValue,x,1",
+                        "SetHardwareBreakpointSingleshoot patch_canary:PatchValue,1", *(f"bphc {address}" for address in placeholders), "patchsinglearm"])
+    assert text.count("patchselect 2") == 1 and text.count("bph patch_canary:PatchValue,x,1") == 1
+    text = text.replace("patchselect 2", "patchselect 2,ss").replace("bph patch_canary:PatchValue,x,1", arming)
+    for index in (1, 2):
+        original = f"run\npatchhit {index}"
+        assert text.count(original) == 1
+        text = text.replace(original, arming + "\n" + original)
+    return text
 
 
 def run_patch_oracles(environment, results, selected_engine, timeout, fixture_identity, run_owned):
@@ -195,29 +256,29 @@ def run_patch_oracles(environment, results, selected_engine, timeout, fixture_id
     child.pop("WININSPECT_TEST_PATCH_MODE", None)
     observations = []
     for engine in engines:
-        for kind in ("software", "hardware", "memory"):
+        for kind, single_shot, hardware_slot in (("software", False, 0), ("hardware", False, 0), ("memory", False, 0), *(("hardware", True, slot) for slot in range(4))):
             source = plugin.parent / ("test.txt" if kind == "software" else f"test.{kind}.txt")
             assert source.is_file(), "Native patch variant script is missing"
-            scope = environment.root / "patch" / engine / kind
+            scope = environment.root / "patch" / engine / (f"hardware-single-{hardware_slot}" if single_shot else kind)
             profile = scope / "userdir"
             profile.mkdir(parents=True)
             engine_id = 0 if engine == "TitanEngine" else 1
             engine_path = runtime / ("TitanEngine.dll" if engine_id == 0 else "GleeBug/TitanEngine.dll")
             (profile / "headless.ini").write_text(f"[Engine]\nDebugEngine={engine_id}\nNoConsoleWindow=1\n", encoding="utf-8")
             script = scope / "reference.txt"
-            text = source.read_text(encoding="utf-8")
+            text = patch_reference_script(source.read_text(encoding="utf-8"), single_shot, hardware_slot)
             assert text.count("init tests/patch_canary.exe") == 1, "Patch reference script template differs"
             script.write_text(text.replace("init tests/patch_canary.exe", f'init "{binary}"'), encoding="utf-8", newline="\n")
             receipt = run_owned([str(required[0]), "-testing", "-userdir", str(profile), "-plugin", str(plugin), "-cf", str(script)], child, timeout,
                                 required_modules=[*required, engine_path])
             write_json(scope / "receipt.json", receipt)
-            reference = check_patch_reference(receipt, facts, kind, engine)
+            reference = check_patch_reference(receipt, facts, kind, engine, single_shot=single_shot, hardware_slot=hardware_slot)
             assert receipt["loadedModules"] and not any("mcp-server" in item["path"].lower() or "agent smithers" in item["path"].lower() for item in receipt["loadedModules"]), "Patch reference loaded an external MCP dependency"
-            controls = check_patch_negative_controls(receipt, facts, kind, engine)
+            controls = check_patch_negative_controls(receipt, facts, kind, engine, single_shot=single_shot, hardware_slot=hardware_slot)
             write_json(scope / "independent-patch.json", reference)
             write_json(scope / "negative-controls.json", controls)
-            observations.append({"engine": engine, "breakpointKind": kind, "receipt": receipt, "reference": reference, "negativeControls": controls, "script": file_identity(script), "sourceScript": file_identity(source)})
-            print(f"[VERIFIED] Native {environment.architecture} {engine} {kind}-breakpoint patch execution 7/42/7, seven OS-verified CPU steps, undo and actual exit 56", flush=True)
+            observations.append({"engine": engine, "breakpointKind": kind, "singleShot": single_shot, "hardwareSlot": hardware_slot if single_shot else None, "receipt": receipt, "reference": reference, "negativeControls": controls, "script": file_identity(script), "sourceScript": file_identity(source)})
+            print(f"[VERIFIED] Native {environment.architecture} {engine} {f'single-shot hardware slot {hardware_slot}' if single_shot else kind}-breakpoint patch execution 7/42/7, seven OS-verified CPU steps, undo and actual exit 56", flush=True)
     assert file_identity(binary) == identity, "Runtime patch reference changed its source executable"
     results.append({"name": "test_native_patch_oracles", "status": "verified", "oracle": {
         "binary": identity, "plugin": file_identity(plugin), "sourcePeFacts": facts, "normal": normals, "observations": observations}})

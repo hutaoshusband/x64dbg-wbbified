@@ -12,14 +12,15 @@ namespace
     int gPluginHandle = 0;
     BPXTYPE gBreakpointType = bp_normal;
     DWORD gOriginalProtection = 0;
-    unsigned gStepCount = 0;
+    unsigned gStepCount = 0, gArmCount = 0, gHardwareSlot = MAXDWORD;
+    bool gSingleShot = false;
     duint gFailureAddress = 0;
     SIZE_T gFailureWritten = 0;
     std::atomic<duint> gAddress{0};
     std::atomic<DWORD> gPid{0}, gThread{0}, gExit{0};
     std::atomic<unsigned> gHitCount{0};
     std::atomic<bool> gOverflow{false}, gExited{false};
-    struct Hit { duint address; DWORD pid, thread; BPXTYPE type; bool enabled; };
+    struct Hit { duint address; DWORD pid, thread; BPXTYPE type; bool enabled, singleshoot; };
     std::array<Hit, 8> gHits{};
     const std::array<unsigned char, 6> Original{0xb8, 7, 0, 0, 0, 0xc3};
     const std::array<unsigned char, 6> Patched{0x66, 0xb8, 0x2a, 0, 0x90, 0xc3};
@@ -76,7 +77,7 @@ namespace
     {
         if(type == CB_INITDEBUG)
         {
-            gAddress = 0; gPid = 0; gThread = 0; gExit = 0; gHitCount = 0; gOverflow = false; gExited = false; gBreakpointType = bp_normal; gOriginalProtection = 0; gStepCount = 0; gFailureAddress = 0; gFailureWritten = 0;
+            gAddress = 0; gPid = 0; gThread = 0; gExit = 0; gHitCount = 0; gOverflow = false; gExited = false; gBreakpointType = bp_normal; gOriginalProtection = 0; gStepCount = 0; gFailureAddress = 0; gFailureWritten = 0; gArmCount = 0; gHardwareSlot = MAXDWORD; gSingleShot = false;
         }
         else if(type == CB_DEBUGEVENT)
         {
@@ -98,7 +99,7 @@ namespace
                 gOverflow.store(true, std::memory_order_release);
                 return;
             }
-            gHits[count] = {info->breakpoint->addr, gPid.load(std::memory_order_relaxed), gThread.load(std::memory_order_acquire), info->breakpoint->type, info->breakpoint->enabled};
+            gHits[count] = {info->breakpoint->addr, gPid.load(std::memory_order_relaxed), gThread.load(std::memory_order_acquire), info->breakpoint->type, info->breakpoint->enabled, info->breakpoint->singleshoot};
             gHitCount.store(count + 1, std::memory_order_release);
         }
         else if(type == CB_EXITPROCESS)
@@ -115,8 +116,31 @@ namespace
     {
         const auto address = FieldAddress("PatchValue");
         BRIDGEBP breakpoint{};
+        if(gSingleShot)
+        {
+            const bool present = DbgFunctions()->GetBridgeBp(bp_hardware, address, &breakpoint);
+            const bool armed = gArmCount > gHitCount.load(std::memory_order_acquire);
+            const ScopedThread thread(DbgGetThreadId());
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            const bool read = thread.value && GetThreadContext(thread.value, &context);
+            const std::array<duint, 4> slots{context.Dr0, context.Dr1, context.Dr2, context.Dr3};
+            if(!_plugin_testassert(read && gHardwareSlot < slots.size() && present == armed &&
+                                  (armed ? slots[gHardwareSlot] == address && (context.Dr7 & (3ull << (gHardwareSlot * 2))) && ((context.Dr7 >> (16 + gHardwareSlot * 4)) & 15) == 0 && breakpoint.singleshoot : (context.Dr7 & 0xff) == 0),
+                                  "single-shot hardware ownership agrees with actual enabled OS debug slots")) return false;
+            _plugin_logprintf("PATCH_SINGLESHOT address=%llx slot=%u actualSlot=%llx dr7=%llx present=%u armed=%u hits=%u arms=%u\n", static_cast<unsigned long long>(address), gHardwareSlot,
+                              static_cast<unsigned long long>(slots[gHardwareSlot]), static_cast<unsigned long long>(context.Dr7), unsigned(present), unsigned(armed), gHitCount.load(), gArmCount);
+            if(!armed)
+            {
+                const ScopedProcess process(DbgGetProcessId());
+                MEMORY_BASIC_INFORMATION region{};
+                return _plugin_testassert(process.value && VirtualQueryEx(process.value, reinterpret_cast<const void*>(address), &region, sizeof(region)) == sizeof(region)
+                                          && region.State == MEM_COMMIT && region.Type == MEM_IMAGE && region.Protect == gOriginalProtection,
+                                          "removed hardware breakpoint leaves the actual executable image protection unchanged");
+            }
+        }
         if(!_plugin_testassert(DbgFunctions()->GetBridgeBp(gBreakpointType, address, &breakpoint) && breakpoint.addr == address
-                              && breakpoint.type == gBreakpointType && breakpoint.enabled && breakpoint.active && !breakpoint.singleshoot,
+                              && breakpoint.type == gBreakpointType && breakpoint.enabled && breakpoint.active && breakpoint.singleshoot == gSingleShot,
                               "the selected breakpoint remains active at the exact source function")) return false;
         const ScopedProcess process(DbgGetProcessId());
         MEMORY_BASIC_INFORMATION region{};
@@ -243,9 +267,11 @@ namespace
     }
     bool cbSelect(int argc, char** argv)
     {
-        if(!_plugin_testassert(argc == 1 || (argc == 2 && strlen(argv[1]) == 1 && (argv[1][0] == '1' || argv[1][0] == '2' || argv[1][0] == '4')),
+        if(!_plugin_testassert(argc == 1 || ((argc == 2 || (argc == 3 && strcmp(argv[2], "ss") == 0 && strcmp(argv[1], "2") == 0))
+                              && strlen(argv[1]) == 1 && (argv[1][0] == '1' || argv[1][0] == '2' || argv[1][0] == '4')),
                               "reference declares an exact software, hardware or memory breakpoint type")) return false;
         gBreakpointType = argc == 1 ? bp_normal : static_cast<BPXTYPE>(argv[1][0] - '0');
+        gSingleShot = argc == 3;
         const ScopedProcess process(DbgGetProcessId());
         MEMORY_BASIC_INFORMATION region{};
         if(!_plugin_testassert(process.value && VirtualQueryEx(process.value, reinterpret_cast<const void*>(FieldAddress("PatchValue")), &region, sizeof(region)) == sizeof(region)
@@ -259,6 +285,29 @@ namespace
                               && DbgMemWrite(FieldAddress("gPatchMutation"), &selected, sizeof(selected)), "reference selection uses separate untracked data writes at the actual entry")) return false;
         return ReadTarget("gPatchMode", mode) && ReadTarget("gPatchMutation", mutation) && CheckTracking(false)
                && _plugin_testassert(mode == 1 && mutation == 1, "reference mode and mutation read back exactly");
+    }
+    bool cbSingleArm(int, char**)
+    {
+        const auto address = FieldAddress("PatchValue");
+        BRIDGEBP breakpoint{};
+        const ScopedThread thread(DbgGetThreadId());
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        FILETIME creation{}, exit{}, kernel{}, user{};
+        const bool read = thread.value && GetThreadContext(thread.value, &context) && GetThreadTimes(thread.value, &creation, &exit, &kernel, &user);
+        const std::array<duint, 4> slots{context.Dr0, context.Dr1, context.Dr2, context.Dr3};
+        if(!_plugin_testassert(gSingleShot && gBreakpointType == bp_hardware && gArmCount == gHitCount.load(std::memory_order_acquire) && gArmCount < 3 && read &&
+                              GetProcessIdOfThread(thread.value) == DbgGetProcessId() && DbgFunctions()->GetBridgeBp(bp_hardware, address, &breakpoint) &&
+                              breakpoint.addr == address && breakpoint.enabled && breakpoint.active && breakpoint.singleshoot && breakpoint.hitCount == 0 &&
+                              breakpoint.slot < slots.size() && slots[breakpoint.slot] == address && (context.Dr7 & (3ull << (breakpoint.slot * 2))) &&
+                              ((context.Dr7 >> (16 + breakpoint.slot * 4)) & 15) == 0 && breakpoint.typeEx == hw_execute && breakpoint.hwSize == hw_byte,
+                              "single-shot is explicitly rearmed before each actual function call")) return false;
+        gHardwareSlot = breakpoint.slot;
+        ++gArmCount;
+        _plugin_logprintf("PATCH_ARM index=%u address=%llx slot=%u dr7=%llx pid=%lu thread=%lu creation=%llu singleshoot=%u hits=%u\n", gArmCount - 1,
+                          static_cast<unsigned long long>(address), gHardwareSlot, static_cast<unsigned long long>(context.Dr7), DbgGetProcessId(), DbgGetThreadId(),
+                          (static_cast<unsigned long long>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime, unsigned(breakpoint.singleshoot), breakpoint.hitCount);
+        return true;
     }
     bool cbApply(int, char**)
     {
@@ -474,10 +523,10 @@ namespace
         const auto count = gHitCount.load(std::memory_order_acquire);
         if(!_plugin_testassert(index < 3 && count == index + 1 && !gOverflow.load() && DbgValFromString("cip") == FieldAddress("PatchValue"), "breakpoint actually stops each selected function call")) return false;
         const auto& hit = gHits[index];
-        if(!_plugin_testassert(hit.address == FieldAddress("PatchValue") && hit.pid == DbgGetProcessId() && hit.thread == DbgGetThreadId() && hit.type == gBreakpointType && hit.enabled,
+        if(!_plugin_testassert(hit.address == FieldAddress("PatchValue") && hit.pid == DbgGetProcessId() && hit.thread == DbgGetThreadId() && hit.type == gBreakpointType && hit.enabled && hit.singleshoot == gSingleShot,
                               "bounded raw breakpoint event has the actual selected breakpoint and OS identity")) return false;
         _plugin_logprintf("PATCH_HIT index=%u address=%llx pid=%lu thread=%lu type=%u\n", index, static_cast<unsigned long long>(hit.address), hit.pid, hit.thread, unsigned(hit.type));
-        return true;
+        return !gSingleShot || CheckBreakpoint();
     }
     bool cbStep(int argc, char** argv)
     {
@@ -498,13 +547,20 @@ namespace
 #else
         const duint ip = context.Eip, ax = context.Eax;
 #endif
-        if(!_plugin_testassert(nativeRead && read && gHitCount.load(std::memory_order_acquire) == hits[index]
-                              && dump.regcontext.cip == expectedIP && ip == expectedIP && dump.regcontext.cax == values[index] && ax == values[index],
-                              "native and independent OS contexts prove that the requested instruction actually executed")) return false;
         _plugin_logprintf("PATCH_STEP index=%u hits=%u nativeIP=%llx nativeAX=%llx osRead=%u osIP=%llx osAX=%llx flags=%lx dr6=%llx dr7=%llx\n", index, hits[index],
                           static_cast<unsigned long long>(dump.regcontext.cip), static_cast<unsigned long long>(dump.regcontext.cax), read ? 1 : 0,
                           static_cast<unsigned long long>(ip), static_cast<unsigned long long>(ax), context.EFlags,
                           static_cast<unsigned long long>(context.Dr6), static_cast<unsigned long long>(context.Dr7));
+        if(!_plugin_testassert(nativeRead && read && gHitCount.load(std::memory_order_acquire) == hits[index]
+                              && dump.regcontext.cip == expectedIP && ip == expectedIP && dump.regcontext.cax == values[index] && ax == values[index],
+                              "native and independent OS contexts prove that the requested instruction actually executed")) return false;
+        if(gSingleShot)
+        {
+            BRIDGEBP breakpoint{};
+            const bool present = DbgFunctions()->GetBridgeBp(bp_hardware, FieldAddress("PatchValue"), &breakpoint);
+            if(!_plugin_testassert(!present && (context.Dr7 & 0xff) == 0, "actual CPU step keeps the consumed single-shot hardware slot disabled")) return false;
+            _plugin_logprintf("PATCH_SINGLESTEP index=%u present=%u dr7=%llx\n", index, unsigned(present), static_cast<unsigned long long>(context.Dr7));
+        }
         ++gStepCount;
         return true;
     }
@@ -516,7 +572,7 @@ namespace
         std::array<std::array<char, 9>, 3> markers{};
         if(!ReadTarget("gPatchPhase", phase) || !ReadTarget("gPatchCompleted", completed) || !ReadTarget("gPatchVerified", verified)
                 || !ReadTarget("gPatchValues", values) || !ReadTarget("gPatchMarkers", markers)) return false;
-        if(!_plugin_testassert(phase == 4 && completed == 3 && verified == 1 && gStepCount == 7 && values == std::array<DWORD, 3>{7, 42, 7}
+        if(!_plugin_testassert(phase == 4 && completed == 3 && verified == 1 && gStepCount == 7 && (!gSingleShot || gArmCount == 3) && values == std::array<DWORD, 3>{7, 42, 7}
                               && strcmp(markers[0].data(), "original") == 0 && strcmp(markers[1].data(), "patched") == 0 && strcmp(markers[2].data(), "original") == 0
                               && DbgValFromString("cip") == FieldAddress("PatchFinish"), "actual target calls and markers prove original, changed and restored execution")) return false;
         _plugin_logprintf("PATCH_RESULT values=%lu/%lu/%lu markers=%s/%s/%s completed=%lu verified=%lu\n", values[0], values[1], values[2],
@@ -537,7 +593,8 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* init)
     gPluginHandle = init->pluginHandle;
     for(const auto type : {CB_INITDEBUG, CB_DEBUGEVENT, CB_BREAKPOINT, CB_EXITPROCESS})
         _plugin_registercallback(gPluginHandle, type, cbPatchEvent);
-    return _plugin_registercommand(gPluginHandle, "patchstep", cbStep, true)
+    return _plugin_registercommand(gPluginHandle, "patchsinglearm", cbSingleArm, true)
+           && _plugin_registercommand(gPluginHandle, "patchstep", cbStep, true)
            && _plugin_registercommand(gPluginHandle, "patchselect", cbSelect, true)
            && _plugin_registercommand(gPluginHandle, "patchprepare", cbPrepare, true)
            && _plugin_registercommand(gPluginHandle, "patchapply", cbApply, true)
