@@ -17,7 +17,18 @@ namespace FixtureNativeCreation
         using NativeCreate = LONG(NTAPI*)(HANDLE*, ACCESS_MASK, void*, HANDLE, void*, void*, ULONG, SIZE_T, SIZE_T, SIZE_T, void*);
         std::atomic<Mode> creationMode{Mode::Normal};
         std::atomic<NativeCreate> nativeCreate{nullptr};
+        std::atomic<HANDLE> gateReached{nullptr}, gateRelease{nullptr};
         Observation observation;
+
+        bool HoldCreation(const char* phase)
+        {
+            std::printf("CREATION_GATE phase=%s pid=%lu thread=%lu creation=%llu start=%p calls=%u\n", phase,
+                        observation.processId, observation.threadId, observation.creation, observation.start, observation.calls);
+            std::fflush(stdout);
+            const auto reached = gateReached.load();
+            const auto release = gateRelease.load();
+            return reached && release && SetEvent(reached) && WaitForSingleObject(release, 10000) == WAIT_OBJECT_0;
+        }
 
         FARPROC Lookup(HMODULE module, LPCSTR name)
         {
@@ -151,9 +162,15 @@ namespace FixtureNativeCreation
             const auto reduced = mode == Mode::ReducedAccess;
             std::vector<ThreadIdentity> before;
             observation.processId = GetProcessId(process);
+            observation.start = start;
             const auto beforeObserved = !reduced || Threads(observation.processId, before);
             const auto actualAccess = reduced ? THREAD_QUERY_INFORMATION | SYNCHRONIZE : access;
             const auto native = nativeCreate.load();
+            if(mode == Mode::HeldBeforeCreation && !HoldCreation("before"))
+            {
+                SetLastError(ERROR_TIMEOUT);
+                return static_cast<LONG>(0xc0000102);
+            }
             const auto status = native(handle, actualAccess, attributes, process, start, argument, flags, zero, commit, reserve, list);
             const auto error = GetLastError();
             observation.nativeStatus = status;
@@ -180,6 +197,19 @@ namespace FixtureNativeCreation
                 observation.threadId = GetThreadId(*handle);
                 observation.creation = CreationTime(creation);
                 observation.nativeCreated = observation.threadId != 0 && observation.creation != 0;
+                if(mode == Mode::HeldBeforeCreation || mode == Mode::HeldAfterCreation)
+                {
+                    std::printf("INFLIGHT_NATIVE status=%08lx requestedAccess=%08lx actualAccess=%08lx flags=%lu pid=%lu thread=%lu creation=%llu start=%p handleValid=%u calls=%u\n",
+                                status, access, actualAccess, flags, observation.processId, observation.threadId, observation.creation, start, unsigned(observation.nativeHandleValid), observation.calls);
+                    std::fflush(stdout);
+                    if(mode == Mode::HeldAfterCreation && !HoldCreation("after"))
+                    {
+                        SetLastError(ERROR_TIMEOUT);
+                        return static_cast<LONG>(0xc0000102);
+                    }
+                    SetLastError(error);
+                    return status;
+                }
                 observation.handleClosed = CloseHandle(*handle) != FALSE;
                 if(observation.handleClosed)
                     *handle = nullptr;
@@ -198,6 +228,12 @@ namespace FixtureNativeCreation
     void Configure(Mode mode)
     {
         creationMode = mode;
+    }
+
+    void ConfigureGate(HANDLE reached, HANDLE release)
+    {
+        gateReached = reached;
+        gateRelease = release;
     }
 
     bool VerifyThread(HANDLE thread, const char* phase)

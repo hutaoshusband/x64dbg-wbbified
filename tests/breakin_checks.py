@@ -260,6 +260,64 @@ def check_replacement_receipt(receipt, architecture, mode, kind, rounds=8):
     return {"rounds": observed, "targetGenerations": len(generations)}
 
 
+def check_inflight_receipt(receipt, architecture, mode, phase, action):
+    assert architecture in ("x64", "x32") and mode in ("show", "hide", "both") and phase in ("before", "after") and action in ("end", "shutdown")
+    assert receipt["exitCode"] == 0 and not receipt["timedOut"] and receipt["terminalObserved"] and receipt["jobClosed"]
+    lines = receipt["stdout"].splitlines()
+    controller = receipt["processIdentity"]
+    header = one_line(lines, "INFLIGHT phase=")
+    assert set(header) == {"phase", "action", "pid", "creation", "controllerCreation"} and header["phase"] == phase and header["action"] == action and header["controllerCreation"] == controller["creationTime"]
+    assert int(header["pid"]) > 0 and header["pid"] != str(controller["pid"]) and int(header["creation"]) >= int(controller["creationTime"])
+    assert one_line(lines, "IDENTITY ") == {"role": "target", "pid": header["pid"], "creation": header["creation"]}
+    worker = one_line(lines, "INFLIGHT_WORKER ")
+    assert set(worker) == {"pid", "thread", "creation", "alive", "releasePending"}
+    assert worker["pid"] == str(controller["pid"]) and int(worker["thread"]) > 0 and int(worker["creation"]) > int(controller["creationTime"])
+    assert worker["alive"] == worker["releasePending"] == "1"
+    assert one_line(lines, "INFLIGHT_WORKER_TERMINAL ") == {key: worker[key] for key in ("pid", "thread", "creation")} | {"exit": "0"}
+    helper = one_line(lines, "INFLIGHT_HELPER ")
+    assert set(helper) == {"pid", "thread", "creation", "code"} and helper["pid"] == header["pid"]
+    assert int(helper["thread"]) > 0 and helper["thread"] != worker["thread"] and int(helper["creation"]) > int(header["creation"]) and int(helper["code"], 16) > 0
+    native = one_line(lines, "INFLIGHT_NATIVE ")
+    assert native == {"status": "00000000", "requestedAccess": "001fffff", "actualAccess": "001fffff", "flags": "2", "pid": helper["pid"], "thread": helper["thread"], "creation": helper["creation"], "start": helper["code"], "handleValid": "1", "calls": "1"}
+    gate = one_line(lines, "CREATION_GATE ")
+    assert gate == {"phase": phase, "pid": helper["pid"], "thread": "0" if phase == "before" else helper["thread"], "creation": "0" if phase == "before" else helper["creation"], "start": helper["code"], "calls": "1"}
+    assert one_line(lines, "INFLIGHT_RETIRE ") == {"action": action, "createRejected": "1", "error": "170", "workerPending": "1"}
+    assert one_line(lines, "INFLIGHT_RETURN ") == {"created": "1", "status": "00000000", "error": "0", **helper}
+    assert one_line(lines, "INFLIGHT_CONSUME ") == {"pid": helper["pid"], "thread": helper["thread"], "consumed": "0", "repeated": "0"}
+    assert one_line(lines, "INFLIGHT_THREAD_TERMINAL ") == {"pid": helper["pid"], "thread": helper["thread"], "exit": "0"}
+    retained = action == "shutdown"
+    assert one_line(lines, "SESSION_PAGE ") == {"role": "0", "pid": helper["pid"], "code": helper["code"], "freed": str(int(not retained)), "state": "00001000" if retained else "00010000"}
+    assert one_line(lines, "INFLIGHT_TARGET_TERMINAL ") == {"pid": helper["pid"], "exit": "7", "breaks": "2", "helperBreaks": "1", "helperExits": "1"}
+    assert one_line(lines, "TARGET final_peb=") == {"final_peb": str(int(mode == "show")), "final_port": "1", "detached": "0", "port_read": "1"}
+    assert one_line(lines, "TARGET breakpoint_returned=") == {"breakpoint_returned": "1"}
+    if architecture == "x32":
+        peb = one_line(lines, "NATIVE_PEB ")
+        assert set(peb) == {"address", "original", "observed"} and int(peb["address"], 16) > 0 and peb["original"] == "1" and peb["observed"] == str(int(mode != "both"))
+    phases = ("held", "retired", "completed") if retained else ("held", "retired")
+    stages = [fields(line) for line in lines if line.startswith("INFLIGHT_RETENTION ")]
+    assert stages == [{"phase": item} for item in phases]
+    retentions = [(index, fields(line)) for index, line in enumerate(lines) if line.startswith("SESSION_RETAIN ")]
+    assert len(retentions) == len(phases)
+    retention_positions = []
+    for stage, (index, sample) in zip(phases, retentions):
+        assert set(sample) == {"pid", "code", "alive", "executable", "data", "unchanged", "samples", "elapsed"}
+        assert {key: sample[key] for key in ("pid", "code", "alive", "executable", "data", "unchanged")} == {
+            "pid": helper["pid"], "code": helper["code"], "alive": "1", "executable": "00000020", "data": "00000004", "unchanged": "1"}
+        assert int(sample["samples"]) > 0 and 250 <= int(sample["elapsed"]) < 10000
+        assert lines[index - 1] == f"INFLIGHT_RETENTION phase={stage}"
+        retention_positions.append(index)
+    def position(prefix):
+        return next(index for index, line in enumerate(lines) if line.startswith(prefix))
+    assert position("CREATION_GATE ") < position("INFLIGHT_WORKER ") < retention_positions[0] < position("INFLIGHT_RETIRE ") < retention_positions[1] < position("INFLIGHT_WORKER_TERMINAL ") < position("INFLIGHT_RETURN ") < position("INFLIGHT_HELPER ") < position("INFLIGHT_CONSUME ") < position("INFLIGHT_THREAD_TERMINAL ") < position("SESSION_PAGE ") < position("TARGET breakpoint_returned=") < position("INFLIGHT_TARGET_TERMINAL ")
+    if phase == "before":
+        assert retention_positions[1] < position("INFLIGHT_NATIVE ") < position("INFLIGHT_WORKER_TERMINAL ")
+    else:
+        assert position("INFLIGHT_NATIVE ") < position("CREATION_GATE ")
+    if retained:
+        assert position("SESSION_PAGE ") < retention_positions[2] < position("TARGET breakpoint_returned=")
+    return {"target": header, "worker": worker, "helper": helper, "gate": gate, "retentions": [sample for index, sample in retentions], "retainedThroughProcessLifetime": retained}
+
+
 def run_breakin_oracles(environment, results, fixture_identity, run_owned):
     binary, identity, machine = fixture_identity(environment, "native_breakin")
     observations = []
@@ -284,6 +342,16 @@ def run_breakin_oracles(environment, results, fixture_identity, run_owned):
             observed = check_replacement_receipt(receipt, environment.architecture, mode, kind)
             assert file_identity(binary) == identity, "Native replacement fixture changed"
             replacements.append({"mode": mode, "kind": kind, "receipt": file_identity(path), "observed": observed})
+    inflight = []
+    for phase in ("before", "after"):
+        for action in ("end", "shutdown"):
+            for mode in ("show", "hide", "both"):
+                receipt = run_owned([str(binary), mode, "inflight", phase, action], os.environ, 35)
+                path = environment.root / f"breakin-inflight-{mode}-{phase}-{action}.json"
+                write_json(path, receipt)
+                observed = check_inflight_receipt(receipt, environment.architecture, mode, phase, action)
+                assert file_identity(binary) == identity, "Native in-flight fixture changed"
+                inflight.append({"mode": mode, "phase": phase, "action": action, "receipt": file_identity(path), "observed": observed})
     results.append({"name": "test_native_breakin_oracles", "status": "verified", "oracle": {
-        "binary": identity, "machine": machine, "observations": observations, "replacements": replacements, "debuggerUsed": "owned Windows native controller"}})
-    print(f"[VERIFIED] Native {environment.architecture} hidden/unhidden break-in, identity rejection, detach, thread exit, page release, failed-handler retention, late-thread binding and actual native reduced-access creation, and repeated target replacement", flush=True)
+        "binary": identity, "machine": machine, "observations": observations, "replacements": replacements, "inflight": inflight, "debuggerUsed": "owned Windows native controller"}})
+    print(f"[VERIFIED] Native {environment.architecture} hidden/unhidden break-in, identity rejection, detach, thread exit, page release, failed-handler retention, late-thread binding, actual reduced-access creation, repeated replacement and held in-flight creation retirement/shutdown", flush=True)

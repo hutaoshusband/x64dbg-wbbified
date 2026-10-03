@@ -7,7 +7,9 @@ namespace FixtureNativeCreation
     {
         Normal,
         ControlledFailure,
-        ReducedAccess
+        ReducedAccess,
+        HeldBeforeCreation,
+        HeldAfterCreation
     };
 
     struct Observation
@@ -30,6 +32,7 @@ namespace FixtureNativeCreation
     };
 
     void Configure(Mode mode);
+    void ConfigureGate(HANDLE reached, HANDLE release);
     bool VerifyThread(HANDLE thread, const char* phase);
     Observation Capture();
 }

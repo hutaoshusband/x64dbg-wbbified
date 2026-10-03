@@ -9,6 +9,7 @@
 #include <string>
 #include <memory>
 #include <array>
+#include <thread>
 
 namespace BreakInSessions
 {
@@ -213,7 +214,7 @@ namespace BreakInSessions
                 oldCreation = FixtureNativeCreation::Capture();
                 FixtureNativeCreation::Configure(FixtureNativeCreation::Mode::Normal);
                 const DWORD expectedError = partial ? ERROR_ACCESS_DENIED : ERROR_SUCCESS;
-            if(old.created == partial || old.status != (partial ? static_cast<LONG>(0xc0000022) : 0) || old.error != expectedError || !NativeBreakIn::BeginTarget(targets[1].process.get()))
+                if(old.created == partial || old.status != (partial ? static_cast<LONG>(0xc0000022) : 0) || old.error != expectedError || !NativeBreakIn::BeginTarget(targets[1].process.get()))
                     return 20;
                 const auto next = NativeBreakIn::Create(targets[1].ntdllBase);
                 std::printf("SESSION_REQUEST oldStatus=%08lx oldCreated=%u nextStatus=%08lx nextCreated=%u\n", old.status, unsigned(old.created), next.status, unsigned(next.created));
@@ -255,6 +256,199 @@ namespace BreakInSessions
         if(targets[0].breaks != 2 || targets[1].breaks != 2 || targets[0].helperBreaks != unsigned(!registration) || targets[1].helperBreaks != 1 || targets[0].exits != 1 || targets[1].exits != 1)
             return 30;
         std::printf("SESSION_ROUND round=%u completed=1\n", round);
+        std::fflush(stdout);
+        return 0;
+    }
+
+    struct PendingCreation
+    {
+        OwnedHandle reached{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        OwnedHandle release{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        OwnedHandle thread;
+        std::thread worker;
+        NativeBreakIn::Result result{};
+
+        ~PendingCreation()
+        {
+            if(release)
+                SetEvent(release.get());
+            if(worker.joinable())
+                worker.join();
+            FixtureNativeCreation::ConfigureGate(nullptr, nullptr);
+        }
+    };
+
+    int RunInFlight(const wchar_t* mode, const wchar_t* phase, const wchar_t* action)
+    {
+        const bool before = std::wcscmp(phase, L"before") == 0;
+        const bool shutdown = std::wcscmp(action, L"shutdown") == 0;
+        if((!before && std::wcscmp(phase, L"after")) || (!shutdown && std::wcscmp(action, L"end")) ||
+                (std::wcscmp(mode, L"show") && std::wcscmp(mode, L"hide") && std::wcscmp(mode, L"both")))
+            return 34;
+        wchar_t binary[32768]{};
+        OwnedSessionTarget target;
+        PendingCreation pending;
+        if(!pending.reached || !pending.release || !GetModuleFileNameW(nullptr, binary, 32768) || !StartTarget(target, binary, mode, L"normal"))
+            return 35;
+        std::printf("INFLIGHT phase=%ls action=%ls pid=%lu creation=%llu controllerCreation=%llu\n", phase, action, target.processId, CreationTime(target.process.get(), false), CreationTime(GetCurrentProcess(), false));
+        std::fflush(stdout);
+        bool requested = false, released = false;
+        FixtureNativeCreation::Observation created;
+        const auto deadline = GetTickCount64() + 20000;
+        while(GetTickCount64() < deadline)
+        {
+            DEBUG_EVENT event{};
+            if(!WaitForDebugEvent(&event, 1000))
+            {
+                if(GetLastError() == ERROR_SEM_TIMEOUT)
+                    continue;
+                return 36;
+            }
+            if(event.dwProcessId != target.processId)
+                return 37;
+            DWORD status = DBG_CONTINUE;
+            if(event.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT && event.u.LoadDll.hFile)
+            {
+                wchar_t path[32768]{};
+                if(GetFinalPathNameByHandleW(event.u.LoadDll.hFile, path, 32768, FILE_NAME_NORMALIZED))
+                {
+                    const auto length = std::wcslen(path);
+                    if(length >= 9 && _wcsicmp(path + length - 9, L"ntdll.dll") == 0)
+                        target.ntdllBase = reinterpret_cast<std::uintptr_t>(event.u.LoadDll.lpBaseOfDll);
+                }
+                CloseHandle(event.u.LoadDll.hFile);
+            }
+            if(event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT && event.u.CreateProcessInfo.hFile)
+                CloseHandle(event.u.CreateProcessInfo.hFile);
+            if(event.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT)
+            {
+                NativeBreakIn::BindThread(event.dwProcessId, event.dwThreadId, event.u.CreateThread);
+                if(requested && event.dwThreadId == created.threadId)
+                {
+                    HANDLE duplicate = nullptr;
+                    if(target.helper || event.u.CreateThread.lpStartAddress != target.remoteCode ||
+                            !DuplicateHandle(GetCurrentProcess(), event.u.CreateThread.hThread, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                        return 38;
+                    target.helper.reset(duplicate);
+                    target.threadId = event.dwThreadId;
+                    if(GetProcessIdOfThread(target.helper.get()) != target.processId || CreationTime(target.helper.get(), true) != created.creation)
+                        return 39;
+                    std::printf("INFLIGHT_HELPER pid=%lu thread=%lu creation=%llu code=%p\n", target.processId, target.threadId, created.creation, target.remoteCode);
+                }
+            }
+            if(event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
+            {
+                if(event.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT)
+                {
+                    if(target.helper && event.dwThreadId == target.threadId)
+                    {
+                        const auto consumed = NativeBreakIn::Consume(event.dwProcessId, event.dwThreadId, event.u.Exception);
+                        const auto repeated = NativeBreakIn::Consume(event.dwProcessId, event.dwThreadId, event.u.Exception);
+                        std::printf("INFLIGHT_CONSUME pid=%lu thread=%lu consumed=%u repeated=%u\n", target.processId, target.threadId, unsigned(consumed), unsigned(repeated));
+                        if(consumed || repeated)
+                            return 40;
+                        ++target.helperBreaks;
+                        status = DBG_EXCEPTION_NOT_HANDLED;
+                    }
+                    else
+                        ++target.breaks;
+                }
+                else
+                    status = DBG_EXCEPTION_NOT_HANDLED;
+            }
+            if(event.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT && target.helper && event.dwThreadId == target.threadId)
+                ++target.exits;
+            if(event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT)
+            {
+                if(event.u.ExitProcess.dwExitCode != 7)
+                    return 41;
+                target.terminal = true;
+            }
+            std::fflush(stdout);
+            if(!ContinueDebugEvent(event.dwProcessId, event.dwThreadId, status))
+                return 42;
+            if(!requested && target.breaks == 2)
+            {
+                requested = true;
+                FixtureNativeCreation::ConfigureGate(pending.reached.get(), pending.release.get());
+                FixtureNativeCreation::Configure(before ? FixtureNativeCreation::Mode::HeldBeforeCreation : FixtureNativeCreation::Mode::HeldAfterCreation);
+                if(!NativeBreakIn::BeginTarget(target.process.get()))
+                    return 43;
+                pending.worker = std::thread([&] { pending.result = NativeBreakIn::Create(target.ntdllBase); });
+                if(WaitForSingleObject(pending.reached.get(), 5000) != WAIT_OBJECT_0)
+                    return 44;
+                HANDLE worker = nullptr;
+                if(!DuplicateHandle(GetCurrentProcess(), pending.worker.native_handle(), GetCurrentProcess(), &worker, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                    return 55;
+                pending.thread.reset(worker);
+                const auto workerId = GetThreadId(worker);
+                const auto workerCreation = CreationTime(worker, true);
+                if(!workerId || !workerCreation || GetProcessIdOfThread(worker) != GetCurrentProcessId() || WaitForSingleObject(worker, 0) != WAIT_TIMEOUT || WaitForSingleObject(pending.release.get(), 0) != WAIT_TIMEOUT)
+                    return 56;
+                std::printf("INFLIGHT_WORKER pid=%lu thread=%lu creation=%llu alive=1 releasePending=1\n", GetCurrentProcessId(), workerId, workerCreation);
+                const auto held = FixtureNativeCreation::Capture();
+                target.remoteCode = held.start;
+                SIZE_T copied = 0;
+                if(held.processId != target.processId || !target.remoteCode || held.calls != 1 ||
+                        (before ? held.threadId != 0 : !held.nativeCreated) ||
+                        !ReadProcessMemory(target.process.get(), target.remoteCode, target.originalCode.data(), target.originalCode.size(), &copied) || copied != target.originalCode.size())
+                    return 45;
+                std::printf("INFLIGHT_RETENTION phase=held\n");
+                if(!VerifyRetainedPages(target))
+                    return 46;
+                if(shutdown)
+                    NativeBreakIn::Shutdown();
+                else
+                    NativeBreakIn::EndTarget();
+                const auto rejected = NativeBreakIn::Create(0);
+                if(rejected.created || rejected.error != ERROR_BUSY || (shutdown && NativeBreakIn::BeginTarget(target.process.get())))
+                    return 47;
+                if(WaitForSingleObject(worker, 0) != WAIT_TIMEOUT || WaitForSingleObject(pending.release.get(), 0) != WAIT_TIMEOUT)
+                    return 57;
+                std::printf("INFLIGHT_RETIRE action=%ls createRejected=1 error=%lu workerPending=1\n", action, rejected.error);
+                std::printf("INFLIGHT_RETENTION phase=retired\n");
+                if(!VerifyRetainedPages(target) || !SetEvent(pending.release.get()))
+                    return 48;
+                pending.worker.join();
+                DWORD workerExit = STILL_ACTIVE;
+                if(WaitForSingleObject(worker, 0) != WAIT_OBJECT_0 || !GetExitCodeThread(worker, &workerExit) || workerExit != 0)
+                    return 58;
+                std::printf("INFLIGHT_WORKER_TERMINAL pid=%lu thread=%lu creation=%llu exit=%lu\n", GetCurrentProcessId(), workerId, workerCreation, workerExit);
+                created = FixtureNativeCreation::Capture();
+                FixtureNativeCreation::Configure(FixtureNativeCreation::Mode::Normal);
+                std::printf("INFLIGHT_RETURN created=%u status=%08lx error=%lu pid=%lu thread=%lu creation=%llu code=%p\n", unsigned(pending.result.created), pending.result.status, pending.result.error, created.processId, created.threadId, created.creation, created.start);
+                std::fflush(stdout);
+                if(!pending.result.created || pending.result.status != 0 || pending.result.error != 0 || !created.nativeCreated || !created.nativeHandleValid || created.handleClosed || created.processId != target.processId || created.start != target.remoteCode)
+                    return 49;
+            }
+            if(!released && target.exits == 1)
+            {
+                DWORD exit = STILL_ACTIVE;
+                if(WaitForSingleObject(target.helper.get(), 3000) != WAIT_OBJECT_0 || !GetExitCodeThread(target.helper.get(), &exit) || exit != 0)
+                    return 50;
+                std::printf("INFLIGHT_THREAD_TERMINAL pid=%lu thread=%lu exit=%lu\n", target.processId, target.threadId, exit);
+                if(!VerifyPages(target, 0, !shutdown))
+                    return 51;
+                if(shutdown)
+                {
+                    std::printf("INFLIGHT_RETENTION phase=completed\n");
+                    if(!VerifyRetainedPages(target))
+                        return 52;
+                }
+                released = SetEvent(target.completion.get()) != FALSE;
+                if(!released)
+                    return 53;
+            }
+            if(target.terminal)
+                break;
+        }
+        NativeBreakIn::EndTarget();
+        NativeBreakIn::Shutdown();
+        DWORD exit = STILL_ACTIVE;
+        if(!target.terminal || !released || target.breaks != 2 || target.helperBreaks != 1 || target.exits != 1 ||
+                WaitForSingleObject(target.process.get(), 1000) != WAIT_OBJECT_0 || !GetExitCodeProcess(target.process.get(), &exit) || exit != 7)
+            return 54;
+        std::printf("INFLIGHT_TARGET_TERMINAL pid=%lu exit=%lu breaks=%u helperBreaks=%u helperExits=%u\n", target.processId, exit, target.breaks, target.helperBreaks, target.exits);
         std::fflush(stdout);
         return 0;
     }
