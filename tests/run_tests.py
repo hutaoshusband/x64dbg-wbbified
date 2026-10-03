@@ -316,6 +316,7 @@ def parse_arguments():
     parser.add_argument("--msvc-toolset", help="Exact installed MSVC toolset version for the native or mcp-contracts source build")
     parser.add_argument("--unity-build", action="store_true", help="Enable global CMake unity compilation for the mcp-contracts source build")
     parser.add_argument("--contract-builds", type=Path, help="Reuse source-bound MCP artifacts from a private run containing build-x64/build-x32")
+    parser.add_argument("--contract-dependencies", type=Path, help="Share pinned archive-verified sources from an existing private MCP build directory")
     arguments = parser.parse_args()
     if not 1 <= arguments.timeout <= 60:
         parser.error("--timeout must be between 1 and 60 seconds")
@@ -344,6 +345,12 @@ def parse_arguments():
         if arguments.phase != "mcp-contracts" or arguments.cmake or arguments.msvc_toolset or arguments.unity_build:
             parser.error("--contract-builds requires mcp-contracts without new build options")
         arguments.contract_builds = arguments.contract_builds.expanduser().resolve()
+    if arguments.contract_dependencies:
+        if arguments.phase != "mcp-contracts" or arguments.contract_builds:
+            parser.error("--contract-dependencies requires a new mcp-contracts build without --contract-builds")
+        arguments.contract_dependencies = arguments.contract_dependencies.expanduser().resolve()
+        if not (arguments.contract_dependencies / "build-manifest.json").is_file():
+            parser.error("--contract-dependencies requires an existing private MCP build directory")
     return arguments
 
 
@@ -512,13 +519,16 @@ def main():
             build_debugger(run_root, architecture, arguments.cmake, arguments.msvc_toolset)
         return 0
     if arguments.phase == "mcp-contracts":
-        from native_contracts import build_contract_fixture, reuse_contract_fixture, run_contract_checks
+        from native_contracts import build_contract_fixture, prepare_dependency_sources, reuse_contract_fixture, run_contract_checks
         architectures = ("x64", "x32") if arguments.arch == "all" else (arguments.arch,)
         results = []
         catalogs = []
+        shared_dependencies = prepare_dependency_sources(arguments.contract_dependencies) if arguments.contract_dependencies else None
+        if shared_dependencies:
+            write_json(run_root / "shared-dependencies.json", shared_dependencies)
         for architecture in architectures:
             try:
-                binary = reuse_contract_fixture(arguments.contract_builds, run_root, architecture) if arguments.contract_builds else build_contract_fixture(run_root, architecture, arguments.cmake, arguments.msvc_toolset, arguments.unity_build)
+                binary = reuse_contract_fixture(arguments.contract_builds, run_root, architecture) if arguments.contract_builds else build_contract_fixture(run_root, architecture, arguments.cmake, arguments.msvc_toolset, arguments.unity_build, shared_dependencies)
                 checks, catalog = run_contract_checks(binary, run_root / architecture, architecture, arguments.case, arguments.timeout)
                 results.extend(checks)
                 catalogs.append(catalog)

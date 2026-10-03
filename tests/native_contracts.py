@@ -18,7 +18,7 @@ from pe_patch_checks import check_pe_file_patch_plans, check_new_file_publicatio
 
 
 CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_context_roundtrip",
-              "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_http_parser", "test_legacy_alias_contracts", "test_native_parity_catalog", "test_pe_file_patch_plans",
+              "test_bounded_json", "test_target_pointer_ranges", "test_source_dependencies", "test_dependency_source_reuse", "test_http_parser", "test_legacy_alias_contracts", "test_native_parity_catalog", "test_pe_file_patch_plans",
               "test_new_file_publication", "test_native_library_fault_oracles", "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
@@ -62,7 +62,7 @@ def contract_source_inputs():
     return [file_identity(path) for path in dict.fromkeys(paths) if path.is_file()]
 
 
-def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None, unity_build=False):
+def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None, unity_build=False, dependency_sources=None):
     build = Path(output) / f"build-{architecture}"
     build.mkdir()
     source = ROOT / "x64dbg"
@@ -74,6 +74,8 @@ def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None, 
                  f"-DCMAKE_C_COMPILER={compiler_path.as_posix()}", f"-DCMAKE_CXX_COMPILER={compiler_path.as_posix()}"]
     if qt.is_dir():
         configure.append(f"-DQt5_DIR={qt}")
+    if dependency_sources:
+        configure.extend(f"-DFETCHCONTENT_SOURCE_DIR_{item['package'].upper()}={Path(item['sourceDirectory']).as_posix()}" for item in dependency_sources["sources"])
     commands = []
     source_inputs = contract_source_inputs()
     with (build / "build.log").open("w", encoding="utf-8") as log:
@@ -101,6 +103,9 @@ def build_contract_fixture(output, architecture, cmake=None, msvc_toolset=None, 
                 "compiledDependencies": [file_identity(path) for path in sorted(build.glob("mcp_*.lib"))],
                 "compileCommands": json.loads((build / "compile_commands.json").read_text(encoding="utf-8")),
                 "notices": [file_identity(path) for path in sorted((build / "mcp-notices").glob("*.txt"))]}
+    if dependency_sources:
+        verify_dependency_sources(dependency_sources)
+        manifest["dependencyReuse"] = dependency_sources
     for input_file in source_inputs:
         assert file_identity(input_file["path"])["sha256"] == input_file["sha256"], "Build source changed during compilation"
     for key in ("cmake", "compiler"):
@@ -193,8 +198,9 @@ def check_dependency_sources(build):
     observations = []
     for entry in record["dependencies"]:
         package, notice_filename = packages[entry["role"]]
-        archive_root = build / "_deps" / f"{package}-subbuild" / f"{package}-populate-prefix/src"
-        fetch_path = archive_root / f"{package}-populate-stamp/{package}-populate-urlinfo.txt"
+        shared = next((item for item in manifest.get("dependencyReuse", {}).get("sources", []) if item["role"] == entry["role"]), None)
+        archive_root = Path(shared["archive"]["path"]).parent if shared else build / "_deps" / f"{package}-subbuild" / f"{package}-populate-prefix/src"
+        fetch_path = Path(shared["fetch"]["path"]) if shared else archive_root / f"{package}-populate-stamp/{package}-populate-urlinfo.txt"
         fetch = dict(line.split("=", 1) for line in fetch_path.read_text(encoding="utf-8").splitlines() if "=" in line)
         if "url(s)" in fetch:
             assert fetch["url(s)"] == entry["sourceUrl"], f"{entry['role']} fetched a different source URL"
@@ -207,15 +213,43 @@ def check_dependency_sources(build):
         matches = [archive for archive in archives if archive["sha256"] == entry["archiveSha256"]]
         assert len(matches) == 1, f"{entry['role']} retained archive does not match its SHA-256"
         notice_path = build / "mcp-notices" / entry["notice"]
-        source_notice = build / "_deps" / f"{package}-src" / notice_filename if notice_filename else ROOT / "x64dbg/src/mcp/notices/sqlite.txt"
+        source_directory = Path(shared["sourceDirectory"]) if shared else build / "_deps" / f"{package}-src"
+        source_notice = source_directory / notice_filename if notice_filename else ROOT / "x64dbg/src/mcp/notices/sqlite.txt"
         notice = file_identity(notice_path)
         assert notice["sha256"] == entry["noticeSha256"], f"{entry['role']} notice differs from its recorded SHA-256"
         assert notice_path.read_bytes() == source_notice.read_bytes(), f"{entry['role']} source notice was changed"
         observations.append({"role": entry["role"], "version": entry["version"], "license": entry["license"],
                              "sourceUrl": entry["sourceUrl"], "archive": matches[0], "fetch": file_identity(fetch_path),
-                             "notice": notice, "sourceNotice": file_identity(source_notice)})
+                             "notice": notice, "sourceNotice": file_identity(source_notice), "package": package, "sourceDirectory": str(source_directory)})
     assert file_identity(record_path) == record_identity, "Dependency record changed during verification"
     return {"dependencyRecord": record_identity, "sourceDependencies": observations}
+
+
+def prepare_dependency_sources(build):
+    build = Path(build).resolve()
+    if build.is_relative_to(ROOT):
+        raise McpError("Shared dependencies must stay outside the project workspace")
+    source_manifest = build / "build-manifest.json"
+    original = file_identity(source_manifest)
+    dependencies = check_dependency_sources(build)
+    from dependency_checks import verify_archive_sources
+    sources = []
+    for item in dependencies["sourceDependencies"]:
+        print(f"Verifying shared dependency source: {item['role']}", flush=True)
+        verified = verify_archive_sources(item["archive"]["path"], item["archive"]["sha256"], item["sourceDirectory"])
+        sources.append({**item, **verified})
+    assert file_identity(source_manifest) == original
+    return {"sourceBuildManifest": original, "dependencyRecord": dependencies["dependencyRecord"], "sources": sources}
+
+
+def verify_dependency_sources(dependencies):
+    from dependency_checks import verify_archive_sources
+    assert file_identity(dependencies["sourceBuildManifest"]["path"]) == dependencies["sourceBuildManifest"]
+    assert file_identity(dependencies["dependencyRecord"]["path"]) == dependencies["dependencyRecord"]
+    for item in dependencies["sources"]:
+        verified = verify_archive_sources(item["archive"]["path"], item["archive"]["sha256"], item["sourceDirectory"])
+        assert all(verified[key] == item[key] for key in verified), "Shared dependency sources changed during build"
+        assert file_identity(item["fetch"]["path"]) == item["fetch"]
 
 
 def independent_validators(catalog):
@@ -2190,6 +2224,9 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                     assert not probe.call("range", {**reference, "size": 2}, f"x{width}")["valid"]
                     assert not probe.call("range", {"address": {"addressHex": "0x100000000"}, "size": 1}, "x32")["valid"]
                 result["targetWidths"] = [32, 64]
+            elif name == "test_dependency_source_reuse":
+                from dependency_checks import check_dependency_source_reuse
+                result.update(check_dependency_source_reuse(output))
             elif name == "test_source_dependencies":
                 result.update(check_dependency_sources(binary.parent))
                 observed = probe.call("dependencies")
