@@ -2,6 +2,8 @@
 #include "local_pipe.h"
 #include "build_identity.h"
 #include "lifecycle.h"
+#include "worker_registry.h"
+#include "worker.h"
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -95,4 +97,72 @@ Json local_pipe_reference(const Json& input)
     {
         return {{"valid", false}, {"error", error_json(error)}};
     }
+}
+
+Json worker_registry_reference(const Json& input)
+{
+    struct ProcessCloser { void operator()(void* value) const { if(value) CloseHandle(value); } };
+    try
+    {
+        const auto role = input.at("role").get<std::string>();
+        const auto expected = expected_identity(input.at("expectedPeer"));
+        if(input.at("requestedMode") != "gui" && input.at("requestedMode") != "headless") throw ContractError{"invalid_argument", "requestedMode", "Worker fixture mode is invalid"};
+        const auto mode = input.at("requestedMode") == "gui" ? WorkerMode::Gui : WorkerMode::Headless;
+        const auto timeout = input.at("timeoutMs").get<std::uint32_t>();
+        const auto peer_build = input.at("expectedBuildId").get<std::string>();
+        if(role == "client")
+        {
+            auto pipe = require_pipe_value(LocalPipe::connect(input.at("installation").get<std::string>(), input.at("profile").get<std::string>(), input.at("channel").get<std::string>(), timeout));
+            const auto admitted = require_pipe_value(register_worker(*pipe, expected, peer_build, {input.at("instanceId").get<std::string>()}, mode, timeout));
+            write_receipt(reference_path(input, "admittedPath"), admitted);
+            const auto release = reference_path(input, "releasePath");
+            const auto expires = GetTickCount64() + 10000;
+            while(!std::filesystem::exists(release) && GetTickCount64() < expires) Sleep(10);
+            if(!std::filesystem::exists(release)) throw ContractError{"ipc_timeout", "", "Worker fixture release was not observed"};
+            return {{"valid", true}, {"admitted", admitted}};
+        }
+        if(role != "server" && role != "reserve") throw ContractError{"invalid_argument", "role", "Unknown worker registry fixture role"};
+        const std::unique_ptr<void, ProcessCloser> process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, expected.pid));
+        if(!process) throw ContractError{"process_identity_unavailable", "", "Cannot open the private worker generation"};
+        WorkerRegistry registry;
+        const auto instance = require_pipe_value(registry.reserve(process.get(), expected, peer_build, mode));
+        if(role == "reserve") return {{"valid", true}, {"instanceId", instance.value}, {"workers", registry.registered_workers()}};
+        const auto duplicate = registry.reserve(process.get(), expected, peer_build, mode);
+        if(!std::holds_alternative<ContractError>(duplicate)) throw ContractError{"internal_error", "", "Duplicate worker reservation was accepted"};
+        auto pipe = require_pipe_value(LocalPipe::create_first(input.at("installation").get<std::string>(), input.at("profile").get<std::string>(), input.at("channel").get<std::string>()));
+        write_receipt(reference_path(input, "readyPath"), {{"name", require_pipe_value(launch_utf8(pipe->name()))}, {"identity", native_process_json(pipe->owner())},
+            {"buildId", BuildId}, {"instanceId", instance.value}});
+        require_pipe_value(pipe->accept(timeout));
+        const auto admitted = require_pipe_value(registry.admit(*pipe, instance, timeout));
+        require_pipe_value(pipe->send(IpcMessageKind::Response, 2, worker_registration_envelope(instance, pipe->owner().creationTime, admitted), timeout));
+        const auto acknowledgment = require_pipe_value(pipe->receive(timeout));
+        if(acknowledgment.header.kind != IpcMessageKind::Request || acknowledgment.header.requestId != 2 || acknowledgment.envelope !=
+            worker_registration_envelope(instance, pipe->owner().creationTime, {{"registered", true}})) throw ContractError{"invalid_frame", "", "Worker reply was not acknowledged"};
+        const auto replay = registry.admit(*pipe, instance, timeout);
+        if(!std::holds_alternative<ContractError>(replay)) throw ContractError{"internal_error", "", "Consumed worker reservation was accepted"};
+        const auto registered = registry.registered_workers();
+        if(registered != Json::array({admitted})) throw ContractError{"internal_error", "", "Worker registry did not retain its actual admitted generation"};
+        Json explicit_removal = nullptr;
+        if(input.value("explicitRemoval", false))
+        {
+            require_pipe_value(registry.unregister(instance));
+            const auto repeated = registry.unregister(instance);
+            const auto stale = registry.admit(*pipe, instance, timeout);
+            const auto replacement = require_pipe_value(registry.reserve(process.get(), expected, peer_build, mode));
+            if(replacement.value == instance.value || !std::holds_alternative<ContractError>(repeated) || !std::holds_alternative<ContractError>(stale))
+                throw ContractError{"internal_error", "", "Retired worker reservation was reused"};
+            explicit_removal = {{"repeatedRemoval", error_json(std::get<ContractError>(repeated))}, {"retiredAdmission", error_json(std::get<ContractError>(stale))},
+                {"replacementId", replacement.value}, {"workers", registry.registered_workers()}};
+            require_pipe_value(registry.unregister(replacement));
+        }
+        write_receipt(reference_path(input, "witnessPath"), {{"value", 42}, {"admitted", admitted}, {"workers", registered},
+            {"duplicateRefusal", error_json(std::get<ContractError>(duplicate))}, {"replayRefusal", error_json(std::get<ContractError>(replay))}, {"explicitRemoval", explicit_removal}});
+        if(WaitForSingleObject(process.get(), 10000) != WAIT_OBJECT_0) throw ContractError{"ipc_timeout", "", "Worker fixture did not exit"};
+        DWORD code = 0;
+        if(!GetExitCodeProcess(process.get(), &code) || code != 0) throw ContractError{"internal_error", "", "Worker fixture did not exit normally"};
+        const auto after = registry.registered_workers();
+        if(!after.empty()) throw ContractError{"internal_error", "", "Terminal worker generation remained registered"};
+        return {{"valid", true}, {"admitted", admitted}, {"afterExit", after}, {"workerExitCode", code}};
+    }
+    catch(const ContractError& error) { return {{"valid", false}, {"error", error_json(error)}}; }
 }

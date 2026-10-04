@@ -523,6 +523,8 @@ int main(int argc, char** argv)
                         reply = library_reference(input);
                     else if(mode == "local-pipe-reference" && argc == 2)
                         reply = local_pipe_reference(input);
+                    else if(mode == "worker-registry-reference" && argc == 2)
+                        reply = worker_registry_reference(input);
                     else if(mode == "parity-resolve-input" && argc == 2)
                     {
                         if(const auto error = validate_schema(string_schema("utf8-text", 16384), input))

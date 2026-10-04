@@ -22,7 +22,7 @@ CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_
               "test_new_file_publication", "test_native_library_fault_oracles", "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
-              "test_provider_ui_contracts", "test_library_script_contracts", "test_job_event_artifact_contracts", "test_native_launch_arguments", "test_native_peer_identity", "test_native_local_pipe", "test_native_broker_lifetime", "test_native_component_builds", "test_ipc_wire_codec")
+              "test_provider_ui_contracts", "test_library_script_contracts", "test_job_event_artifact_contracts", "test_native_launch_arguments", "test_native_peer_identity", "test_native_local_pipe", "test_native_broker_lifetime", "test_native_worker_registration", "test_native_component_builds", "test_ipc_wire_codec")
 
 EXECUTION_TOOLS = ("execution_resume", "execution_pause", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to",
                    "execution_skip_instruction", "execution_wait", "threads_list", "threads_select", "threads_suspend", "threads_resume", "threads_context",
@@ -2301,6 +2301,9 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
             elif name == "test_native_local_pipe":
                 from pipe_checks import check_local_pipes
                 result.update(check_local_pipes(probe, architecture, process_token_oracle, file_handle_oracle))
+            elif name == "test_native_worker_registration":
+                from pipe_checks import check_worker_registration
+                result.update(check_worker_registration(probe, architecture, process_token_oracle, file_handle_oracle))
             elif name == "test_native_broker_lifetime":
                 from pipe_checks import check_broker_lifetime
                 result.update(check_broker_lifetime(probe, architecture, process_token_oracle, file_handle_oracle))

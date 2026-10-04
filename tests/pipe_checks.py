@@ -327,6 +327,129 @@ def check_local_pipes(probe, architecture, token_oracle, file_oracle):
             "crossArchitectureChannels": sum(v["variant"].startswith("native-cross-architecture") for v in results), "ordinaryLocalHandshakeOnly": True}
 
 
+def check_worker_registration(probe, architecture, token_oracle, file_oracle):
+    output = probe.output / "native-worker-registration"
+    output.mkdir()
+    binary = probe.binary
+    build_id = json.loads((probe.output / "compiled-contracts.json").read_text())["buildId"]
+    pairs = [("normal", binary, build_id, False), ("explicit-removal", binary, build_id, True),
+             ("wrong-mode", binary, build_id, False), ("wrong-build", binary, "0" * 64, False)]
+    if architecture == "x32":
+        other = binary.parent.parent / "build-x64/wininspect-mcp-contract-fixture.exe"
+        other_catalog = probe.output.parent / "x64/compiled-contracts.json"
+        if other.is_file() and other_catalog.is_file():
+            other_id = json.loads(other_catalog.read_text())["buildId"]
+            pairs.extend((("cross-architecture", other, other_id, False), ("cross-architecture-reverse", other, other_id, True)))
+    observations = []
+    controls = []
+    for variant, client_binary, client_build, explicit in pairs:
+        case = output / variant
+        case.mkdir()
+        server_binary = client_binary if variant == "cross-architecture-reverse" else binary
+        worker_binary = binary if variant == "cross-architecture-reverse" else client_binary
+        worker_build = build_id if variant == "cross-architecture-reverse" else client_build
+        server_build = client_build if variant == "cross-architecture-reverse" else build_id
+        job = OwnedJob()
+        processes = []
+        witness = case / "witness.json"
+        write_json(witness, {"value": 7})
+        original = file_identity(witness)
+        try:
+            worker = subprocess.Popen([str(worker_binary), "worker-registry-reference"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+            processes.append(worker)
+            job.assign(worker)
+            worker_identity, worker_queries = pipe_process_identity(worker, worker_binary, token_oracle, file_oracle)
+            assert KERNEL.WaitForSingleObject(worker._handle, 0) == 258
+            request = {"role": "server", "installation": hashlib.sha256(str(binary.parent.parent).encode()).hexdigest(),
+                       "profile": hashlib.sha256(b"owned native worker registration").hexdigest(), "channel": secrets.token_hex(32), "timeoutMs": 5000,
+                       "expectedPeer": worker_identity, "expectedBuildId": worker_build, "requestedMode": "headless", "explicitRemoval": explicit,
+                       "readyPath": str(case / "ready.json"), "witnessPath": str(witness)}
+            if variant == "normal":
+                for name, field, value in (("stale-generation", "creationTime", str(int(worker_identity["creationTime"]) + 1)),
+                                           ("wrong-user", "userSid", "S-1-5-18"), ("wrong-session", "sessionId", worker_identity["sessionId"] + 1),
+                                           ("wrong-architecture", "architecture", "x32" if worker_identity["architecture"] == "x64" else "x64")):
+                    changed = {**request, "role": "reserve", "expectedPeer": {**worker_identity, field: value}}
+                    refused = probe.call("worker-registry-reference", changed)
+                    assert not refused["valid"] and refused["error"]["code"] == "worker_identity_mismatch"
+                    assert file_identity(witness) == original and KERNEL.WaitForSingleObject(worker._handle, 0) == 258
+                    controls.append({"case": name, "response": refused, "witness": original, "workerStillLive": True})
+                changed = copy.deepcopy(request)
+                changed["role"] = "reserve"
+                changed["expectedPeer"]["image"]["sha256"] = "0" * 64
+                refused = probe.call("worker-registry-reference", changed)
+                assert not refused["valid"] and refused["error"]["code"] == "worker_identity_mismatch"
+                assert file_identity(witness) == original
+                controls.append({"case": "wrong-image", "response": refused, "witness": original})
+            server = subprocess.Popen([str(server_binary), "worker-registry-reference"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+            processes.append(server)
+            job.assign(server)
+            server_identity, server_queries = pipe_process_identity(server, server_binary, token_oracle, file_oracle)
+            write_process_input(server, request)
+            ready = wait_pipe_receipt(server, case / "ready.json")
+            assert ready["identity"] == server_identity and ready["buildId"] == server_build
+            assert len(ready["instanceId"]) == 71 and ready["instanceId"].startswith("worker-")
+            client_request = {**request, "role": "client", "expectedPeer": server_identity, "expectedBuildId": server_build,
+                              "instanceId": ready["instanceId"], "admittedPath": str(case / "client-admitted.json"), "releasePath": str(case / "release")}
+            if variant == "wrong-mode":
+                client_request["requestedMode"] = "gui"
+            write_process_input(worker, client_request)
+            if variant in ("wrong-mode", "wrong-build"):
+                server_result = collect_pipe_process(server)
+                worker_result = collect_pipe_process(worker)
+                assert not server_result["valid"] and not worker_result["valid"]
+                assert server_result["error"]["code"] == ("worker_registration_mismatch" if variant == "wrong-mode" else "ipc_handshake_mismatch")
+                assert file_identity(witness) == original
+                observations.append({"variant": variant, "server": server_identity, "worker": worker_identity, "serverResult": server_result,
+                                     "workerResult": worker_result, "witness": original, "serverExitCode": server.returncode, "workerExitCode": worker.returncode})
+                continue
+            admitted = wait_pipe_receipt(worker, case / "client-admitted.json")
+            expires = time.monotonic() + 5
+            while time.monotonic() < expires:
+                try:
+                    value = json.loads(witness.read_bytes())
+                    if value.get("value") == 42:
+                        break
+                except json.JSONDecodeError:
+                    pass
+                assert server.poll() is None
+                time.sleep(0.01)
+            else:
+                raise AssertionError("Native worker admission did not update its private witness")
+            expected = {"instanceId": ready["instanceId"], "requestedMode": "headless", "registrationState": "registered", "engineReady": False,
+                        "process": worker_identity, "buildId": worker_build}
+            assert admitted == value["admitted"] == expected and value["workers"] == [expected]
+            assert value["duplicateRefusal"]["code"] == "worker_already_reserved" and value["replayRefusal"]["code"] == "worker_already_registered"
+            if explicit:
+                removal = value["explicitRemoval"]
+                assert removal["workers"] == [] and removal["replacementId"] != ready["instanceId"]
+                assert removal["retiredAdmission"]["code"] == removal["repeatedRemoval"]["code"] == "worker_registration_missing"
+            else:
+                assert value["explicitRemoval"] is None
+            assert KERNEL.WaitForSingleObject(worker._handle, 0) == KERNEL.WaitForSingleObject(server._handle, 0) == 258
+            held_receipt = {"workerWaitResult": 258, "serverWaitResult": 258, "worker": pipe_process_identity(worker, worker_binary, token_oracle, file_oracle)[0],
+                            "server": pipe_process_identity(server, server_binary, token_oracle, file_oracle)[0]}
+            assert held_receipt["worker"] == worker_identity and held_receipt["server"] == server_identity
+            (case / "release").write_bytes(b"release")
+            worker_result = collect_pipe_process(worker)
+            server_result = collect_pipe_process(server)
+            assert worker_result == {"valid": True, "admitted": expected}
+            assert server_result == {"valid": True, "admitted": expected, "afterExit": [], "workerExitCode": 0}
+            observations.append({"variant": variant, "server": server_identity, "worker": worker_identity, "serverBuildId": server_build, "workerBuildId": worker_build,
+                                 "serverTokenQueries": server_queries, "workerTokenQueries": worker_queries, "serverResult": server_result, "workerResult": worker_result,
+                                 "witness": file_identity(witness), "observed": value, "heldLive": held_receipt, "serverExitCode": server.returncode, "workerExitCode": worker.returncode})
+        finally:
+            job.close()
+            for process in processes:
+                if process.poll() is None:
+                    process.wait(timeout=5)
+            write_json(output / "observations.json", {"cases": observations, "controls": controls})
+    return {"nativeWorkerRegistrations": observations, "actualReservationRefusals": controls,
+            "acceptedWorkerGenerations": sum(v["serverResult"]["valid"] for v in observations), "engineRegistrationVerified": False,
+            "brokerIntegrationVerified": False, "operationalMcpTransport": False}
+
+
 def check_broker_lifetime(probe, architecture, token_oracle, file_oracle):
     output = probe.output / "broker-lifetime"
     output.mkdir()

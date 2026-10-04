@@ -1249,6 +1249,8 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/registry.h"
 		"src/mcp/common/schema_helpers.cpp"
 		"src/mcp/common/schema_helpers.h"
+		"src/mcp/common/worker_registry.cpp"
+		"src/mcp/common/worker_registry.h"
 	)
 
 	add_library(mcp_common STATIC)
