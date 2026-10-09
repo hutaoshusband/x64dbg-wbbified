@@ -22,7 +22,7 @@ CASE_NAMES = ("test_compiled_schema_catalog", "test_contract_boundaries", "test_
               "test_new_file_publication", "test_native_library_fault_oracles", "test_result_contracts", "test_registry_contracts", "test_registry_dispatch", "test_schema_references",
               "test_lifecycle_contracts", "test_execution_contracts", "test_inspection_contracts", "test_memory_contracts",
               "test_breakpoint_trace_contracts", "test_assembly_file_contracts", "test_module_analysis_contracts", "test_database_settings_contracts",
-              "test_provider_ui_contracts", "test_library_script_contracts", "test_job_event_artifact_contracts", "test_native_launch_arguments", "test_native_peer_identity", "test_native_local_pipe", "test_native_broker_lifetime", "test_native_worker_registration", "test_native_component_builds", "test_ipc_wire_codec")
+              "test_provider_ui_contracts", "test_library_script_contracts", "test_job_event_artifact_contracts", "test_native_launch_arguments", "test_native_peer_identity", "test_native_local_pipe", "test_native_broker_lifetime", "test_native_worker_registration", "test_native_component_builds", "test_native_stdio_transport", "test_ipc_wire_codec")
 
 EXECUTION_TOOLS = ("execution_resume", "execution_pause", "execution_step_into", "execution_step_over", "execution_step_out", "execution_run_to",
                    "execution_skip_instruction", "execution_wait", "threads_list", "threads_select", "threads_suspend", "threads_resume", "threads_context",
@@ -551,7 +551,7 @@ def check_registry_contracts(probe, registry, validators):
         assert not validators[(name, "input")].is_valid(value) and not probe.call("tool-input", value, name)["valid"]
         comparisons += 1
     for tool in registry["tools"]:
-        assert tool["availability"] == ("implemented" if tool["name"] in ("capabilities_list", "capabilities_describe", "capabilities_search") else "planned")
+        assert tool["availability"] == ("implemented" if tool["name"] in ("capabilities_list", "capabilities_describe", "capabilities_search", "server_health", "server_info") else "planned")
     return {"declaredTools": len(registry["tools"]), "independentComparisons": comparisons, "operationalTools": 0}
 
 
@@ -598,7 +598,7 @@ def check_registry_dispatch(probe, registry, validators):
     assert not probe.call("call", {"limit": 2, "cursor": cursors[0], "domain": "capabilities"}, "capabilities_list")["valid"]
     assert not probe.call("call", {"cursor": "registry:wrong-build:capabilities_list"}, "capabilities_list")["valid"]
     implemented = call("capabilities_list", {"availability": "implemented"})
-    assert [item["name"] for item in implemented["items"]] == ["capabilities_describe", "capabilities_list", "capabilities_search"]
+    assert [item["name"] for item in implemented["items"]] == ["capabilities_describe", "capabilities_list", "capabilities_search", "server_health", "server_info"]
     assert call("capabilities_list", {"provider": "missing.provider"})["items"] == []
     for tool in actual:
         assert call("capabilities_describe", {"capabilityId": tool["name"]})["capability"] == tool
@@ -606,12 +606,28 @@ def check_registry_dispatch(probe, registry, validators):
     assert search["items"][0] == {"capabilityId": "capabilities_list", "description": next(item["description"] for item in actual if item["name"] == "capabilities_list"), "score": 3}
     ranked = call("capabilities_search", {"query": "capabilities"})
     assert [item["capabilityId"] for item in ranked["items"] if item["score"] == 2] == ["capabilities_describe", "capabilities_list", "capabilities_search"]
-    for name, value in (("server_info", {}), ("control_release", {"instanceId": "instance-1", "targetId": "target-1", "targetGeneration": "1", "leaseId": "lease-1"}),
+    for name, value in (("control_release", {"instanceId": "instance-1", "targetId": "target-1", "targetGeneration": "1", "leaseId": "lease-1"}),
                         ("missing_tool", {}), ("capabilities_describe", {"capabilityId": "missing_tool"})):
         rejected = probe.call("call", value, name)
         assert not rejected["valid"] and rejected["error"]["code"] == "unsupported_capability"
+    observed_index = len(probe.observations)
+    info = call("server_info", {})
+    observed = probe.observations[observed_index]["processIdentity"]
+    assert info["buildId"] == registry["buildId"]
+    assert info["protocolProfiles"] == ["2024-11-05-suite"]
+    assert info["endpoint"] == {"transport": "stdio", "redactedAddress": "stdio"}
+    assert info["limits"] == {"frameBytes": 8388608, "payloadBytes": 1048576, "pageLimit": 1000, "timeoutMs": 60000}
+    broker = info["broker"]
+    assert broker["pid"] == observed["pid"] and broker["creationTime"] == broker["generation"] == observed["creationTime"]
+    assert broker["imageSha256"] == file_identity(probe.binary)["sha256"]
+    assert broker["installationId"] == final_directory_sha(probe.binary)
+    assert broker["sessionId"] == process_token_oracle()[0]["sessionId"]
+    health = call("server_health", {})
+    assert health["broker"] == {"status": "ready", "failure": None}
+    assert health["ipc"]["status"] == health["store"]["status"] == "unavailable"
+    assert health["ipc"]["failure"]["code"] == health["store"]["failure"]["code"] == "unsupported_capability"
     return {"exactDescriptors": len(actual), "paginationPages": len(cursors) + 1, "boundedDefaultAndMaximumPages": bounded_pages,
-            "implementedNativeMetadataHandlers": 3, "publicOperationalTools": 0}
+            "implementedNativeMetadataHandlers": 5, "publicOperationalTools": 0}
 
 
 def check_lifecycle_contracts(probe, validators):
@@ -1977,6 +1993,24 @@ def file_handle_oracle(binary):
         KERNEL.CloseHandle(handle)
 
 
+def final_directory_sha(binary):
+    KERNEL.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    KERNEL.CreateFileW.restype = wintypes.HANDLE
+    KERNEL.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    KERNEL.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    handle = KERNEL.CreateFileW(str(Path(binary).parent), 0x80, 1 | 2 | 4, None, 3, 0x02000000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = KERNEL.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+        if not length or length >= len(buffer):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return hashlib.sha256(buffer.value.encode("utf-8")).hexdigest()
+    finally:
+        KERNEL.CloseHandle(handle)
+
+
 def check_native_parity_catalog(probe, catalog):
     baseline_path = ROOT / "tests/native_mcp/parity-manifest.json"
     baseline_bytes = baseline_path.read_bytes()
@@ -2098,7 +2132,8 @@ def check_native_components(probe, architecture, validators, catalog):
         assert set(information) == {"schemaVersion", "component", "buildId", "wireVersion", "process", "declaredToolCount", "declaredLegacyAliasCount", "declaredParityOperationCount", "implementedTransports", "operationalTools"}
         assert information["schemaVersion"] == information["wireVersion"] == 1 and information["component"] == component
         assert information["buildId"] == catalog["buildId"] and information["declaredToolCount"] == len(catalog["tools"])
-        assert information["implementedTransports"] == information["operationalTools"] == []
+        assert information["implementedTransports"] == (["stdio"] if component == "broker" else [])
+        assert information["operationalTools"] == []
         assert information["declaredLegacyAliasCount"] == 80
         assert information["declaredParityOperationCount"] == 3940
         process = information["process"]
@@ -2121,12 +2156,115 @@ def check_native_components(probe, architecture, validators, catalog):
             assert not stdout and json.loads(stderr)["code"] == "unsupported_capability"
         stdout, stderr, receipt = probe.execute([str(binary), "--help"])
         assert not stdout and b"--build-info" in stderr
+        if component == "broker":
+            assert b"--serve-stdio" in stderr
     worker = probe.call("worker-build-info")
     assert worker["valid"], worker
     verify(worker["information"], probe.observations[-1]["processIdentity"], probe.binary, "worker_adapter")
     write_json(probe.output / "native-components.json", observations)
     return {"componentProcesses": observations, "inheritedTokenOracle": expected_token, "tokenQueryStatuses": token_queries,
             "unimplementedTransportStartsRejected": 6, "workerLinked": True}
+
+
+def check_native_stdio_transport(probe, architecture, registry, tool_validators):
+    import queue
+    import threading
+    from wi_driver import OwnedJob, process_identity
+    binary = probe.binary.parent / "wininspect-mcp.exe"
+    implemented = ["capabilities_describe", "capabilities_list", "capabilities_search", "server_health", "server_info"]
+    assert [tool["name"] for tool in registry["tools"] if tool["availability"] == "implemented"] == implemented
+    expected_inputs = {tool["name"]: tool["inputSchema"] for tool in registry["tools"] if tool["name"] in implemented}
+    job = OwnedJob()
+    process = subprocess.Popen([str(binary), "--serve-stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+    messages = []
+    try:
+        job.assign(process)
+        identity = process_identity(process)
+        pending = queue.Queue()
+        def reader():
+            while True:
+                line = process.stdout.readline()
+                pending.put(line if line else None)
+                if not line:
+                    return
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        counter = 0
+        def transact(payload=None, raw=None):
+            nonlocal counter
+            counter += 1
+            body = raw if raw is not None else (json.dumps(payload) + "\n").encode()
+            process.stdin.write(body)
+            process.stdin.flush()
+            line = pending.get(timeout=probe.timeout)
+            assert line, "stdio broker closed stdout mid-session"
+            response = json.loads(line.decode())
+            messages.append({"request": None if raw is not None else payload, "rawBytes": len(body), "response": response})
+            return response
+        initialized = transact({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "stdio-check", "version": "1"}}})
+        assert initialized == {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
+                                                                   "serverInfo": {"name": "wininspect-mcp", "version": registry["buildId"]}}}
+        process.stdin.write(b'{"jsonrpc": "2.0", "method": "notifications/initialized"}\n')
+        process.stdin.flush()
+        counter += 1
+        assert transact({"jsonrpc": "2.0", "id": 2, "method": "ping"}) == {"jsonrpc": "2.0", "id": 2, "result": {}}
+        fallback = transact({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {"protocolVersion": "1900-01-01"}})
+        assert fallback["result"]["protocolVersion"] == "2024-11-05"
+        listed = transact({"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}})
+        assert [tool["name"] for tool in listed["result"]["tools"]] == implemented
+        assert "nextCursor" not in listed["result"]
+        for tool in listed["result"]["tools"]:
+            assert set(tool) == {"name", "description", "inputSchema", "annotations"}
+            assert tool["inputSchema"] == expected_inputs[tool["name"]]
+            assert set(tool["annotations"]) == {"readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"}
+        assert transact({"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {"cursor": "nope"}})["error"]["code"] == -32602
+        information = transact({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "server_info", "arguments": {}}})
+        envelope = json.loads(information["result"]["content"][0]["text"])
+        assert information["result"].get("isError") is not True and tool_validators[("server_info", "output")].is_valid(envelope)
+        assert probe.call("tool-output", envelope, "server_info")["valid"]
+        observed = envelope["data"]["broker"]
+        assert observed["pid"] == identity["pid"] and observed["creationTime"] == observed["generation"] == identity["creationTime"]
+        assert observed["imageSha256"] == file_identity(binary)["sha256"]
+        assert observed["installationId"] == final_directory_sha(binary)
+        assert envelope["context"] == {"brokerGeneration": identity["creationTime"]} and envelope["stateVersion"] == "1"
+        assert envelope["outcome"] == "completed" and envelope["verification"]["status"] == "verified"
+        health = transact({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "server_health", "arguments": {}}})
+        assert tool_validators[("server_health", "output")].is_valid(json.loads(health["result"]["content"][0]["text"]))
+        assert json.loads(health["result"]["content"][0]["text"])["data"]["broker"] == {"status": "ready", "failure": None}
+        page = transact({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                         "params": {"name": "capabilities_list", "arguments": {"limit": 1}}})
+        assert tool_validators[("capabilities_list", "output")].is_valid(json.loads(page["result"]["content"][0]["text"]))
+        assert len(json.loads(page["result"]["content"][0]["text"])["data"]["items"]) == 1
+        assert transact({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "target_open", "arguments": {}}})["error"]["code"] == -32602
+        rejected = transact({"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"name": "server_info", "arguments": {"bogus": 1}}})
+        assert rejected["result"]["isError"] is True and json.loads(rejected["result"]["content"][0]["text"])["code"] == "invalid_argument"
+        assert transact(raw=b'{"truncated":\n')["error"]["code"] == -32700
+        assert transact({"jsonrpc": "2.0", "id": 11})["error"]["code"] == -32600
+        assert transact({"jsonrpc": "2.0", "id": 12, "method": "resources/list"})["error"]["code"] == -32601
+        oversized = transact(raw=b"z" * (1024 * 1024 + 64) + b"\n")
+        assert oversized["id"] is None and oversized["error"]["code"] == -32600
+        assert transact({"jsonrpc": "2.0", "id": 13, "method": "ping"}) == {"jsonrpc": "2.0", "id": 13, "result": {}}
+        process.stdin.close()
+        process.wait(timeout=probe.timeout)
+        assert process.returncode == 0
+        thread.join(timeout=probe.timeout)
+        errors = process.stderr.read()
+        assert errors == b""
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        job.close()
+    connector = probe.binary.parent / "wininspect-mcp-connect.exe"
+    stdout, stderr, receipt = probe.execute([str(connector), "--serve-stdio"], expected_exit=64)
+    assert not stdout and json.loads(stderr)["code"] == "unsupported_capability"
+    probe.observations.append({"command": [str(binary), "--serve-stdio"], "processIdentity": identity, "exitCode": 0,
+                               "conversationMessages": len(messages), "stderrBytes": 0})
+    write_json(probe.output / "native-stdio-conversation.json", messages)
+    return {"stdioMessages": len(messages), "implementedStdioTools": implemented, "brokerPid": identity["pid"],
+            "cleanExit": True, "connectorStdioRejected": True}
 
 
 def check_ipc_wire(probe):
@@ -2309,6 +2447,8 @@ def run_contract_checks(binary, output, architecture, selected, timeout):
                 result.update(check_broker_lifetime(probe, architecture, process_token_oracle, file_handle_oracle))
             elif name == "test_native_component_builds":
                 result.update(check_native_components(probe, architecture, validators, catalog))
+            elif name == "test_native_stdio_transport":
+                result.update(check_native_stdio_transport(probe, architecture, registry, tool_validators))
             elif name == "test_ipc_wire_codec":
                 result.update(check_ipc_wire(probe))
         except Exception as error:

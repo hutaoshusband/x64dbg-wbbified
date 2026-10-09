@@ -1,8 +1,12 @@
 #include "registry.h"
 #include "build_identity.h"
+#include "lifecycle.h"
+#include "platform.h"
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <limits>
+#include <windows.h>
 
 namespace wininspect::mcp
 {
@@ -170,6 +174,60 @@ Checked<Json> describe_capability(const Json& input)
     return Json{{"capability", tool_descriptor(*tool)}};
 }
 
+Checked<std::string> local_installation_id(std::string_view imagePath)
+{
+    const auto image = launch_utf16(imagePath);
+    if(const auto* error = std::get_if<ContractError>(&image))
+        return *error;
+    const auto directory = std::filesystem::path(std::get<std::wstring>(image)).parent_path();
+    HANDLE raw = CreateFileW(directory.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if(!raw || raw == INVALID_HANDLE_VALUE)
+        return ContractError{"broker_start_failed", "", "Open installation directory failed with Win32 error " + std::to_string(GetLastError())};
+    std::wstring final_path(32768, L'\0');
+    const auto length = GetFinalPathNameByHandleW(raw, final_path.data(), static_cast<DWORD>(final_path.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    CloseHandle(raw);
+    if(!length || length >= final_path.size())
+        return ContractError{"broker_start_failed", "", "Resolve installation directory failed with Win32 error " + std::to_string(GetLastError())};
+    final_path.resize(length);
+    const auto utf8 = launch_utf8(final_path);
+    if(const auto* error = std::get_if<ContractError>(&utf8))
+        return *error;
+    return sha256_bytes(std::get<std::string>(utf8));
+}
+
+Checked<Json> server_info(const Json& input)
+{
+    (void)input;
+    const auto identity = capture_current_process();
+    if(const auto* error = std::get_if<ContractError>(&identity))
+        return *error;
+    const auto& owner = std::get<NativeProcessIdentity>(identity);
+    const auto installation = local_installation_id(owner.image.path);
+    if(const auto* error = std::get_if<ContractError>(&installation))
+        return *error;
+    return Json{{"buildId", BuildId},
+        {"broker", Json{{"pid", owner.pid}, {"creationTime", decimal64(owner.creationTime)}, {"generation", decimal64(owner.creationTime)},
+            {"installationId", std::get<std::string>(installation)}, {"imageSha256", owner.image.sha256}, {"sessionId", owner.sessionId}}},
+        {"protocolProfiles", Json::array({"2024-11-05-suite"})},
+        {"endpoint", Json{{"transport", "stdio"}, {"redactedAddress", "stdio"}}},
+        {"limits", Json{{"frameBytes", MaximumFrameBytes}, {"payloadBytes", MaximumPayloadBytes},
+            {"pageLimit", MaximumPageLimit}, {"timeoutMs", MaximumTimeoutMs}}}};
+}
+
+Checked<Json> server_health(const Json& input)
+{
+    (void)input;
+    const auto identity = capture_current_process();
+    if(const auto* error = std::get_if<ContractError>(&identity))
+        return *error;
+    return Json{{"broker", Json{{"status", "ready"}, {"failure", nullptr}}},
+        {"ipc", Json{{"status", "unavailable"},
+            {"failure", Json{{"code", "unsupported_capability"}, {"message", "No local IPC channel is configured in stdio mode"}, {"path", ""}}}}},
+        {"store", Json{{"status", "unavailable"},
+            {"failure", Json{{"code", "unsupported_capability"}, {"message", "No profile store is bound in stdio mode"}, {"path", ""}}}}}};
+}
+
 Json page_output(Json item)
 {
     const auto properties = Json{{"snapshotId", string_schema("sha256", 64)}, {"items", bounded_array_schema(std::move(item), MaximumPageLimit)},
@@ -248,10 +306,10 @@ const std::vector<ToolDefinition>& tool_registry()
                 acceptance, source, idempotent, false, handler));
         };
         add("server_info", "Return the actual broker/build identity, supported protocol profiles, redacted endpoint and enforced limits.", "server", empty, info, {Effect::Inspect}, StateRequirement::Broker,
-            "Broker process identity and actual listening profile are observed from the owning process.", {"server_health"}, true, nullptr);
+            "Broker process identity and actual listening profile are observed from the owning process.", {"server_health"}, true, server_info);
         add("server_health", "Inspect broker, worker-channel and store health with bounded failure causes and no credential values.", "server", empty,
             closed_object_schema({{"broker", health_part}, {"ipc", health_part}, {"store", health_part}}, {"broker", "ipc", "store"}), {Effect::Inspect}, StateRequirement::Broker,
-            "Each health component is checked against its actual resource and current failure state.", {"server_info"}, true, nullptr);
+            "Each health component is checked against its actual resource and current failure state.", {"server_info"}, true, server_health);
         add("capabilities_list", "List deterministic declared capabilities, including unavailable providers, schemas and completion requirements.", "capabilities", filtered_input(false), page_output(descriptor), {Effect::Inspect}, StateRequirement::Broker,
             "Every matching compiled descriptor appears exactly once across the requested snapshot pages.", {"capabilities_describe"}, true, list_capabilities);
         add("capabilities_describe", "Read the versioned schemas, effects, executor, native source, recovery and availability of one capability.", "capabilities",

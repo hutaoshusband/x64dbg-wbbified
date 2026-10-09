@@ -1227,6 +1227,8 @@ if(X64DBG_BUILD_MCP) # mcp
 		"src/mcp/common/lifecycle.h"
 		"src/mcp/common/local_pipe.cpp"
 		"src/mcp/common/local_pipe.h"
+		"src/mcp/common/mcp_stdio.cpp"
+		"src/mcp/common/mcp_stdio.h"
 		"src/mcp/common/memory_tools.cpp"
 		"src/mcp/common/module_analysis_tools.cpp"
 		"src/mcp/common/new_file_publish.cpp"

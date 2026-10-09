@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "x64dbg": {
+      "type": "stdio",
+      "command": "C:/Users/YOU/AppData/Local/Programs/Python/Python313/python.exe",
+      "args": [
+        "C:/Users/YOU/Documents/GitHub/x64dbg-wbbified/tools/mcp_stdio_bridge.py",
+        "--arch",
+        "x64"
+      ]
+    }
+  }
+}
