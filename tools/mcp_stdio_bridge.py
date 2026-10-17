@@ -3,16 +3,21 @@
 Exposes the legacy x64dbg MCP HTTP endpoint as a newline-delimited JSON-RPC
 server on stdio, which is the transport most AI-agent MCP clients speak.
 
-The bridge owns one isolated debugger lifetime per process:
+The bridge owns one isolated debugger lifetime per process, started lazily
+(the GUI only runs while the agent is actively calling tools):
 
 1. Stage a private copy of ``WinTools/<arch>`` outside the repository.
 2. Launch ``wininspect.exe`` with a fresh profile, random port and random
    bearer token, bound to an owned Windows job object.
 3. Verify the HTTP listener belongs to the owned debugger PID, then run the
    MCP ``initialize`` handshake against the backend.
-4. Forward stdio JSON-RPC (``initialize``, ``tools/list``, ``tools/call``,
-   ``ping``, plus any other method verbatim) to the backend session.
-5. Shut the owned debugger down on stdin EOF and exit.
+4. Forward stdio JSON-RPC to the backend session while the agent is active
+   (``initialize``, ``ping``, ``BridgeInfo`` and cached ``tools/list``
+   are answered with no debugger running; the first real ``tools/call``
+   launches the visible GUI).
+5. Stop the owned debugger after ``--idle-timeout`` seconds without a
+   backend-backed call, and shut everything down on stdin EOF and exit.
+   Pass ``--eager`` to launch the debugger at bridge startup instead.
 
 Nothing is written to the repository or to ``WinTools``. The bearer token is
 random per run and never written to stdout or the log in clear text.
@@ -40,6 +45,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from ctypes import wintypes
@@ -52,6 +58,12 @@ HOST = "127.0.0.1"
 BACKEND_PROTOCOL = "2024-11-05"
 CLIENT_PROTOCOLS = ("2025-11-25", "2025-03-26", "2024-11-05")
 DEFAULT_RUN_ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "x64dbg-wbbified" / "Agentic"
+DEFAULT_IDLE_TIMEOUT = 120
+WATCHDOG_INTERVAL = 5
+
+
+def default_catalog_cache(architecture):
+    return Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "x64dbg-wbbified" / f"tools-catalog-{architecture}.json"
 # Loader-stop profiles written into each fresh debugger profile. "off" keeps the
 # initial system pause and the entry-point stop but skips TLS/DLL/thread stops,
 # so one `run` reaches the entry point. "stock" preserves x64dbg defaults.
@@ -219,7 +231,8 @@ class Backend:
     """One owned debugger process plus its authenticated MCP HTTP session."""
 
     def __init__(self, architecture, deployment=None, run_root=None, hide_debugger=True,
-                 startup_timeout=45, request_timeout=60, loader_breaks="off"):
+                 startup_timeout=45, request_timeout=60, loader_breaks="off",
+                 idle_timeout=DEFAULT_IDLE_TIMEOUT, catalog_cache=None):
         if loader_breaks not in LOADER_BREAKS_PROFILES:
             raise BridgeError(f"Unknown loader-breaks profile '{loader_breaks}'")
         self.architecture = architecture
@@ -233,6 +246,8 @@ class Backend:
         self.hide_debugger = hide_debugger
         self.startup_timeout = startup_timeout
         self.request_timeout = request_timeout
+        self.idle_timeout = idle_timeout
+        self.catalog_cache = Path(catalog_cache) if catalog_cache else default_catalog_cache(architecture)
         self.auth = secrets.token_hex(32)
         self.port = None
         self.stage = None
@@ -244,6 +259,68 @@ class Backend:
         self.server_info = None
         self.capabilities = None
         self.instructions = None
+        self.started = False
+        self.last_activity = time.monotonic()
+        self._guard = threading.RLock()
+
+    def is_running(self):
+        proc = self.__dict__.get("proc")
+        return proc is not None and proc.poll() is None
+
+    def note_activity(self):
+        self.last_activity = time.monotonic()
+
+    def ensure_started(self):
+        """Launch the owned debugger on first use; no-op while it runs."""
+        with self._guard:
+            if self.is_running():
+                return self.server_info
+            self.start()
+            return self.server_info
+
+    def check_idle(self):
+        """Stop a debugger that outlived ``idle_timeout``. Returns True if stopped."""
+        if not self.__dict__.get("idle_timeout"):
+            return False
+        with self._guard:
+            if not self.is_running():
+                return False
+            if time.monotonic() - self.last_activity < self.idle_timeout:
+                return False
+            log(f"debugger idle for {self.idle_timeout}s, stopping GUI (state is discarded)")
+            self.stop()
+            return True
+
+    def deployment_plugin_id(self):
+        suffix = ".dp64" if self.architecture == "x64" else ".dp32"
+        try:
+            plugin = Path(self.deployment) / "plugins" / f"x64dbg-MCP-Server{suffix}"
+            stat = plugin.stat()
+            return f"{stat.st_size}:{stat.st_mtime_ns}"
+        except OSError:
+            return "unknown"
+
+    def save_cached_catalog(self, result):
+        try:
+            self.catalog_cache.parent.mkdir(parents=True, exist_ok=True)
+            self.catalog_cache.write_text(json.dumps({
+                "backendVersion": (self.server_info or {}).get("version", "unknown"),
+                "pluginId": self.deployment_plugin_id(),
+                "result": result,
+            }), encoding="utf-8")
+        except OSError as error:
+            log(f"catalog cache write failed: {error}")
+
+    def load_cached_catalog(self):
+        try:
+            cached = json.loads(self.catalog_cache.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(cached, dict) or not isinstance(cached.get("result"), dict):
+            return None
+        if cached.get("pluginId") != self.deployment_plugin_id():
+            return None
+        return cached["result"]
 
     def start(self):
         self.run_root.mkdir(parents=True, exist_ok=True)
@@ -289,6 +366,8 @@ class Backend:
             self.instructions = result.get("instructions")
             self.raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
             log(f"backend ready: {self.server_info.get('name')} {self.server_info.get('version')}")
+            self.started = True
+            self.note_activity()
         except BaseException:
             self.stop()
             raise
@@ -308,6 +387,7 @@ class Backend:
             self.job.close()
             self.job = None
         self.session = None
+        self.started = False
 
     def raw(self, payload):
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
@@ -366,23 +446,33 @@ class StdioServer:
         self.stdout.flush()
 
     def bridge_instructions(self):
+        idle = self.backend.__dict__.get("idle_timeout", DEFAULT_IDLE_TIMEOUT)
+        idle_note = (f"Debugger GUI starts visibly on the first tool call and stops after {idle}s idle. "
+                     if idle else "Debugger GUI starts visibly on the first tool call and stays until the session ends. ")
         return (f"{BRIDGE_NAME} stdio bridge {BRIDGE_VERSION}. One isolated debugger per session (staged copy, fresh profile). "
+                + idle_note +
                 "All backend tools plus BridgeInfo are callable; "
                 "results end with a [state] trailer and GetEventLog carries a bridge journal with observed addresses. "
+                "Stopping the idle debugger discards debug state (target, breakpoints); the next call starts fresh. "
                 "Loader stops: TLS/DLL/thread breaks off, entry stop on. "
                 "Bare `.RVA` addresses resolve against the current module. "
                 "Third-party DLLs (shell mods, AV) may inject into debug targets and appear in module lists.")
 
     def bridge_info_text(self):
         windows = sys.getwindowsversion()
+        running = self.backend.is_running() if hasattr(self.backend, "is_running") else False
+        proc = self.backend.__dict__.get("proc")
         info = {
             "bridge": {"name": BRIDGE_NAME, "version": BRIDGE_VERSION},
-            "backend": self.backend.server_info,
-            "debugger": {"pid": self.backend.proc.pid if self.backend.proc else None, "architecture": self.backend.architecture},
+            "backend": self.backend.server_info or {"status": "not-started"},
+            "lifecycle": {"mode": "lazy", "running": running,
+                          "idleTimeout": self.backend.__dict__.get("idle_timeout", DEFAULT_IDLE_TIMEOUT)},
+            "debugger": {"pid": proc.pid if running else None, "architecture": self.backend.architecture},
             "profile": {"hideDebugger": self.backend.hide_debugger, "loaderBreaks": self.backend.loader_breaks},
             "host": {"windows": f"{windows.major}.{windows.minor}.{windows.build}", "isolatedStage": True},
             "notes": ["Bare `.RVA` addresses are resolved against the current module before forwarding.",
-                      "Third-party DLLs injected into targets (shell extensions, mods, AV) show up in ListModules."],
+                      "Third-party DLLs injected into targets (shell extensions, mods, AV) show up in ListModules.",
+                      "The debugger GUI only runs while tools are in use; an idle stop discards debug state."],
         }
         return json.dumps(info, indent=2)
 
@@ -444,7 +534,7 @@ class StdioServer:
             if method == "initialize":
                 requested = params.get("protocolVersion", BACKEND_PROTOCOL)
                 version = requested if requested in CLIENT_PROTOCOLS else BACKEND_PROTOCOL
-                backend_version = self.backend.server_info.get("version", "unknown") if self.backend.server_info else "unknown"
+                backend_version = self.backend.server_info.get("version", "unknown") if self.backend.server_info else "not-started"
                 result = {"protocolVersion": version, "capabilities": self.backend.capabilities or {"tools": {}},
                           "serverInfo": {"name": BRIDGE_NAME, "version": f"{BRIDGE_VERSION}+backend-{backend_version}"}}
                 notes = self.bridge_instructions()
@@ -453,12 +543,33 @@ class StdioServer:
             if method == "ping":
                 return {"jsonrpc": "2.0", "id": message["id"], "result": {}} if has_id else None
             if method == "tools/list":
-                response = self.backend.call_backend(method, params or None)
-                if response is None:
-                    raise BridgeError(f"Backend {method} returned no response")
-                if "error" in response and response["error"]:
-                    return {"jsonrpc": "2.0", "id": message["id"], "error": response["error"]} if has_id else None
-                merged = dict(response.get("result", {}))
+                if self.backend.is_running():
+                    with self.backend._guard:
+                        self.backend.ensure_started()
+                        response = self.backend.call_backend(method, params or None)
+                    if response is None:
+                        raise BridgeError(f"Backend {method} returned no response")
+                    if "error" in response and response["error"]:
+                        return {"jsonrpc": "2.0", "id": message["id"], "error": response["error"]} if has_id else None
+                    merged = dict(response.get("result", {}))
+                    self.backend.note_activity()
+                    self.backend.save_cached_catalog(merged)
+                else:
+                    cached = self.backend.load_cached_catalog()
+                    if cached is None:
+                        log("no cached tool catalog, starting debugger for tools/list")
+                        with self.backend._guard:
+                            self.backend.ensure_started()
+                            response = self.backend.call_backend(method, params or None)
+                        if response is None:
+                            raise BridgeError(f"Backend {method} returned no response")
+                        if "error" in response and response["error"]:
+                            return {"jsonrpc": "2.0", "id": message["id"], "error": response["error"]} if has_id else None
+                        merged = dict(response.get("result", {}))
+                        self.backend.note_activity()
+                        self.backend.save_cached_catalog(merged)
+                    else:
+                        merged = dict(cached)
                 merged["tools"] = [*merged.get("tools", []), dict(BRIDGE_TOOL)]
                 return {"jsonrpc": "2.0", "id": message["id"], "result": merged} if has_id else None
             if method == "tools/call":
@@ -466,10 +577,13 @@ class StdioServer:
                 if name == "BridgeInfo":
                     info = {"content": [{"type": "text", "text": self.bridge_info_text()}]}
                     return {"jsonrpc": "2.0", "id": message["id"], "result": info} if has_id else None
-                forwarded = dict(params or {})
-                if isinstance(forwarded.get("arguments"), dict):
-                    forwarded["arguments"] = self.normalize_arguments(forwarded["arguments"])
-                response = self.backend.call_backend(method, forwarded or None)
+                with self.backend._guard:
+                    self.backend.ensure_started()
+                    forwarded = dict(params or {})
+                    if isinstance(forwarded.get("arguments"), dict):
+                        forwarded["arguments"] = self.normalize_arguments(forwarded["arguments"])
+                    response = self.backend.call_backend(method, forwarded or None)
+                    self.backend.note_activity()
                 if response is None:
                     raise BridgeError(f"Backend {method} returned no response")
                 if "error" in response and response["error"]:
@@ -482,12 +596,21 @@ class StdioServer:
                         merged["content"] = [*merged.get("content", []), {"type": "text", "text": appendix}]
                 return {"jsonrpc": "2.0", "id": message["id"], "result": merged} if has_id else None
             if method.startswith("notifications/"):
-                try:
-                    self.backend.raw({"jsonrpc": "2.0", "method": method, "params": params or {}})
-                except BridgeError as error:
-                    log(f"notification forward failed: {error}")
+                if self.backend.is_running():
+                    try:
+                        self.backend.raw({"jsonrpc": "2.0", "method": method, "params": params or {}})
+                    except BridgeError as error:
+                        log(f"notification forward failed: {error}")
                 return None
-            response = self.backend.call_backend(method, params or None)
+            if not self.backend.is_running():
+                if has_id:
+                    return {"jsonrpc": "2.0", "id": message["id"],
+                            "error": {"code": -32601, "message": f"Method not found: {method}"}}
+                return None
+            with self.backend._guard:
+                self.backend.ensure_started()
+                response = self.backend.call_backend(method, params or None)
+                self.backend.note_activity()
             if response is None or not has_id:
                 return None
             if "error" in response and response["error"]:
@@ -500,28 +623,45 @@ class StdioServer:
                         "error": {"code": -32603, "message": str(error)[:500]}}
             return None
 
+    def watch_idle(self, stop_event):
+        while not stop_event.wait(WATCHDOG_INTERVAL):
+            try:
+                self.backend.check_idle()
+            except Exception as error:
+                log(f"idle watchdog failed: {type(error).__name__}: {error}")
+
     def serve(self):
-        while True:
-            line = self.stdin.readline()
-            if not line:
-                log("stdin EOF, shutting down")
-                return
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self.reply({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
-                continue
-            try:
-                response = self.handle(message)
-            except Exception as error:  # never let one request kill the session
-                log(f"handler crashed: {type(error).__name__}: {error}")
-                response = {"jsonrpc": "2.0", "id": message.get("id"),
-                            "error": {"code": -32603, "message": "Internal bridge error"}} if "id" in message else None
-            if response is not None:
-                self.reply(response)
+        stop_watch = threading.Event()
+        watcher = None
+        if self.backend.__dict__.get("idle_timeout"):
+            watcher = threading.Thread(target=self.watch_idle, args=(stop_watch,), daemon=True)
+            watcher.start()
+        try:
+            while True:
+                line = self.stdin.readline()
+                if not line:
+                    log("stdin EOF, shutting down")
+                    return
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self.reply({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+                    continue
+                try:
+                    response = self.handle(message)
+                except Exception as error:  # never let one request kill the session
+                    log(f"handler crashed: {type(error).__name__}: {error}")
+                    response = {"jsonrpc": "2.0", "id": message.get("id"),
+                                "error": {"code": -32603, "message": "Internal bridge error"}} if "id" in message else None
+                if response is not None:
+                    self.reply(response)
+        finally:
+            stop_watch.set()
+            if watcher is not None:
+                watcher.join(timeout=5)
 
 
 def run_self_test():
@@ -585,7 +725,43 @@ def run_self_test():
     server = HTTPServer((HOST, 0), FakeBackend)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    class _RunningProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+    def _lazy_backend(cache_file):
+        lazy = Backend.__new__(Backend)
+        lazy.port = server.server_port
+        lazy.auth = "self-test-token"
+        lazy.session = None
+        lazy.rid = 1
+        lazy.request_timeout = 10
+        lazy.server_info = None
+        lazy.capabilities = None
+        lazy.instructions = None
+        lazy.proc = None
+        lazy.started = False
+        lazy.architecture = "x64"
+        lazy.deployment = ROOT / "WinTools" / "x64"
+        lazy.hide_debugger = True
+        lazy.loader_breaks = "off"
+        lazy.idle_timeout = 120
+        lazy.catalog_cache = Path(cache_file)
+        lazy.last_activity = time.monotonic()
+        lazy._guard = threading.RLock()
+        return lazy
+
+    def _lazy_frontend(lazy):
+        frontend = StdioServer.__new__(StdioServer)
+        frontend.backend = lazy
+        frontend.journal = collections.deque(maxlen=64)
+        return frontend
+
     try:
+        cache_dir = tempfile.mkdtemp(prefix="bridge-catalog-")
         backend = Backend.__new__(Backend)
         backend.port = server.server_port
         backend.auth = "self-test-token"
@@ -595,10 +771,16 @@ def run_self_test():
         backend.server_info = {"name": "fake-mcp", "version": "9.9"}
         backend.capabilities = {"tools": {}}
         backend.instructions = None
-        backend.proc = None
+        backend.proc = _RunningProc(424242)
+        backend.started = True
         backend.architecture = "x64"
+        backend.deployment = ROOT / "WinTools" / "x64"
         backend.hide_debugger = True
         backend.loader_breaks = "off"
+        backend.idle_timeout = 0
+        backend.catalog_cache = Path(cache_dir) / "running-catalog.json"
+        backend.last_activity = time.monotonic()
+        backend._guard = threading.RLock()
         frontend = StdioServer.__new__(StdioServer)
         frontend.backend = backend
         frontend.journal = collections.deque(maxlen=64)
@@ -651,6 +833,63 @@ def run_self_test():
         malformed = frontend.handle({"jsonrpc": "2.0", "id": 6, "method": "tools/call"})
         assert "error" in malformed or "result" in malformed, malformed
         assert any(call.get("method") == "tools/call" for call in calls), calls
+        calls_before_lazy = len(calls)
+        stopped = _lazy_backend(str(Path(cache_dir) / "stopped-catalog.json"))
+        stopped_frontend = _lazy_frontend(stopped)
+
+        def _must_not_start():
+            raise AssertionError("lazy path launched the debugger")
+
+        stopped.ensure_started = _must_not_start
+        lazy_init = stopped_frontend.handle({"jsonrpc": "2.0", "id": 100, "method": "initialize", "params": {}})
+        assert lazy_init["result"]["serverInfo"]["name"] == BRIDGE_NAME, lazy_init
+        assert "not-started" in lazy_init["result"]["serverInfo"]["version"], lazy_init
+        lazy_info = stopped_frontend.handle({"jsonrpc": "2.0", "id": 101, "method": "tools/call",
+                                             "params": {"name": "BridgeInfo", "arguments": {}}})
+        lazy_text = lazy_info["result"]["content"][0]["text"]
+        assert '"running": false' in lazy_text and '"status": "not-started"' in lazy_text, lazy_text
+        stopped.save_cached_catalog({"tools": [{"name": "Echo", "description": "echo",
+                                                "inputSchema": {"type": "object", "properties": {}}}]})
+        lazy_list = stopped_frontend.handle({"jsonrpc": "2.0", "id": 102, "method": "tools/list", "params": {}})
+        assert [tool["name"] for tool in lazy_list["result"]["tools"]] == ["Echo", "BridgeInfo"], lazy_list
+        lazy_unknown = stopped_frontend.handle({"jsonrpc": "2.0", "id": 103, "method": "resources/list"})
+        assert lazy_unknown["error"]["code"] == -32601, lazy_unknown
+        assert stopped_frontend.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+        assert len(calls) == calls_before_lazy, "lazy metadata paths reached the backend"
+        woken = _lazy_backend(str(Path(cache_dir) / "woken-catalog.json"))
+        woken_frontend = _lazy_frontend(woken)
+        wake_calls = []
+
+        def _fake_ensure():
+            wake_calls.append(True)
+            woken.proc = _RunningProc(434343)
+            woken.started = True
+            woken.server_info = {"name": "fake-mcp", "version": "9.9"}
+            woken.capabilities = {"tools": {}}
+            woken.note_activity()
+            return woken.server_info
+
+        woken.ensure_started = _fake_ensure
+        woken_echo = woken_frontend.handle({"jsonrpc": "2.0", "id": 104, "method": "tools/call",
+                                            "params": {"name": "Echo", "arguments": {"message": "wake"}}})
+        assert wake_calls == [True], "first tool call did not start the debugger"
+        assert woken_echo["result"]["content"][0]["text"] == "fake:wake", woken_echo
+        idle = _lazy_backend(str(Path(cache_dir) / "idle-catalog.json"))
+        idle.proc = _RunningProc(444444)
+        idle.started = True
+        idle_stops = []
+        idle.stop = lambda: idle_stops.append(True)
+        idle.last_activity = time.monotonic() - 121
+        assert idle.check_idle() is True and idle_stops == [True], "stale debugger was not stopped"
+        idle.last_activity = time.monotonic()
+        assert idle.check_idle() is False, "active debugger was stopped early"
+        idle.proc = None
+        idle.last_activity = time.monotonic() - 1000
+        assert idle.check_idle() is False, "stopped backend reported an idle stop"
+        idle.idle_timeout = 0
+        idle.proc = _RunningProc(444444)
+        assert idle.check_idle() is False, "disabled idle timeout stopped the debugger"
+        shutil.rmtree(cache_dir, ignore_errors=True)
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -737,6 +976,10 @@ def main(argv=None):
                         help="Loader stops: off skips TLS/DLL/thread breaks so one run reaches the entry point; stock keeps x64dbg defaults")
     parser.add_argument("--startup-timeout", type=int, default=45)
     parser.add_argument("--request-timeout", type=int, default=60)
+    parser.add_argument("--idle-timeout", type=int, default=DEFAULT_IDLE_TIMEOUT,
+                        help="Stop the debugger GUI after this many idle seconds (default 120, 0 disables auto-stop)")
+    parser.add_argument("--eager", action="store_true",
+                        help="Launch the debugger at bridge startup instead of on the first tool call")
     parser.add_argument("--self-test", action="store_true", help="Protocol translation check without a debugger")
     parser.add_argument("--smoke-test", action="store_true", help="Real debugger launch, list, Echo and idle state")
     parser.add_argument("--print-config", choices=sorted(EXAMPLE_CONFIGS), default=None,
@@ -744,6 +987,8 @@ def main(argv=None):
     arguments = parser.parse_args(argv)
     if not 1 <= arguments.startup_timeout <= 300 or not 1 <= arguments.request_timeout <= 300:
         parser.error("Timeouts must stay within 1..300 seconds")
+    if not 0 <= arguments.idle_timeout <= 3600:
+        parser.error("Idle timeout must stay within 0..3600 seconds")
     try:
         if arguments.print_config:
             return print_config(arguments.print_config, arguments.arch)
@@ -755,9 +1000,13 @@ def main(argv=None):
                                   arguments.loader_breaks)
         backend = Backend(arguments.arch, arguments.deployment, arguments.run_root,
                           not arguments.show_debugger, arguments.startup_timeout, arguments.request_timeout,
-                          arguments.loader_breaks)
+                          arguments.loader_breaks, idle_timeout=arguments.idle_timeout)
         try:
-            backend.start()
+            if arguments.eager:
+                backend.start()
+            else:
+                log(f"lazy mode: debugger GUI starts on first tool call"
+                    + (f", stops after {arguments.idle_timeout}s idle" if arguments.idle_timeout else ", no auto-stop"))
             StdioServer(backend).serve()
         finally:
             backend.stop()

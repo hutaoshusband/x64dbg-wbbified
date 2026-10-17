@@ -68,8 +68,13 @@ client-side loading state, never a server gap.
   ("Breakpoint hit", "DLL loaded"). Every tool result already ends with a
   `[state]` trailer, and `GetEventLog` additionally carries a bridge journal
   pairing each observed session event with the address it was seen at.
-- One session per bridge process: the debugger starts when the agent host
-  spawns the bridge and is closed when the session ends.
+- One session per bridge process, started lazily: `initialize`, `ping`,
+  `BridgeInfo` and cached `tools/list` answer with no debugger running, so
+  idle chats/tabs hold no GUI, no taskbar button and no debuggee. The first
+  real tool call launches the visible GUI; it stops again after
+  `--idle-timeout` seconds without tool activity (default 120, `0`
+  disables). Stopping discards debug state (target, breakpoints) — the next
+  call starts fresh. Pass `--eager` to launch at bridge startup instead.
 
 Environment note: the debugger runs natively on Windows (see `BridgeInfo`
 for the build). Odd module names in `ListModules` (Windhawk mods, shell
@@ -107,6 +112,7 @@ Typical first tasks to give an agent:
 | `MCP listener does not belong to the owned debugger process` | Port race or another listener grabbed the port. Retry; the port is random per run. |
 | Agent sees no tools | Client config path/typo, or the client needs a restart/reconnect. Validate with `--smoke-test` outside the client first. |
 | Debuggee detects the debugger | Default hiding covers PEB checks; ScyllaHide options in the staged `plugins/` dir can be tuned per run. Attach/pause with hiding enabled is a known open engine gate (see `tests/README.md`). |
+| Debug state vanished mid-task (target gone, breakpoints lost) | The idle watchdog stopped the GUI after `--idle-timeout` without tool activity. Re-run the setup calls, or raise the timeout (`--idle-timeout 600`) / disable it (`--idle-timeout 0`) for long analyses. |
 
 ## Roadmap checkpoints
 
