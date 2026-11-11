@@ -199,24 +199,48 @@ def free_port():
         return probe.getsockname()[1]
 
 
+def clear_directory(path, attempts=8, delay=0.25):
+    """Delete a stale directory, retrying briefly while a just-killed process
+    or antivirus still holds files open. Returns True once the path is gone."""
+    for _ in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            time.sleep(delay)
+    return False
+
+
 def stage_deployment(deployment, run_root, architecture):
-    """Copy the debugger deployment into a private run directory."""
+    """Copy the debugger deployment into a private run directory.
+
+    Re-staging over an earlier stage (after an idle stop, a debugger crash or
+    a manual close) must succeed, so any stale stage is cleared first. Files
+    of a freshly killed debugger can stay locked for a short while; if the
+    stale stage cannot be removed in time, the copy overwrites the needed
+    files in place instead of failing the restart.
+    """
     deployment = Path(deployment)
     suffix = ".dp64" if architecture == "x64" else ".dp32"
     baseline_plugin = deployment / "plugins" / f"x64dbg-MCP-Server{suffix}"
     if not baseline_plugin.is_file():
         raise BridgeError(f"Legacy MCP baseline plugin is unavailable for {architecture}")
     stage = Path(run_root) / "deploy"
-    stage.mkdir(parents=True)
-    for source in deployment.iterdir():
-        if source.is_file() and source.suffix.lower() in (".dll", ".exe"):
-            shutil.copy2(source, stage / source.name)
-    for directory in ("platforms", "iconengines", "imageformats", "styles"):
-        source = deployment / directory
-        if source.is_dir():
-            shutil.copytree(source, stage / directory)
-    plugins = stage / "plugins"
-    shutil.copytree(deployment / "plugins", plugins)
+    try:
+        clear_directory(stage)
+        stage.mkdir(parents=True, exist_ok=True)
+        for source in deployment.iterdir():
+            if source.is_file() and source.suffix.lower() in (".dll", ".exe"):
+                shutil.copy2(source, stage / source.name)
+        for directory in ("platforms", "iconengines", "imageformats", "styles"):
+            source = deployment / directory
+            if source.is_dir():
+                shutil.copytree(source, stage / directory, dirs_exist_ok=True)
+        shutil.copytree(deployment / "plugins", stage / "plugins", dirs_exist_ok=True)
+    except OSError as error:
+        raise BridgeError(f"Failed to stage the debugger deployment: {error}")
     return stage
 
 
@@ -820,6 +844,22 @@ def run_self_test():
         ini = Path(profile_dir, "wininspect.ini").read_text(encoding="utf-8")
         assert "TlsCallbacks=1" in ini and "HideDebugger=0" in ini, ini
         shutil.rmtree(profile_dir, ignore_errors=True)
+        staging_root = tempfile.mkdtemp(prefix="bridge-staging-")
+        try:
+            fake_deployment = Path(staging_root) / "deployment"
+            (fake_deployment / "plugins").mkdir(parents=True)
+            (fake_deployment / "plugins" / "x64dbg-MCP-Server.dp64").write_bytes(b"plugin")
+            run_root = Path(staging_root) / "run"
+            stage_deployment(fake_deployment, run_root, "x64")
+            staged = run_root / "deploy"
+            assert (staged / "plugins" / "x64dbg-MCP-Server.dp64").is_file(), staged
+            stale = staged / "stale.dll"
+            stale.write_bytes(b"stale")
+            stage_deployment(fake_deployment, run_root, "x64")
+            assert (staged / "plugins" / "x64dbg-MCP-Server.dp64").is_file(), staged
+            assert not stale.exists(), "re-staging kept a stale stage file"
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
         called = frontend.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                   "params": {"name": "Echo", "arguments": {"message": "hi"}}})
         assert called["result"]["content"][0]["text"] == "fake:hi", called
@@ -936,6 +976,17 @@ def run_smoke_test(architecture, deployment, run_root, hide_debugger, startup_ti
         if not state_text.strip():
             raise BridgeError("GetDebugState returned empty idle state")
         summary["idleStateLines"] = len(state_text.splitlines())
+        backend.stop()
+        if backend.proc is not None or backend.is_running():
+            raise BridgeError("Stopped debugger is still owned by the backend")
+        backend.start()
+        if backend.proc is None or not backend.is_running():
+            raise BridgeError("Restart on the same run root failed")
+        summary["restartPid"] = backend.proc.pid
+        roundtrip = backend.call_tool("Echo", {"message": "restart-smoke"})
+        text = "\n".join(item.get("text", "") for item in roundtrip.get("content", []))
+        if "restart-smoke" not in text:
+            raise BridgeError(f"Echo after restart did not round-trip: {text[:200]}")
         summary["status"] = "passed"
     finally:
         backend.stop()
